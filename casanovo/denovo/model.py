@@ -271,6 +271,16 @@ class Spec2Pep(pl.LightningModule):
         # Create cache for decoded beams.
         pred_cache = collections.OrderedDict((i, []) for i in range(batch))
 
+        # DEBUG: One entry per beam (B * S)
+        beam_debug = [
+            {
+                "discard_reason": None,
+                "step": None,
+                "token": None,
+            }
+            for _ in range(batch * beam)
+        ]
+
         # Get the first prediction.
         pred = self.decoder(
             tokens=torch.zeros(
@@ -298,7 +308,7 @@ class Spec2Pep(pl.LightningModule):
                 finished_beams,
                 beam_fits_precursor,
                 discarded_beams,
-            ) = self._finish_beams(tokens, precursors, step)
+            ) = self._finish_beams(tokens, precursors, step, beam_debug) # DEBUG: beam_debug is added for logging
             # Cache peptide predictions from the finished beams (but not the
             # discarded beams).
             self._cache_finished_beams(
@@ -328,6 +338,24 @@ class Spec2Pep(pl.LightningModule):
                 tokens, scores, finished_beams, batch, step + 1
             )
 
+        # DEBUG: mark silent discards (never finished / never cached)
+        for spec_idx, preds in pred_cache.items():
+            if len(preds) == 0:
+                beam_idx = spec_idx * beam  # n_beams == 1 case
+                if beam_debug[beam_idx]["discard_reason"] is None:
+                    beam_debug[beam_idx] = {
+                        "discard_reason": "NEVER_FINISHED",
+                        "step": None,
+                        "token": None,
+                    }
+                    logger.warning(
+                        f"Spectrum {spec_idx} had no prediction: {beam_debug[beam_idx]}"
+                    )
+
+        # DEBUG: At the very end, right before return pred_cache:
+        total_predictions = sum(len(preds) for preds in pred_cache.values())
+        logger.info(f"beam_search_decode: returning {len(pred_cache)} spectra with {total_predictions} total predictions")
+
         # Return the peptide with the highest confidence score, within the
         # precursor m/z tolerance if possible.
         return list(self._get_top_peptide(pred_cache))
@@ -337,6 +365,7 @@ class Spec2Pep(pl.LightningModule):
         tokens: torch.Tensor,
         precursors: torch.Tensor,
         step: int,
+        beam_debug=None, # DEBUG: beam_debug is added for logging
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Track all beams that have been finished, either by predicting the stop
@@ -392,6 +421,17 @@ class Spec2Pep(pl.LightningModule):
 
         discarded_beams[tokens[:, step] == 0] = True
 
+        # DEBUG: 
+        if beam_debug is not None:
+            pad_mask = tokens[:, step] == 0
+            for i in torch.where(pad_mask)[0].tolist():
+                if beam_debug[i]["discard_reason"] is None:
+                    beam_debug[i] = {
+                        "discard_reason": "PAD_TOKEN",
+                        "step": step,
+                        "token": int(tokens[i, step]),
+                    }
+
         # Discard beams with invalid modification combinations (i.e. N-terminal
         # modifications occur multiple times or in internal positions)
         n_term = torch.tensor(
@@ -425,6 +465,17 @@ class Spec2Pep(pl.LightningModule):
         is_n_term[is_valid_position] = False
         discarded_beams |= torch.any(is_n_term, dim=1)
 
+        # DEBUG: 
+        if beam_debug is not None:
+            invalid_mod_mask = torch.any(is_n_term, dim=1)
+            for i in torch.where(invalid_mod_mask)[0].tolist():
+                if beam_debug[i]["discard_reason"] is None:
+                    beam_debug[i] = {
+                        "discard_reason": "INVALID_NTERM_MOD",
+                        "step": step,
+                        "token": int(tokens[i, step]),
+                    }
+
         # Check which beams should be terminated or discarded based on the
         # predicted peptide.
         for i in range(len(finished_beams)):
@@ -448,10 +499,26 @@ class Spec2Pep(pl.LightningModule):
             # peptide length.
             if finished_beams[i] and peptide_len < self.min_peptide_len:
                 discarded_beams[i] = True
+
+                # DEBUG:
+                if beam_debug is not None and beam_debug[i]["discard_reason"] is None:
+                    beam_debug[i] = {
+                        "discard_reason": "TOO_SHORT",
+                        "step": step,
+                        "token": int(tokens[i, step]),
+                    }
                 continue
             # Discard beams that contain more than chimeric separator
             if (pred_tokens == chimeric_separator).sum() > 1:
                 discarded_beams[i] = True
+
+                # DEBUG:
+                if beam_debug is not None and beam_debug[i]["discard_reason"] is None:
+                    beam_debug[i] = {
+                        "discard_reason": "MULTI_SEPARATOR",
+                        "step": step,
+                        "token": int(tokens[i, step]),
+                    }
                 continue
             # Terminate the beam if it has not been finished by the model but
             # the peptide mass exceeds the precursor m/z to an extent that it
@@ -810,7 +877,7 @@ class Spec2Pep(pl.LightningModule):
         pred = pred[:, :-1, :].reshape(-1, self.vocab_size)
         pred_comp = pred_comp[:, :-1, :].reshape(-1, self.vocab_size)
 
-        loss_fun = self.celoss if mode == "Train" else self.val_celoss
+        loss_fun = self.celoss if mode == "train" else self.val_celoss
         loss_one = (
             loss_fun(pred, truth.flatten())
             .reshape((batch_size, seq_length))
@@ -1027,7 +1094,7 @@ class Spec2Pep(pl.LightningModule):
                 )
                 next_aa_scores, next_pep_score = _aa_pep_score(
                     next_aa_scores,
-                    True # Don't penalize precursor mass
+                    True # Don't penalize precursor mass 
                 )
                 next_peptide = self.tokenizer.detokenize(
                     next_peptide.unsqueeze(0)

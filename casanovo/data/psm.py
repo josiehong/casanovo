@@ -98,10 +98,13 @@ class PepSpecMatch:
             The parsed ProForma object representing the current peptide sequence
         """
         if self._proteoform_sequence != self.sequence:
-            self._proteoform_sequence = self.sequence
             self._cache_proteoform = spectrum_utils.proforma.parse(
                 self.sequence
             )[0]
+            # Only update the cache key after a successful parse so that a
+            # parse exception cannot leave _cache_proteoform as None while
+            # _proteoform_sequence already equals self.sequence.
+            self._proteoform_sequence = self.sequence
 
         return self._cache_proteoform
 

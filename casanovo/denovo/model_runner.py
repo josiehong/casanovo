@@ -524,6 +524,13 @@ class ModelRunner:
             architecture_params = set(model_params.keys()) - set(
                 loaded_model_params.keys()
             )
+            # Re-derive chimera state from the new tokenizer — these were
+            # set in __init__ from the checkpoint's tokenizer and are stale.
+            self.model.chimera = isinstance(tokenizer, ChimeraTokenizer)
+            if self.model.chimera:
+                self.model.sep_token = tokenizer.index[
+                    tokenizer.chimeric_separator_token
+                ]
             for param in architecture_params:
                 if model_params[param] != self.model.hparams[param]:
                     if param == "tokenizer":
@@ -549,6 +556,11 @@ class ModelRunner:
                     **model_params,
                 )
                 self.model.tokenizer = tokenizer
+                self.model.chimera = isinstance(tokenizer, ChimeraTokenizer)
+                if self.model.chimera:
+                    self.model.sep_token = tokenizer.index[
+                        tokenizer.chimeric_separator_token
+                    ]
             except RuntimeError:
                 raise RuntimeError(
                     "Weights file incompatible with the current version of "

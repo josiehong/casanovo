@@ -878,15 +878,23 @@ class Spec2Pep(pl.LightningModule):
         pred_comp = pred_comp[:, :-1, :].reshape(-1, self.vocab_size)
 
         loss_fun = self.celoss if mode == "train" else self.val_celoss
+        mask = (truth != 0).float()
+        mask_comp = (truth_comp != 0).float()
         loss_one = (
-            loss_fun(pred, truth.flatten())
-            .reshape((batch_size, seq_length))
-            .mean(dim=1, keepdim=True)
+            (
+                loss_fun(pred, truth.flatten()).reshape((batch_size, seq_length))
+                * mask
+            ).sum(dim=1, keepdim=True)
+            / mask.sum(dim=1, keepdim=True)
         )
         loss_two = (
-            loss_fun(pred_comp, truth_comp.flatten())
-            .reshape((batch_size, seq_length))
-            .mean(dim=1, keepdim=True)
+            (
+                loss_fun(pred_comp, truth_comp.flatten()).reshape(
+                    (batch_size, seq_length)
+                )
+                * mask_comp
+            ).sum(dim=1, keepdim=True)
+            / mask_comp.sum(dim=1, keepdim=True)
         )
 
         loss = torch.cat((loss_one, loss_two), dim=1)

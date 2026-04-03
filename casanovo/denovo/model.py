@@ -896,7 +896,7 @@ class Spec2Pep(pl.LightningModule):
         self.log(
             f"{mode}_CELoss",
             loss.detach(),
-            on_step=False,
+            on_step=(mode == "train"),
             on_epoch=True,
             sync_dist=True,
             batch_size=pred.shape[0],
@@ -1026,6 +1026,15 @@ class Spec2Pep(pl.LightningModule):
         }
         self._history.append(metrics)
         self._log_history()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
+        """
+        Log the training loss at each training step.
+        """
+        step = self.trainer.global_step
+        if step % self.n_log == 0:
+            loss = outputs["loss"].detach().item()
+            logger.info("Step %i\tTrain loss: %.6f", step, loss)
 
     def on_validation_epoch_end(self) -> None:
         """

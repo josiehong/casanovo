@@ -13,7 +13,8 @@ import lightning.pytorch as pl
 import lightning.pytorch.loggers
 import torch
 from depthcharge.tokenizers import PeptideTokenizer
-from depthcharge.tokenizers.peptides import MskbPeptideTokenizer
+
+from .chimera import ChimeraTokenizer, MskbChimeraTokenizer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader
@@ -193,6 +194,7 @@ class ModelRunner:
         valid_paths = self._get_input_paths(valid_peak_path, True, "valid")
         self.initialize_data_module(train_paths, valid_paths)
         self.loaders.setup()
+        self.model.train_eval_dataloader = self.loaders.train_eval_dataloader()
 
         self.trainer.fit(
             self.model,
@@ -401,10 +403,11 @@ class ModelRunner:
 
     def initialize_tokenizer(self) -> None:
         """Initialize the peptide tokenizer."""
-        if self.config.massivekb_tokenizer:
-            tokenizer_clss = MskbPeptideTokenizer
-        else:
-            tokenizer_clss = PeptideTokenizer
+        tokenizer_clss = (
+            MskbChimeraTokenizer
+            if self.config.massivekb_tokenizer
+            else ChimeraTokenizer
+        )
 
         missing_aa = list(
             set(self.config.residues) - set(tokenizer_clss.residues)
@@ -519,6 +522,13 @@ class ModelRunner:
             # Use tokenizer initialized from config file instead of loaded
             # from checkpoint file.
             self.model.tokenizer = tokenizer
+            # Re-derive chimera state from the new tokenizer — these were
+            # set in __init__ from the checkpoint's tokenizer and are stale.
+            self.model.chimera = isinstance(tokenizer, ChimeraTokenizer)
+            if self.model.chimera:
+                self.model.sep_token = tokenizer.index[
+                    tokenizer.chimeric_separator_token
+                ]
             architecture_params = set(model_params.keys()) - set(
                 loaded_model_params.keys()
             )
@@ -547,6 +557,11 @@ class ModelRunner:
                     **model_params,
                 )
                 self.model.tokenizer = tokenizer
+                self.model.chimera = isinstance(tokenizer, ChimeraTokenizer)
+                if self.model.chimera:
+                    self.model.sep_token = tokenizer.index[
+                        tokenizer.chimeric_separator_token
+                    ]
             except RuntimeError:
                 raise RuntimeError(
                     "Weights file incompatible with the current version of "

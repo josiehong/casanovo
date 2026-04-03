@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from depthcharge.tokenizers import PeptideTokenizer
 
+from .chimera import ChimeraTokenizer
 from .. import config
 from ..data import ms_io, psm
 from ..denovo.transformers import PeptideDecoder, SpectrumEncoder
@@ -91,6 +92,15 @@ class Spec2Pep(pl.LightningModule):
         This is expensive.
     tokenizer: PeptideTokenizer | None
         Tokenizer object to process peptide sequences.
+    chimera : bool
+        If ``True``, enable chimeric spectrum sequencing.  The tokenizer must
+        be a :class:`~casanovo.denovo.chimera.ChimeraTokenizer`, the training
+        data must contain ``"seq_compliment"`` batches (provided automatically
+        by :class:`~casanovo.denovo.chimera.ChimeraAnnotatedSpectrumDataset`),
+        and the loss is computed as a hard-minimum over the two possible
+        peptide orderings.  During prediction, the separator token is used to
+        split predictions into two :class:`~casanovo.data.psm.PepSpecMatch`
+        objects per spectrum.
     **kwargs : Dict
         Additional keyword arguments passed to the Adam optimizer.
     """
@@ -144,9 +154,13 @@ class Spec2Pep(pl.LightningModule):
         self.softmax = torch.nn.Softmax(2)
         ignore_index = 0
         self.celoss = torch.nn.CrossEntropyLoss(
-            ignore_index=ignore_index, label_smoothing=train_label_smoothing
+            ignore_index=ignore_index,
+            label_smoothing=train_label_smoothing,
+            reduction="none",
         )
-        self.val_celoss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.val_celoss = torch.nn.CrossEntropyLoss(
+            ignore_index=ignore_index, reduction="none"
+        )
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -171,10 +185,17 @@ class Spec2Pep(pl.LightningModule):
         self.top_match = top_match
         self.stop_token = self.tokenizer.stop_int
 
+        self.chimera = isinstance(self.tokenizer, ChimeraTokenizer)
+        if self.chimera:
+            self.sep_token = self.tokenizer.index[
+                self.tokenizer.chimeric_separator_token
+            ]
+
         # Logging.
         self.calculate_precision = calculate_precision
         self.n_log = n_log
         self._history = []
+        self._pending_valid_metrics = {}
 
         # Output writer during predicting.
         self.out_writer = out_writer
@@ -291,24 +312,19 @@ class Spec2Pep(pl.LightningModule):
 
         Returns
         -------
-        scores : torch.Tensor of shape (n_spectra, length, n_amino_acids)
+        scores : torch.Tensor of shape (n_spectra, max_peptide_len, n_amino_acids)
             The individual amino acid scores for each prediction.
         seqs : torch.Tensor of shape (n_spectra, length)
-            The ground truth tokens for training, or zeros for inference.
+            The ground truth tokens for training, or None for inference.
         """
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
 
-        if seqs is not None:
-            # Training: match ground truth length
-            zero_tokens = torch.zeros_like(seqs)
-        else:
-            # Inference: use max peptide length
-            zero_tokens = torch.zeros(
-                (mzs.shape[0], self.max_peptide_len),
-                dtype=torch.long,
-                device=self.device,
-            )
+        zero_tokens = torch.zeros(
+            (mzs.shape[0], self.max_peptide_len),
+            dtype=torch.long,
+            device=self.device,
+        )
         scores = self.decoder(
             tokens=zero_tokens,
             memory=memories,
@@ -347,21 +363,47 @@ class Spec2Pep(pl.LightningModule):
         pred, truth = self._forward_step(batch)
 
         batch_size, seq_len = truth.shape
-        pred = pred[:, :seq_len, :]
+        seq_len = min(seq_len, self.max_peptide_len)
+        truth = truth[:, :seq_len]
+        pred_sliced = pred[:, :seq_len, :]
+        pred_flat = pred_sliced.reshape(-1, self.vocab_size)
 
-        pred = pred.reshape(-1, self.vocab_size)
+        loss_fun = self.celoss if mode == "train" else self.val_celoss
 
-        if mode == "train":
-            loss = self.celoss(pred, truth.flatten())
+        if self.chimera and "seq_compliment" in batch:
+            # Chimera hard-min loss: pick the peptide ordering with lower
+            # mask-normalised per-sequence CE, then average raw token losses
+            # across the batch (consistent with the non-chimeric path).
+            # Because the NAR decoder always receives zero tokens, a single
+            # forward pass produces logits that can be scored against both
+            # peptide orderings without a second decoder call.
+            truth_comp = batch["seq_compliment"][:, :seq_len]
+            mask = (truth != 0).float()
+            n_real = mask.sum(dim=1).clamp(min=1)
+            raw_a = (
+                loss_fun(pred_flat, truth.flatten()).reshape(batch_size, seq_len)
+            )
+            raw_b = (
+                loss_fun(pred_flat, truth_comp.flatten()).reshape(batch_size, seq_len)
+            )
+            # Mask-normalised loss used only for ordering selection.
+            loss_a_norm = (raw_a * mask).sum(dim=1) / n_real
+            loss_b_norm = (raw_b * mask).sum(dim=1) / n_real
+            winner = (loss_b_norm < loss_a_norm).float().unsqueeze(1)
+            # Divide by real tokens only to avoid padding dilution.
+            n_real_total = mask.sum().clamp(min=1)
+            loss = (raw_a * (1 - winner) + raw_b * winner).sum() / n_real_total
         else:
-            loss = self.val_celoss(pred, truth.flatten())
+            raw = loss_fun(pred_flat, truth.flatten())
+            n_real_total = (truth.flatten() != 0).float().sum().clamp(min=1)
+            loss = raw.sum() / n_real_total
         self.log(
             f"{mode}_CELoss",
             loss.detach(),
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=pred.shape[0],
+            batch_size=pred_flat.shape[0],
         )
         return loss
 
@@ -391,8 +433,9 @@ class Spec2Pep(pl.LightningModule):
         if not self.calculate_precision:
             return loss
 
-        # Calculate and log amino acid and peptide match evaluation
-        # metrics from the predicted peptides.
+        # Calculate and log amino acid and peptide match evaluation metrics.
+        # In chimera mode each chimeric spectrum contributes two (truth, pred)
+        # sub-peptide pairs; single-peptide spectra contribute one.
         # FIXME: Remove work around when depthcharge reverse detokenization
         # bug is fixed.
         # peptides_true = self.tokenizer.detokenize(batch["seq"])
@@ -400,26 +443,101 @@ class Spec2Pep(pl.LightningModule):
             "".join(pep)
             for pep in self.tokenizer.detokenize(batch["seq"], join=False)
         ]
-        peptides_pred = [
-            pred
-            for spectrum_preds in self.forward(batch)
-            for _, _, pred in spectrum_preds
-        ]
+        pred_psms = self.predict_step(batch)
+
+        if self.chimera:
+            peptides_true, peptides_pred = self._build_chimera_eval_pairs(
+                batch, peptides_true, pred_psms
+            )
+        else:
+            peptides_pred = [m.sequence for m in pred_psms]
+
         aa_precision, _, pep_precision = evaluate.aa_match_metrics(
             *evaluate.aa_match_batch(
                 peptides_true, peptides_pred, self.tokenizer.residues
             )
         )
 
-        batch_size = len(peptides_true)
+        # Use the number of original spectra as the batch_size weight so that
+        # Lightning's metric averaging stays spectrum-normalised even when
+        # chimeric spectra produce two evaluation pairs.
+        n_spectra = batch["precursor_charge"].shape[0]
         log_args = dict(on_step=False, on_epoch=True, sync_dist=True)
         self.log(
-            "pep_precision", pep_precision, **log_args, batch_size=batch_size
+            "pep_precision", pep_precision, **log_args, batch_size=n_spectra
         )
         self.log(
-            "aa_precision", aa_precision, **log_args, batch_size=batch_size
+            "aa_precision", aa_precision, **log_args, batch_size=n_spectra
         )
         return loss
+
+    def _build_chimera_eval_pairs(
+        self,
+        batch: Dict[str, torch.Tensor],
+        peptides_true: List[str],
+        pred_psms: List[psm.PepSpecMatch],
+    ) -> Tuple[List[str], List[str]]:
+        """Pair ground-truth and predicted sub-peptides for chimera evaluation.
+
+        For each spectrum, the ground-truth chimeric string ``"pep1:pep2"`` is
+        split into individual sub-peptides.  Predicted sub-peptides (already
+        split by :meth:`predict_step`) are grouped by spectrum ID and matched
+        positionally.  If the model predicted fewer sub-peptides than the
+        ground truth contains (e.g. no separator was emitted for a chimeric
+        spectrum), the missing prediction is recorded as an empty string so
+        that it counts as a miss.
+
+        Parameters
+        ----------
+        batch : Dict[str, torch.Tensor]
+            The current validation batch.
+        peptides_true : List[str]
+            Ground-truth sequences, one per spectrum (may contain ``":"``).
+        pred_psms : List[psm.PepSpecMatch]
+            Predicted PSMs returned by :meth:`predict_step`.
+
+        Returns
+        -------
+        flat_true : List[str]
+            Ground-truth sub-peptides, one entry per sub-peptide pair.
+        flat_pred : List[str]
+            Corresponding predicted sub-peptides (empty string for misses).
+        """
+        sep = self.tokenizer.chimeric_separator_token
+
+        # Group predictions by spectrum ID.
+        pred_by_spec: Dict[Tuple, List[str]] = {}
+        for m in pred_psms:
+            pred_by_spec.setdefault(m.spectrum_id, []).append(m.sequence)
+
+        flat_true: List[str] = []
+        flat_pred: List[str] = []
+
+        for peak_file, scan_id, true_str in zip(
+            batch["peak_file"], batch["scan_id"], peptides_true
+        ):
+            true_parts = true_str.split(sep) if sep in true_str else [true_str]
+            preds = pred_by_spec.get((peak_file, scan_id), [])
+
+            if len(true_parts) == 2 and len(preds) >= 2:
+                # For chimeric spectra with two predictions, try both orderings
+                # and pick the one with more exact sub-peptide matches.  This
+                # avoids penalising the model when it predicts the correct
+                # sub-peptides in the opposite order from the stored annotation.
+                t0, t1 = true_parts
+                p0, p1 = preds[0], preds[1]
+                score_straight = (p0 == t0) + (p1 == t1)
+                score_swapped = (p0 == t1) + (p1 == t0)
+                if score_swapped > score_straight:
+                    p0, p1 = p1, p0
+                flat_true.extend([t0, t1])
+                flat_pred.extend([p0, p1])
+            else:
+                for j, true_part in enumerate(true_parts):
+                    flat_true.append(true_part)
+                    flat_pred.append(preds[j] if j < len(preds) else "")
+
+        return flat_true, flat_pred
 
     def predict_step(
         self, batch: Dict[str, torch.Tensor], *args
@@ -437,7 +555,8 @@ class Spec2Pep(pl.LightningModule):
         Returns
         -------
         predictions : List[psm.PepSpecMatch]
-            Predicted PSMs for the given batch of spectra.
+            Predicted PSMs for the given batch of spectra.  In chimera mode
+            up to two PSMs are emitted per spectrum (one per sub-peptide).
         """
         # Forward pass
         logits, _ = self._forward_step(batch)  # logits: (B, L, V)
@@ -457,103 +576,259 @@ class Spec2Pep(pl.LightningModule):
             -1
         )  # (B, L)
 
-        # N-term cleanup for non-reverse tokenizer
-        if not self.tokenizer.reverse and L > 1:
+        # Vectorized N-term cleanup for non-reverse, non-chimera case only.
+        # Chimera and reverse cases are handled per-spectrum below.
+        if not self.tokenizer.reverse and L > 1 and not self.chimera:
             mask = torch.isin(predicted_tokens[:, 1:], nterm_idx)
             predicted_tokens[:, 1:][mask] = 0
 
-        # N-term fix for reverse tokenizer
-        if self.tokenizer.reverse:
-            for b in range(batch_size):
-                # Find STOP token for this spectrum
-                stop_pos = L
-                for j, t in enumerate(predicted_tokens[b]):
-                    if t == self.stop_token or t == 0:
-                        stop_pos = j
-                        break
-
-                # Allowed N-term mod position = stop_pos - 1
-                valid_pos = max(0, stop_pos - 1)
-
-                # For all positions before STOP:
-                for j in range(stop_pos):
-                    tok = int(predicted_tokens[b, j].item())
-                    if tok in nterm_set and j != valid_pos:
-                        # Mask all N-term tokens and re-decide
-                        masked = logits[b, j].clone()
-                        masked[nterm_idx] = -float("inf")
-                        newtok = masked.argmax()
-                        newtok_idx = int(
-                            newtok.item()
-                        )  # Fixed: convert to int
-
-                        predicted_tokens[b, j] = newtok
-                        # New confidence
-                        new_probs = torch.softmax(masked, dim=0)
-                        per_aa_conf[b, j] = new_probs[
-                            newtok_idx
-                        ]  # Fixed: use int index
-
         predictions: List[psm.PepSpecMatch] = []
 
-        for (
+        for b, (
             filename,
             scan,
             charge,
             prec_mz,
             tokens,
             confs,
-        ) in zip(
-            batch["peak_file"],
-            batch["scan_id"],
-            batch["precursor_charge"],
-            batch["precursor_mz"],
-            predicted_tokens,
-            per_aa_conf,
+        ) in enumerate(
+            zip(
+                batch["peak_file"],
+                batch["scan_id"],
+                batch["precursor_charge"],
+                batch["precursor_mz"],
+                predicted_tokens,
+                per_aa_conf,
+            )
         ):
-            # Find STOP position for this sequence
-            stop_pos = L
-            for j, t in enumerate(tokens):
-                if t == self.stop_token or t == 0:
-                    stop_pos = j
-                    break
-
-            valid_tokens = tokens[:stop_pos]
-            valid_scores = confs[:stop_pos].detach().cpu().numpy()
-
-            if len(valid_tokens) == 0:
-                continue
-
-            # Detokenize (ensure CPU)
-            valid_tokens_cpu = valid_tokens.detach().cpu().unsqueeze(0)
-            peptide = "".join(
-                self.tokenizer.detokenize(valid_tokens_cpu, join=False)[0]
-            )
-
-            # Reverse score order if needed
-            if self.tokenizer.reverse:
-                valid_scores = valid_scores[::-1]
-
-            pep_score = float(valid_scores.mean())
-
-            # Build PSM
-            spec_match = psm.PepSpecMatch(
-                sequence=peptide,
-                spectrum_id=(filename, scan),
-                peptide_score=pep_score,
-                charge=int(charge),
-                calc_mz=np.nan,
-                exp_mz=float(prec_mz.item()),
-                aa_scores=valid_scores,
-            )
-
-            predictions.append(spec_match)
+            if self.chimera:
+                predictions.extend(
+                    self._predict_chimera(
+                        b, filename, scan, charge, prec_mz,
+                        tokens, confs, logits, nterm_idx, nterm_set, L,
+                    )
+                )
+            else:
+                spec_match = self._predict_single(
+                    b, filename, scan, charge, prec_mz,
+                    tokens, confs, logits, nterm_idx, nterm_set, L,
+                )
+                if spec_match is not None:
+                    predictions.append(spec_match)
 
         return predictions
+
+    def _predict_single(
+        self,
+        b: int,
+        filename: str,
+        scan: str,
+        charge: torch.Tensor,
+        prec_mz: torch.Tensor,
+        tokens: torch.Tensor,
+        confs: torch.Tensor,
+        logits: torch.Tensor,
+        nterm_idx: torch.Tensor,
+        nterm_set: set,
+        L: int,
+    ):
+        """Build a single PSM from one spectrum's predicted tokens.
+
+        Handles the per-spectrum N-term fix for the reverse-tokenizer case.
+        For the non-reverse case the vectorized fix has already been applied
+        before this call.
+        """
+        # Find STOP position
+        stop_pos = L
+        for j, t in enumerate(tokens):
+            if t == self.stop_token or t == 0:
+                stop_pos = j
+                break
+
+        if self.tokenizer.reverse:
+            # Allowed N-term mod is at the last valid position (stop_pos - 1).
+            valid_pos = max(0, stop_pos - 1)
+            for j in range(stop_pos):
+                tok = int(tokens[j].item())
+                if tok in nterm_set and j != valid_pos:
+                    masked = logits[b, j].clone()
+                    masked[nterm_idx] = -float("inf")
+                    newtok_idx = int(masked.argmax().item())
+                    tokens[j] = newtok_idx
+                    new_probs = torch.softmax(masked, dim=0)
+                    confs[j] = new_probs[newtok_idx]
+
+        valid_tokens = tokens[:stop_pos]
+        valid_scores = confs[:stop_pos].detach().cpu().numpy()
+
+        if len(valid_tokens) == 0:
+            return None
+
+        valid_tokens_cpu = valid_tokens.detach().cpu().unsqueeze(0)
+        peptide = "".join(
+            self.tokenizer.detokenize(valid_tokens_cpu, join=False)[0]
+        )
+
+        if self.tokenizer.reverse:
+            valid_scores = valid_scores[::-1]
+
+        return psm.PepSpecMatch(
+            sequence=peptide,
+            spectrum_id=(filename, scan),
+            peptide_score=float(valid_scores.mean()),
+            charge=int(charge),
+            calc_mz=np.nan,
+            exp_mz=float(prec_mz.item()),
+            aa_scores=valid_scores,
+        )
+
+    def _predict_chimera(
+        self,
+        b: int,
+        filename: str,
+        scan: str,
+        charge: torch.Tensor,
+        prec_mz: torch.Tensor,
+        tokens: torch.Tensor,
+        confs: torch.Tensor,
+        logits: torch.Tensor,
+        nterm_idx: torch.Tensor,
+        nterm_set: set,
+        L: int,
+    ) -> List[psm.PepSpecMatch]:
+        """Build two PSMs from one chimeric spectrum's predicted tokens.
+
+        Locates the separator token, applies per-sub-peptide N-term fixes,
+        and returns up to two :class:`~casanovo.data.psm.PepSpecMatch` objects
+        (one per sub-peptide).  The second peptide's PSM does not apply a
+        precursor mass filter because its charge state may differ from the
+        recorded precursor charge.
+
+        Parameters
+        ----------
+        b : int
+            Index into the batch dimension (used to index *logits*).
+        tokens : torch.Tensor of shape (L,)
+            Mutable copy of argmax token indices for this spectrum.
+        confs : torch.Tensor of shape (L,)
+            Corresponding per-position confidences.
+        logits : torch.Tensor of shape (B, L, V)
+            Full logit tensor from the forward pass.
+        nterm_idx : torch.Tensor
+            Token indices of all N-terminal modification tokens.
+        nterm_set : set
+            Same indices as a Python set for fast membership tests.
+        L : int
+            Sequence length (== ``logits.shape[1]``).
+
+        Returns
+        -------
+        List[psm.PepSpecMatch]
+            Zero, one or two PSMs depending on how many non-empty sub-peptides
+            were found.
+        """
+        tokens = tokens.clone()
+        confs = confs.clone()
+
+        # Locate first STOP token (or padding zero).
+        stop_pos = L
+        for j, t in enumerate(tokens):
+            if t == self.stop_token or t == 0:
+                stop_pos = j
+                break
+
+        # Collect all separator positions before STOP.
+        sep_positions = [
+            j for j in range(stop_pos)
+            if int(tokens[j].item()) == self.sep_token
+        ]
+
+        # Discard tokens after the second separator to ensure at most two
+        # peptides are predicted.
+        if len(sep_positions) >= 2:
+            stop_pos = sep_positions[1]
+
+        if len(sep_positions) == 0:
+            # No separator found: fall back to single-peptide path.
+            spec_match = self._predict_single(
+                b, filename, scan, charge, prec_mz,
+                tokens, confs, logits, nterm_idx, nterm_set, L,
+            )
+            return [spec_match] if spec_match is not None else []
+
+        sep_pos = sep_positions[0]
+
+        # Apply per-sub-peptide N-term fixes.
+        if not self.tokenizer.reverse:
+            # Forward tokenizer: valid N-term positions are 0 and sep_pos+1.
+            invalid_ranges = [
+                range(1, sep_pos),
+                range(sep_pos + 2, stop_pos),
+            ]
+        else:
+            # Reverse tokenizer: valid N-term positions are sep_pos-1 and
+            # stop_pos-1 (last position of each reversed sub-peptide).
+            invalid_ranges = [
+                range(0, max(0, sep_pos - 1)),
+                range(sep_pos + 1, max(sep_pos + 1, stop_pos - 1)),
+            ]
+
+        for rng in invalid_ranges:
+            for j in rng:
+                tok = int(tokens[j].item())
+                if tok in nterm_set:
+                    masked = logits[b, j].clone()
+                    masked[nterm_idx] = -float("inf")
+                    newtok_idx = int(masked.argmax().item())
+                    tokens[j] = newtok_idx
+                    new_probs = torch.softmax(masked, dim=0)
+                    confs[j] = new_probs[newtok_idx]
+
+        # Extract sub-sequences. sub1 is tokens before the first separator;
+        # sub2 is tokens between the first separator and stop_pos (which is
+        # either the original stop position or the second separator position).
+        sub1_tok = tokens[:sep_pos]
+        sub1_conf = confs[:sep_pos].detach().cpu().numpy()
+
+        sub2_tok = tokens[sep_pos + 1 : stop_pos]
+        sub2_conf = confs[sep_pos + 1 : stop_pos].detach().cpu().numpy()
+
+        if self.tokenizer.reverse:
+            sub1_conf = sub1_conf[::-1]
+            sub2_conf = sub2_conf[::-1]
+
+        results: List[psm.PepSpecMatch] = []
+        for sub_tokens, sub_scores in [(sub1_tok, sub1_conf), (sub2_tok, sub2_conf)]:
+            if len(sub_tokens) == 0:
+                continue
+            sub_tokens_cpu = sub_tokens.detach().cpu().unsqueeze(0)
+            peptide = "".join(
+                self.tokenizer.detokenize(sub_tokens_cpu, join=False)[0]
+            )
+            results.append(
+                psm.PepSpecMatch(
+                    sequence=peptide,
+                    spectrum_id=(filename, scan),
+                    peptide_score=float(sub_scores.mean()),
+                    charge=int(charge),
+                    calc_mz=np.nan,
+                    exp_mz=float(prec_mz.item()),
+                    aa_scores=sub_scores,
+                )
+            )
+
+        return results
 
     def on_train_epoch_end(self) -> None:
         """
         Log the training loss at the end of each epoch.
+
+        Records the running average of per-step losses accumulated during
+        training (model weights were still changing, so early-epoch batches
+        are included with a less-trained model).  The eval-mode train pass
+        that produces ``train_eval`` is run in
+        :meth:`on_validation_epoch_end` so that both eval passes occur
+        back-to-back.
         """
         if "train_CELoss" in self.trainer.callback_metrics:
             train_loss = (
@@ -561,17 +836,32 @@ class Spec2Pep(pl.LightningModule):
             )
         else:
             train_loss = np.nan
-        metrics = {"step": self.trainer.global_step, "train": train_loss}
+
+        metrics = {
+            "step": self.trainer.global_step,
+            "train": train_loss,
+        }
+        metrics.update(getattr(self, "_pending_valid_metrics", {}))
+        self._pending_valid_metrics = {}
         self._history.append(metrics)
         self._log_history()
 
     def on_validation_epoch_end(self) -> None:
         """
-        Log the validation metrics at the end of each epoch.
+        Log the validation metrics and eval-mode training loss.
+
+        Both eval passes (validation set and training set) are performed
+        here back-to-back so that ``train_eval`` and ``valid`` are computed
+        under identical conditions.
+
+        - ``valid``: loss on the held-out validation set.
+        - ``train_eval``: loss computed in eval mode over the full training
+          set after all weight updates for the interval, using the same loss
+          function as validation (no label smoothing).  Directly comparable
+          to the validation loss.
         """
         callback_metrics = self.trainer.callback_metrics
         metrics = {
-            "step": self.trainer.global_step,
             "valid": callback_metrics["valid_CELoss"].detach().item(),
         }
 
@@ -582,8 +872,66 @@ class Spec2Pep(pl.LightningModule):
             metrics["valid_pep_precision"] = (
                 callback_metrics["pep_precision"].detach().item()
             )
-        self._history.append(metrics)
-        self._log_history()
+
+        # --- eval-mode pass over the full training set ---
+        # Use a dedicated non-shuffled dataloader (separate IterDataPipe
+        # instance) so we don't create a second iterator on the same
+        # ShufflerIterDataPipe that Lightning's training loop holds active.
+        train_eval_dl = getattr(self, "train_eval_dataloader", None)
+        if train_eval_dl is None:
+            self._pending_valid_metrics = metrics
+            return
+        self.eval()
+        total_loss = 0.0
+        total_tokens = 0
+        with torch.no_grad():
+            for batch in train_eval_dl:
+                batch = {
+                    k: v.to(self.device) if hasattr(v, "to") else v
+                    for k, v in batch.items()
+                }
+                pred, truth = self._forward_step(batch)
+                batch_size, seq_len = truth.shape
+                seq_len = min(seq_len, self.max_peptide_len)
+                truth = truth[:, :seq_len]
+                pred_flat = pred[:, :seq_len, :].reshape(-1, self.vocab_size)
+                if self.chimera and "seq_compliment" in batch:
+                    truth_comp = batch["seq_compliment"][:, :seq_len]
+                    mask = (truth != 0).float()
+                    n_real = mask.sum(dim=1).clamp(min=1)
+                    raw_a = self.val_celoss(
+                        pred_flat, truth.flatten()
+                    ).reshape(batch_size, seq_len)
+                    raw_b = self.val_celoss(
+                        pred_flat, truth_comp.flatten()
+                    ).reshape(batch_size, seq_len)
+                    loss_a_norm = (raw_a * mask).sum(dim=1) / n_real
+                    loss_b_norm = (raw_b * mask).sum(dim=1) / n_real
+                    winner = (loss_b_norm < loss_a_norm).float().unsqueeze(1)
+                    n_real_total = mask.sum().clamp(min=1)
+                    total_loss += (
+                        (raw_a * (1 - winner) + raw_b * winner).sum().item()
+                    )
+                    total_tokens += n_real_total.item()
+                else:
+                    raw = self.val_celoss(pred_flat, truth.flatten())
+                    n_real = (truth.flatten() != 0).float().sum().clamp(min=1)
+                    total_loss += raw.sum().item()
+                    total_tokens += n_real.item()
+        self.train()
+        train_eval_loss = (
+            total_loss / total_tokens if total_tokens > 0 else np.nan
+        )
+        self.log(
+            "train_eval_CELoss",
+            train_eval_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        metrics["train_eval"] = train_eval_loss
+
+        self._pending_valid_metrics = metrics
 
     def on_predict_batch_end(
         self, outputs: List[psm.PepSpecMatch], *args
@@ -611,9 +959,13 @@ class Spec2Pep(pl.LightningModule):
                 spec_match.aa_scores = spec_match.aa_scores[1:]
 
             # Compute the precursor m/z of the predicted peptide.
-            spec_match.calc_mz = self.tokenizer.calculate_precursor_ions(
-                spec_match.sequence, torch.tensor(spec_match.charge)
-            ).item()
+            # In chimera mode the recorded precursor belongs to the peptide
+            # pair, not to an individual sub-peptide, so calc_mz is left as
+            # NaN to avoid misleading comparisons against exp_mz.
+            if not self.chimera:
+                spec_match.calc_mz = self.tokenizer.calculate_precursor_ions(
+                    spec_match.sequence, torch.tensor(spec_match.charge)
+                ).item()
 
             self.out_writer.psms.append(spec_match)
 
@@ -633,17 +985,18 @@ class Spec2Pep(pl.LightningModule):
         if len(self._history) == 0:
             return
         if len(self._history) == 1:
-            header = "Step\tTrain loss\tValid loss\t"
+            header = "Step\tTrain loss\tTrain eval loss\tValid loss\t"
             if self.calculate_precision:
                 header += "Peptide precision\tAA precision"
 
             logger.info(header)
         metrics = self._history[-1]
         if metrics["step"] % self.n_log == 0:
-            msg = "%i\t%.6f\t%.6f"
+            msg = "%i\t%.6f\t%.6f\t%.6f"
             vals = [
                 metrics["step"],
                 metrics.get("train", np.nan),
+                metrics.get("train_eval", np.nan),
                 metrics.get("valid", np.nan),
             ]
 

@@ -194,6 +194,10 @@ class DeNovoDataModule(pl.LightningDataModule):
         torch.utils.data.Dataset
             A PyTorch Dataset for the given peak files.
         """
+        # Lazy import to avoid circular dependency with chimera.py.
+        from .chimera import ChimeraAnnotatedSpectrumDataset, ChimeraTokenizer
+
+        is_chimera = isinstance(self.tokenizer, ChimeraTokenizer)
         custom_fields = [self.custom_field_anno] if annotated else []
         lance_path = pathlib.Path(f"{self.lance_dir}/{mode}.lance")
 
@@ -216,7 +220,10 @@ class DeNovoDataModule(pl.LightningDataModule):
         )
 
         if annotated:
-            Dataset, params = AnnotatedSpectrumDataset, anno_dataset_params
+            if is_chimera:
+                Dataset, params = ChimeraAnnotatedSpectrumDataset, anno_dataset_params
+            else:
+                Dataset, params = AnnotatedSpectrumDataset, anno_dataset_params
         else:
             Dataset, params = SpectrumDataset, dataset_params
 
@@ -269,6 +276,18 @@ class DeNovoDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> torch.utils.data.DataLoader:
         """Get the training DataLoader."""
         return self._make_loader(self.train_dataset, shuffle=self.shuffle)
+
+    def train_eval_dataloader(self) -> torch.utils.data.DataLoader:
+        """Get a non-shuffled DataLoader over the training data for eval-mode loss.
+
+        Creates a fresh dataset object (new IterDataPipe instance) backed by
+        the same Lance file so it can be iterated concurrently with the
+        shuffled training dataloader that Lightning holds during validation.
+        """
+        dataset = self._make_dataset(
+            self.train_paths, annotated=True, mode="train", shuffle=False
+        )
+        return self._make_loader(dataset)
 
     def val_dataloader(self) -> torch.utils.data.DataLoader:
         """Get the validation DataLoader."""

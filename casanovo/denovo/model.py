@@ -379,11 +379,11 @@ class Spec2Pep(pl.LightningModule):
             truth_comp = batch["seq_compliment"][:, :seq_len]
             mask = (truth != 0).float()
             n_real = mask.sum(dim=1).clamp(min=1)
-            raw_a = (
-                loss_fun(pred_flat, truth.flatten()).reshape(batch_size, seq_len)
+            raw_a = loss_fun(pred_flat, truth.flatten()).reshape(
+                batch_size, seq_len
             )
-            raw_b = (
-                loss_fun(pred_flat, truth_comp.flatten()).reshape(batch_size, seq_len)
+            raw_b = loss_fun(pred_flat, truth_comp.flatten()).reshape(
+                batch_size, seq_len
             )
             # Mask-normalised loss used only for ordering selection.
             loss_a_norm = (raw_a * mask).sum(dim=1) / n_real
@@ -603,18 +603,35 @@ class Spec2Pep(pl.LightningModule):
             if self.chimera:
                 predictions.extend(
                     self._predict_chimera(
-                        b, filename, scan, charge, prec_mz,
-                        tokens, confs, logits, nterm_idx, nterm_set, L,
+                        b,
+                        filename,
+                        scan,
+                        charge,
+                        prec_mz,
+                        tokens,
+                        confs,
+                        logits,
+                        nterm_idx,
+                        nterm_set,
+                        L,
                     )
                 )
             else:
                 spec_match = self._predict_single(
-                    b, filename, scan, charge, prec_mz,
-                    tokens, confs, logits, nterm_idx, nterm_set, L,
+                    b,
+                    filename,
+                    scan,
+                    charge,
+                    prec_mz,
+                    tokens,
+                    confs,
+                    logits,
+                    nterm_idx,
+                    nterm_set,
+                    L,
                 )
                 if spec_match is not None:
                     predictions.append(spec_match)
-
         return predictions
 
     def _predict_single(
@@ -652,6 +669,11 @@ class Spec2Pep(pl.LightningModule):
                 if tok in nterm_set and j != valid_pos:
                     masked = logits[b, j].clone()
                     masked[nterm_idx] = -float("inf")
+                    # Also mask stop and separator so they can't be
+                    # introduced into the middle of the sequence.
+                    masked[self.stop_token] = -float("inf")
+                    if self.chimera:
+                        masked[self.sep_token] = -float("inf")
                     newtok_idx = int(masked.argmax().item())
                     tokens[j] = newtok_idx
                     new_probs = torch.softmax(masked, dim=0)
@@ -667,6 +689,11 @@ class Spec2Pep(pl.LightningModule):
         peptide = "".join(
             self.tokenizer.detokenize(valid_tokens_cpu, join=False)[0]
         )
+
+        # A lone N-terminal modification (e.g. "[Acetyl]-") has no amino
+        # acids and is invalid ProForma — skip it.
+        if not peptide or peptide.endswith("-"):
+            return None
 
         if self.tokenizer.reverse:
             valid_scores = valid_scores[::-1]
@@ -726,97 +753,64 @@ class Spec2Pep(pl.LightningModule):
             Zero, one or two PSMs depending on how many non-empty sub-peptides
             were found.
         """
+
+        def build_single(
+            tok_slice: torch.Tensor,
+            conf_slice: torch.Tensor,
+            logit_slice: torch.Tensor,
+        ) -> Optional[psm.PepSpecMatch]:
+            return self._predict_single(
+                b,
+                filename,
+                scan,
+                charge,
+                prec_mz,
+                tok_slice,
+                conf_slice,
+                logit_slice,
+                nterm_idx,
+                nterm_set,
+                len(tok_slice),
+            )
+
         tokens = tokens.clone()
         confs = confs.clone()
 
-        # Locate first STOP token (or padding zero).
         stop_pos = L
         for j, t in enumerate(tokens):
             if t == self.stop_token or t == 0:
                 stop_pos = j
                 break
 
-        # Collect all separator positions before STOP.
         sep_positions = [
-            j for j in range(stop_pos)
+            j
+            for j in range(stop_pos)
             if int(tokens[j].item()) == self.sep_token
         ]
 
-        # Discard tokens after the second separator to ensure at most two
-        # peptides are predicted.
+        # No separator: fall back to normal single-peptide prediction.
+        if not sep_positions:
+            spec_match = build_single(tokens, confs, logits)
+            return [spec_match] if spec_match is not None else []
+
+        # Keep at most two sub-peptides.
         if len(sep_positions) >= 2:
             stop_pos = sep_positions[1]
 
-        if len(sep_positions) == 0:
-            # No separator found: fall back to single-peptide path.
-            spec_match = self._predict_single(
-                b, filename, scan, charge, prec_mz,
-                tokens, confs, logits, nterm_idx, nterm_set, L,
-            )
-            return [spec_match] if spec_match is not None else []
-
         sep_pos = sep_positions[0]
 
-        # Apply per-sub-peptide N-term fixes.
-        if not self.tokenizer.reverse:
-            # Forward tokenizer: valid N-term positions are 0 and sep_pos+1.
-            invalid_ranges = [
-                range(1, sep_pos),
-                range(sep_pos + 2, stop_pos),
-            ]
-        else:
-            # Reverse tokenizer: valid N-term positions are sep_pos-1 and
-            # stop_pos-1 (last position of each reversed sub-peptide).
-            invalid_ranges = [
-                range(0, max(0, sep_pos - 1)),
-                range(sep_pos + 1, max(sep_pos + 1, stop_pos - 1)),
-            ]
+        left = build_single(
+            tokens[:sep_pos],
+            confs[:sep_pos],
+            logits[:, :sep_pos, :],
+        )
+        right = build_single(
+            tokens[sep_pos + 1 : stop_pos],
+            confs[sep_pos + 1 : stop_pos],
+            logits[:, sep_pos + 1 : stop_pos, :],
+        )
 
-        for rng in invalid_ranges:
-            for j in rng:
-                tok = int(tokens[j].item())
-                if tok in nterm_set:
-                    masked = logits[b, j].clone()
-                    masked[nterm_idx] = -float("inf")
-                    newtok_idx = int(masked.argmax().item())
-                    tokens[j] = newtok_idx
-                    new_probs = torch.softmax(masked, dim=0)
-                    confs[j] = new_probs[newtok_idx]
-
-        # Extract sub-sequences. sub1 is tokens before the first separator;
-        # sub2 is tokens between the first separator and stop_pos (which is
-        # either the original stop position or the second separator position).
-        sub1_tok = tokens[:sep_pos]
-        sub1_conf = confs[:sep_pos].detach().cpu().numpy()
-
-        sub2_tok = tokens[sep_pos + 1 : stop_pos]
-        sub2_conf = confs[sep_pos + 1 : stop_pos].detach().cpu().numpy()
-
-        if self.tokenizer.reverse:
-            sub1_conf = sub1_conf[::-1]
-            sub2_conf = sub2_conf[::-1]
-
-        results: List[psm.PepSpecMatch] = []
-        for sub_tokens, sub_scores in [(sub1_tok, sub1_conf), (sub2_tok, sub2_conf)]:
-            if len(sub_tokens) == 0:
-                continue
-            sub_tokens_cpu = sub_tokens.detach().cpu().unsqueeze(0)
-            peptide = "".join(
-                self.tokenizer.detokenize(sub_tokens_cpu, join=False)[0]
-            )
-            results.append(
-                psm.PepSpecMatch(
-                    sequence=peptide,
-                    spectrum_id=(filename, scan),
-                    peptide_score=float(sub_scores.mean()),
-                    charge=int(charge),
-                    calc_mz=np.nan,
-                    exp_mz=float(prec_mz.item()),
-                    aa_scores=sub_scores,
-                )
-            )
-
-        return results
+        return [m for m in (left, right) if m is not None]
 
     def on_train_epoch_end(self) -> None:
         """

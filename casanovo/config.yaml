@@ -44,6 +44,19 @@ n_beams: 1
 
 
 ###
+# The following parameters are unique to Casanovo-chimera's de novo sequencing mode.
+###
+
+# Isotope error range for chimera sub-peptide charge assignment.
+# A wider range reduces errors when the precursor was isolated from a
+# non-monoisotopic isotope peak.
+chimera_isotope_error_range: [0, 2]
+# Maximum charge state to try when assigning a charge to each chimera
+# sub-peptide (charges 1..chimera_max_charge are enumerated).
+chimera_max_charge: 4
+
+
+###
 # The following parameters are unique to Casanovo's database search mode.
 ###
 

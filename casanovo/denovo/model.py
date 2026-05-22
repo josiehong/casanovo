@@ -127,6 +127,8 @@ class Spec2Pep(pl.LightningModule):
         out_writer: Optional[ms_io.MztabWriter] = None,
         calculate_precision: bool = False,
         tokenizer: PeptideTokenizer | None = None,
+        chimera_isotope_error_range: Tuple[int, int] = (0, 2),
+        chimera_max_charge: int = 4,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -190,6 +192,8 @@ class Spec2Pep(pl.LightningModule):
             self.sep_token = self.tokenizer.index[
                 self.tokenizer.chimeric_separator_token
             ]
+        self.chimera_isotope_error_range = chimera_isotope_error_range
+        self.chimera_max_charge = chimera_max_charge
 
         # Logging.
         self.calculate_precision = calculate_precision
@@ -708,6 +712,37 @@ class Spec2Pep(pl.LightningModule):
             aa_scores=valid_scores,
         )
 
+    def _assign_chimera_charge(
+        self,
+        sequence: str,
+        obs_mz: float,
+    ) -> Tuple[int, float]:
+        """Return (charge, calc_mz) for the best charge assignment.
+
+        Enumerates charge states 1..chimera_max_charge and isotope offsets
+        within chimera_isotope_error_range, picking the combination that
+        minimises |calc_mz - (obs_mz - iso * 1.00335 / z)| in ppm.
+        Returns (1, nan) if calculate_precursor_ions raises for all charges.
+        """
+        best_charge, best_calc_mz, best_err_ppm = 1, float("nan"), float("inf")
+        iso_start, iso_end = self.chimera_isotope_error_range
+        for z in range(1, self.chimera_max_charge + 1):
+            try:
+                calc_mz = self.tokenizer.calculate_precursor_ions(
+                    sequence, torch.tensor(z)
+                ).item()
+            except Exception:
+                continue
+            for iso in range(iso_start, iso_end + 1):
+                err_ppm = (
+                    abs(calc_mz - (obs_mz - iso * 1.00335 / z)) / obs_mz * 1e6
+                )
+                if err_ppm < best_err_ppm:
+                    best_err_ppm = err_ppm
+                    best_charge = z
+                    best_calc_mz = calc_mz
+        return best_charge, best_calc_mz
+
     def _predict_chimera(
         self,
         b: int,
@@ -872,10 +907,16 @@ class Spec2Pep(pl.LightningModule):
                 spec_match.aa_scores = spec_match.aa_scores[1:]
 
             # Compute the precursor m/z of the predicted peptide.
-            # In chimera mode the recorded precursor belongs to the peptide
-            # pair, not to an individual sub-peptide, so calc_mz is left as
-            # NaN to avoid misleading comparisons against exp_mz.
-            if not self.chimera:
+            if self.chimera:
+                # Each chimera sub-peptide may carry a different charge, so
+                # enumerate 1..chimera_max_charge and pick the best match to
+                # the observed precursor m/z.
+                charge, calc_mz = self._assign_chimera_charge(
+                    spec_match.sequence, spec_match.exp_mz
+                )
+                spec_match.charge = charge
+                spec_match.calc_mz = calc_mz
+            else:
                 spec_match.calc_mz = self.tokenizer.calculate_precursor_ions(
                     spec_match.sequence, torch.tensor(spec_match.charge)
                 ).item()

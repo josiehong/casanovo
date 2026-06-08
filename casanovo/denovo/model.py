@@ -769,6 +769,31 @@ class Spec2Pep(pl.LightningModule):
                     best_calc_mz = calc_mz
         return best_charge, best_calc_mz
 
+    def _residue_len(self, sequence: str) -> int:
+        """Number of amino-acid residues in a ProForma sequence.
+
+        Counts residue tokens only; N-term modification tokens (which end
+        in ``-``) are excluded.
+        """
+        return sum(
+            1
+            for tok in self.tokenizer.split(sequence)
+            if not tok.endswith("-")
+        )
+
+    def _has_internal_nterm_mod(self, sequence: str) -> bool:
+        """Whether an N-term modification appears past the sequence start.
+
+        A single leading N-term mod is valid; any further occurrence makes
+        the ProForma invalid (e.g. "PEP[Acetyl]-TIDE").
+        """
+        rest = sequence
+        for mod in self.n_term:
+            if rest.startswith(mod):
+                rest = rest[len(mod):]
+                break
+        return any(mod in rest for mod in self.n_term)
+
     def _predict_chimera(
         self,
         b: int,
@@ -854,93 +879,98 @@ class Spec2Pep(pl.LightningModule):
         stats = self._chimera_drop_stats
         stats["spectra_total"] += 1
 
-        # No separator: fall back to normal single-peptide prediction.
-        # This is correct behavior for true single-peptide spectra and a
-        # miss for true chimeras — we cannot tell the two apart here.
-        if not sep_positions:
-            spec_match = build_single(tokens, confs, logits)
+        # Decode one segment per separator-delimited region of [0, stop_pos).
+        # No separator gives a single segment; N separators give N + 1.
+        bounds = [-1, *sep_positions, stop_pos]
+        candidates = []  # (peptide_score, residue_len, PepSpecMatch)
+        for k in range(len(bounds) - 1):
+            seg_start = bounds[k] + 1
+            seg_end = bounds[k + 1]  # position of the terminating sep/stop
+            term_score = (
+                float(confs[seg_end].detach().cpu().item())
+                if seg_end < L
+                else None
+            )
+            spec_match = build_single(
+                tokens[seg_start:seg_end],
+                confs[seg_start:seg_end],
+                logits[:, seg_start:seg_end, :],
+                stop_score=term_score,
+            )
+
+            # Drop empty / undecodable segments (empty slice or lone N-term
+            # mod) — build_single returns None for these.
             if spec_match is None:
-                stats["no_separator_invalid_peptide"] += 1
+                stats["invalid_peptide"] += 1
                 logger.debug(
-                    "chimera-drop %s scan=%s reason=no_separator_invalid_peptide",
+                    "chimera-drop %s scan=%s reason=invalid_peptide "
+                    "seg=[%d,%d)",
                     filename,
                     scan,
+                    seg_start,
+                    seg_end,
                 )
-            else:
-                stats["no_separator_single_psm"] += 1
-            return [spec_match] if spec_match is not None else []
+                continue
 
-        if len(sep_positions) > 2:
-            stats["extra_separators_discarded"] += 1
+            # Drop sequences with an N-term mod anywhere but the start
+            # (e.g. "PEP[Acetyl]-TIDE"), which is invalid ProForma.
+            if self._has_internal_nterm_mod(spec_match.sequence):
+                stats["invalid_peptide"] += 1
+                logger.debug(
+                    "chimera-drop %s scan=%s reason=invalid_internal_nterm "
+                    "seq=%s",
+                    filename,
+                    scan,
+                    spec_match.sequence,
+                )
+                continue
+
+            # (1) Drop peptides shorter than the configured minimum length.
+            res_len = self._residue_len(spec_match.sequence)
+            if res_len < self.min_peptide_len:
+                stats["too_short"] += 1
+                logger.debug(
+                    "chimera-drop %s scan=%s reason=too_short len=%d min=%d",
+                    filename,
+                    scan,
+                    res_len,
+                    self.min_peptide_len,
+                )
+                continue
+
+            candidates.append(
+                (spec_match.peptide_score, res_len, spec_match)
+            )
+
+        # (2) Accept the two highest-scoring remaining peptides, dropping
+        # duplicate sequences first.
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        kept, seen = [], set()
+        for _, _, spec_match in candidates:
+            if spec_match.sequence in seen:
+                stats["duplicate_dropped"] += 1
+                logger.debug(
+                    "chimera-drop %s scan=%s reason=duplicate seq=%s",
+                    filename,
+                    scan,
+                    spec_match.sequence,
+                )
+                continue
+            seen.add(spec_match.sequence)
+            kept.append(spec_match)
+
+        if len(kept) > 2:
+            stats["excess_dropped"] += len(kept) - 2
             logger.debug(
-                "chimera-drop %s scan=%s reason=extra_separators_discarded n=%d",
+                "chimera-drop %s scan=%s reason=excess_dropped n=%d",
                 filename,
                 scan,
-                len(sep_positions),
+                len(kept) - 2,
             )
+            kept = kept[:2]
 
-        # Keep at most two sub-peptides.
-        if len(sep_positions) >= 2:
-            stop_pos = sep_positions[1]
-
-        sep_pos = sep_positions[0]
-
-        # The separator acts as sub-peptide 1's stop; sub-peptide 2 ends
-        # at the actual stop (or the second separator when present).
-        left_stop_score = float(confs[sep_pos].detach().cpu().item())
-        right_stop_score = (
-            float(confs[stop_pos].detach().cpu().item())
-            if stop_pos < L
-            else None
-        )
-        left = build_single(
-            tokens[:sep_pos],
-            confs[:sep_pos],
-            logits[:, :sep_pos, :],
-            stop_score=left_stop_score,
-        )
-        right = build_single(
-            tokens[sep_pos + 1 : stop_pos],
-            confs[sep_pos + 1 : stop_pos],
-            logits[:, sep_pos + 1 : stop_pos, :],
-            stop_score=right_stop_score,
-        )
-
-        # Attribute each missing sub-peptide to its structural cause so the
-        # summary can distinguish empty-slice artifacts (sep at edge) from
-        # detokenization failures (lone N-term mod / empty peptide).
-        if left is None:
-            reason = (
-                "empty_left_slice" if sep_pos == 0 else "invalid_left_peptide"
-            )
-            stats[reason] += 1
-            logger.debug(
-                "chimera-drop %s scan=%s reason=%s sep_pos=%d stop_pos=%d",
-                filename,
-                scan,
-                reason,
-                sep_pos,
-                stop_pos,
-            )
-        if right is None:
-            reason = (
-                "empty_right_slice"
-                if sep_pos + 1 >= stop_pos
-                else "invalid_right_peptide"
-            )
-            stats[reason] += 1
-            logger.debug(
-                "chimera-drop %s scan=%s reason=%s sep_pos=%d stop_pos=%d",
-                filename,
-                scan,
-                reason,
-                sep_pos,
-                stop_pos,
-            )
-        if left is not None and right is not None:
-            stats["two_psms"] += 1
-
-        return [m for m in (left, right) if m is not None]
+        stats[("no_psm", "one_psm", "two_psms")[min(len(kept), 2)]] += 1
+        return kept
 
     def on_train_epoch_end(self) -> None:
         """
@@ -1029,13 +1059,12 @@ class Spec2Pep(pl.LightningModule):
         ordered_keys = [
             "spectra_total",
             "two_psms",
-            "no_separator_single_psm",
-            "no_separator_invalid_peptide",
-            "empty_left_slice",
-            "empty_right_slice",
-            "invalid_left_peptide",
-            "invalid_right_peptide",
-            "extra_separators_discarded",
+            "one_psm",
+            "no_psm",
+            "invalid_peptide",
+            "too_short",
+            "duplicate_dropped",
+            "excess_dropped",
         ]
         lines = ["Chimera sub-peptide drop summary (predict run):"]
         for k in ordered_keys:

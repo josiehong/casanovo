@@ -651,12 +651,18 @@ class Spec2Pep(pl.LightningModule):
         nterm_idx: torch.Tensor,
         nterm_set: set,
         L: int,
+        stop_score: Optional[float] = None,
     ):
         """Build a single PSM from one spectrum's predicted tokens.
 
         Handles the per-spectrum N-term fix for the reverse-tokenizer case.
         For the non-reverse case the vectorized fix has already been applied
         before this call.
+
+        ``stop_score`` lets the caller supply the terminating-token
+        confidence when it lives outside ``tokens``/``confs`` (e.g. the
+        chimera separator that bounds a sub-peptide). When ``None`` the
+        confidence at the detected stop position within ``confs`` is used.
         """
         # Find STOP position
         stop_pos = L
@@ -699,13 +705,28 @@ class Spec2Pep(pl.LightningModule):
         if not peptide or peptide.endswith("-"):
             return None
 
+        # Include the terminating-token confidence (':' for a chimera
+        # sub-peptide, '$' otherwise) in the peptide score but not in the
+        # reported per-aa scores. Mirrors the AR model's `_peptide_score`
+        # (geometric product of per-aa confidences).
+        if stop_score is None and stop_pos < L:
+            stop_score = float(confs[stop_pos].detach().cpu().item())
+        scored = (
+            np.append(valid_scores, stop_score)
+            if stop_score is not None
+            else valid_scores
+        )
+        peptide_score = float(
+            _peptide_score(scored, fits_precursor_mz=True)
+        )
+
         if self.tokenizer.reverse:
             valid_scores = valid_scores[::-1]
 
         return psm.PepSpecMatch(
             sequence=peptide,
             spectrum_id=(filename, scan),
-            peptide_score=float(valid_scores.mean()),
+            peptide_score=peptide_score,
             charge=int(charge),
             calc_mz=np.nan,
             exp_mz=float(prec_mz.item()),
@@ -793,6 +814,7 @@ class Spec2Pep(pl.LightningModule):
             tok_slice: torch.Tensor,
             conf_slice: torch.Tensor,
             logit_slice: torch.Tensor,
+            stop_score: Optional[float] = None,
         ) -> Optional[psm.PepSpecMatch]:
             return self._predict_single(
                 b,
@@ -806,6 +828,7 @@ class Spec2Pep(pl.LightningModule):
                 nterm_idx,
                 nterm_set,
                 len(tok_slice),
+                stop_score=stop_score,
             )
 
         tokens = tokens.clone()
@@ -834,15 +857,25 @@ class Spec2Pep(pl.LightningModule):
 
         sep_pos = sep_positions[0]
 
+        # The separator acts as sub-peptide 1's stop; sub-peptide 2 ends
+        # at the actual stop (or the second separator when present).
+        left_stop_score = float(confs[sep_pos].detach().cpu().item())
+        right_stop_score = (
+            float(confs[stop_pos].detach().cpu().item())
+            if stop_pos < L
+            else None
+        )
         left = build_single(
             tokens[:sep_pos],
             confs[:sep_pos],
             logits[:, :sep_pos, :],
+            stop_score=left_stop_score,
         )
         right = build_single(
             tokens[sep_pos + 1 : stop_pos],
             confs[sep_pos + 1 : stop_pos],
             logits[:, sep_pos + 1 : stop_pos, :],
+            stop_score=right_stop_score,
         )
 
         return [m for m in (left, right) if m is not None]

@@ -195,6 +195,11 @@ class Spec2Pep(pl.LightningModule):
         self.chimera_isotope_error_range = chimera_isotope_error_range
         self.chimera_max_charge = chimera_max_charge
 
+        # Debug counters for why a chimeric spectrum yields <2 PSMs.
+        # See `_predict_chimera` for where each case is incremented and
+        # `on_predict_end` for the summary log.
+        self._chimera_drop_stats = collections.Counter()
+
         # Logging.
         self.calculate_precision = calculate_precision
         self.n_log = n_log
@@ -651,12 +656,18 @@ class Spec2Pep(pl.LightningModule):
         nterm_idx: torch.Tensor,
         nterm_set: set,
         L: int,
+        stop_score: Optional[float] = None,
     ):
         """Build a single PSM from one spectrum's predicted tokens.
 
         Handles the per-spectrum N-term fix for the reverse-tokenizer case.
         For the non-reverse case the vectorized fix has already been applied
         before this call.
+
+        ``stop_score`` lets the caller supply the terminating-token
+        confidence when it lives outside ``tokens``/``confs`` (e.g. the
+        chimera separator that bounds a sub-peptide). When ``None`` the
+        confidence at the detected stop position within ``confs`` is used.
         """
         # Find STOP position
         stop_pos = L
@@ -699,13 +710,28 @@ class Spec2Pep(pl.LightningModule):
         if not peptide or peptide.endswith("-"):
             return None
 
+        # Include the terminating-token confidence (':' for a chimera
+        # sub-peptide, '$' otherwise) in the peptide score but not in the
+        # reported per-aa scores. Mirrors the AR model's `_peptide_score`
+        # (geometric product of per-aa confidences).
+        if stop_score is None and stop_pos < L:
+            stop_score = float(confs[stop_pos].detach().cpu().item())
+        scored = (
+            np.append(valid_scores, stop_score)
+            if stop_score is not None
+            else valid_scores
+        )
+        peptide_score = float(
+            _peptide_score(scored, fits_precursor_mz=True)
+        )
+
         if self.tokenizer.reverse:
             valid_scores = valid_scores[::-1]
 
         return psm.PepSpecMatch(
             sequence=peptide,
             spectrum_id=(filename, scan),
-            peptide_score=float(valid_scores.mean()),
+            peptide_score=peptide_score,
             charge=int(charge),
             calc_mz=np.nan,
             exp_mz=float(prec_mz.item()),
@@ -793,6 +819,7 @@ class Spec2Pep(pl.LightningModule):
             tok_slice: torch.Tensor,
             conf_slice: torch.Tensor,
             logit_slice: torch.Tensor,
+            stop_score: Optional[float] = None,
         ) -> Optional[psm.PepSpecMatch]:
             return self._predict_single(
                 b,
@@ -806,6 +833,7 @@ class Spec2Pep(pl.LightningModule):
                 nterm_idx,
                 nterm_set,
                 len(tok_slice),
+                stop_score=stop_score,
             )
 
         tokens = tokens.clone()
@@ -823,10 +851,33 @@ class Spec2Pep(pl.LightningModule):
             if int(tokens[j].item()) == self.sep_token
         ]
 
+        stats = self._chimera_drop_stats
+        stats["spectra_total"] += 1
+
         # No separator: fall back to normal single-peptide prediction.
+        # This is correct behavior for true single-peptide spectra and a
+        # miss for true chimeras — we cannot tell the two apart here.
         if not sep_positions:
             spec_match = build_single(tokens, confs, logits)
+            if spec_match is None:
+                stats["no_separator_invalid_peptide"] += 1
+                logger.debug(
+                    "chimera-drop %s scan=%s reason=no_separator_invalid_peptide",
+                    filename,
+                    scan,
+                )
+            else:
+                stats["no_separator_single_psm"] += 1
             return [spec_match] if spec_match is not None else []
+
+        if len(sep_positions) > 2:
+            stats["extra_separators_discarded"] += 1
+            logger.debug(
+                "chimera-drop %s scan=%s reason=extra_separators_discarded n=%d",
+                filename,
+                scan,
+                len(sep_positions),
+            )
 
         # Keep at most two sub-peptides.
         if len(sep_positions) >= 2:
@@ -834,16 +885,60 @@ class Spec2Pep(pl.LightningModule):
 
         sep_pos = sep_positions[0]
 
+        # The separator acts as sub-peptide 1's stop; sub-peptide 2 ends
+        # at the actual stop (or the second separator when present).
+        left_stop_score = float(confs[sep_pos].detach().cpu().item())
+        right_stop_score = (
+            float(confs[stop_pos].detach().cpu().item())
+            if stop_pos < L
+            else None
+        )
         left = build_single(
             tokens[:sep_pos],
             confs[:sep_pos],
             logits[:, :sep_pos, :],
+            stop_score=left_stop_score,
         )
         right = build_single(
             tokens[sep_pos + 1 : stop_pos],
             confs[sep_pos + 1 : stop_pos],
             logits[:, sep_pos + 1 : stop_pos, :],
+            stop_score=right_stop_score,
         )
+
+        # Attribute each missing sub-peptide to its structural cause so the
+        # summary can distinguish empty-slice artifacts (sep at edge) from
+        # detokenization failures (lone N-term mod / empty peptide).
+        if left is None:
+            reason = (
+                "empty_left_slice" if sep_pos == 0 else "invalid_left_peptide"
+            )
+            stats[reason] += 1
+            logger.debug(
+                "chimera-drop %s scan=%s reason=%s sep_pos=%d stop_pos=%d",
+                filename,
+                scan,
+                reason,
+                sep_pos,
+                stop_pos,
+            )
+        if right is None:
+            reason = (
+                "empty_right_slice"
+                if sep_pos + 1 >= stop_pos
+                else "invalid_right_peptide"
+            )
+            stats[reason] += 1
+            logger.debug(
+                "chimera-drop %s scan=%s reason=%s sep_pos=%d stop_pos=%d",
+                filename,
+                scan,
+                reason,
+                sep_pos,
+                stop_pos,
+            )
+        if left is not None and right is not None:
+            stats["two_psms"] += 1
 
         return [m for m in (left, right) if m is not None]
 
@@ -922,6 +1017,33 @@ class Spec2Pep(pl.LightningModule):
                 ).item()
 
             self.out_writer.psms.append(spec_match)
+
+    def on_predict_end(self) -> None:
+        """Log the chimera sub-peptide drop-reason breakdown for the run."""
+        if not self.chimera:
+            return
+        stats = self._chimera_drop_stats
+        total = stats.get("spectra_total", 0)
+        if total == 0:
+            return
+        ordered_keys = [
+            "spectra_total",
+            "two_psms",
+            "no_separator_single_psm",
+            "no_separator_invalid_peptide",
+            "empty_left_slice",
+            "empty_right_slice",
+            "invalid_left_peptide",
+            "invalid_right_peptide",
+            "extra_separators_discarded",
+        ]
+        lines = ["Chimera sub-peptide drop summary (predict run):"]
+        for k in ordered_keys:
+            v = stats.get(k, 0)
+            pct = 100.0 * v / total if total else 0.0
+            lines.append(f"  {k}: {v} ({pct:.2f}%)")
+        logger.info("\n".join(lines))
+        self._chimera_drop_stats.clear()
 
     def on_train_start(self):
         """Log optimizer settings."""

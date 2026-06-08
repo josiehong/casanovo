@@ -58,6 +58,25 @@ class ChimeraTokenizer(depthcharge.tokenizers.peptides.PeptideTokenizer):
             stop_token=stop_token,
         )
 
+        # Pyteomics' proforma.parse returns `[]` (not `None`) for absent
+        # terminal modifications in current versions; depthcharge's
+        # `Peptide.split` then emits a spurious `[+0.000000]-` /
+        # `-[+0.000000]` token that isn't in the alphabet. Normalize
+        # empty terminal lists back to `None` to match depthcharge's
+        # expected contract.
+        base_parse = self._parse_peptide
+
+        def _safe_parse(sequence):
+            pep = base_parse(sequence)
+            if pep.modifications:
+                if pep.modifications[0] == []:
+                    pep.modifications[0] = None
+                if pep.modifications[-1] == []:
+                    pep.modifications[-1] = None
+            return pep
+
+        self._parse_peptide = _safe_parse
+
     def compliment(
         self,
         sequences: Iterable[str] | str,

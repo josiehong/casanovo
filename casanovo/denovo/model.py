@@ -764,6 +764,31 @@ class Spec2Pep(pl.LightningModule):
                     best_calc_mz = calc_mz
         return best_charge, best_calc_mz
 
+    def _residue_len(self, sequence: str) -> int:
+        """Number of amino-acid residues in a ProForma sequence.
+
+        Counts residue tokens only; N-term modification tokens (which end
+        in ``-``) are excluded.
+        """
+        return sum(
+            1
+            for tok in self.tokenizer.split(sequence)
+            if not tok.endswith("-")
+        )
+
+    def _has_internal_nterm_mod(self, sequence: str) -> bool:
+        """Whether an N-term modification appears past the sequence start.
+
+        A single leading N-term mod is valid; any further occurrence makes
+        the ProForma invalid (e.g. "PEP[Acetyl]-TIDE").
+        """
+        rest = sequence
+        for mod in self.n_term:
+            if rest.startswith(mod):
+                rest = rest[len(mod):]
+                break
+        return any(mod in rest for mod in self.n_term)
+
     def _predict_chimera(
         self,
         b: int,
@@ -846,39 +871,50 @@ class Spec2Pep(pl.LightningModule):
             if int(tokens[j].item()) == self.sep_token
         ]
 
-        # No separator: fall back to normal single-peptide prediction.
-        if not sep_positions:
-            spec_match = build_single(tokens, confs, logits)
-            return [spec_match] if spec_match is not None else []
+        # Decode one segment per separator-delimited region of [0, stop_pos).
+        # No separator gives a single segment; N separators give N + 1.
+        bounds = [-1, *sep_positions, stop_pos]
+        candidates = []  # (peptide_score, PepSpecMatch)
+        for k in range(len(bounds) - 1):
+            seg_start = bounds[k] + 1
+            seg_end = bounds[k + 1]  # position of the terminating sep/stop
+            term_score = (
+                float(confs[seg_end].detach().cpu().item())
+                if seg_end < L
+                else None
+            )
+            spec_match = build_single(
+                tokens[seg_start:seg_end],
+                confs[seg_start:seg_end],
+                logits[:, seg_start:seg_end, :],
+                stop_score=term_score,
+            )
 
-        # Keep at most two sub-peptides.
-        if len(sep_positions) >= 2:
-            stop_pos = sep_positions[1]
+            # Drop empty / undecodable segments (build_single returns None) and
+            # sequences with an N-term mod past the start (invalid ProForma,
+            # e.g. "PEP[Acetyl]-TIDE").
+            if spec_match is None or self._has_internal_nterm_mod(
+                spec_match.sequence
+            ):
+                continue
 
-        sep_pos = sep_positions[0]
+            # Drop peptides shorter than the configured minimum length.
+            if self._residue_len(spec_match.sequence) < self.min_peptide_len:
+                continue
 
-        # The separator acts as sub-peptide 1's stop; sub-peptide 2 ends
-        # at the actual stop (or the second separator when present).
-        left_stop_score = float(confs[sep_pos].detach().cpu().item())
-        right_stop_score = (
-            float(confs[stop_pos].detach().cpu().item())
-            if stop_pos < L
-            else None
-        )
-        left = build_single(
-            tokens[:sep_pos],
-            confs[:sep_pos],
-            logits[:, :sep_pos, :],
-            stop_score=left_stop_score,
-        )
-        right = build_single(
-            tokens[sep_pos + 1 : stop_pos],
-            confs[sep_pos + 1 : stop_pos],
-            logits[:, sep_pos + 1 : stop_pos, :],
-            stop_score=right_stop_score,
-        )
+            candidates.append((spec_match.peptide_score, spec_match))
 
-        return [m for m in (left, right) if m is not None]
+        # Accept the two highest-scoring remaining peptides, dropping
+        # duplicate sequences first.
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        kept, seen = [], set()
+        for _, spec_match in candidates:
+            if spec_match.sequence in seen:
+                continue
+            seen.add(spec_match.sequence)
+            kept.append(spec_match)
+
+        return kept[:2]
 
     def on_train_epoch_end(self) -> None:
         """

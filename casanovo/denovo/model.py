@@ -898,27 +898,38 @@ class Spec2Pep(pl.LightningModule):
                 stop_score=term_score,
             )
 
-            # Drop empty / undecodable segments (empty slice or lone N-term
-            # mod) — build_single returns None for these.
+            # No peptide produced. A zero-length slice (the "pep1:" case) has
+            # output length 0 — just the extreme of too_short. A non-empty
+            # slice that decodes to nothing usable (e.g. a lone / trailing
+            # N-term mod) is malformed ProForma -> invalid_peptide.
             if spec_match is None:
-                stats["invalid_peptide"] += 1
-                logger.debug(
-                    "chimera-drop %s scan=%s reason=invalid_peptide "
-                    "seg=[%d,%d)",
-                    filename,
-                    scan,
-                    seg_start,
-                    seg_end,
-                )
+                if seg_end <= seg_start:
+                    stats["too_short"] += 1
+                    logger.debug(
+                        "chimera-drop %s scan=%s reason=too_short len=0 "
+                        "min=%d",
+                        filename,
+                        scan,
+                        self.min_peptide_len,
+                    )
+                else:
+                    stats["invalid_peptide"] += 1
+                    logger.debug(
+                        "chimera-drop %s scan=%s reason=invalid_peptide "
+                        "seg=[%d,%d)",
+                        filename,
+                        scan,
+                        seg_start,
+                        seg_end,
+                    )
                 continue
 
-            # Drop sequences with an N-term mod anywhere but the start
+            # A peptide was produced but carries an N-term mod past the start
             # (e.g. "PEP[Acetyl]-TIDE"), which is invalid ProForma.
             if self._has_internal_nterm_mod(spec_match.sequence):
                 stats["invalid_peptide"] += 1
                 logger.debug(
-                    "chimera-drop %s scan=%s reason=invalid_internal_nterm "
-                    "seq=%s",
+                    "chimera-drop %s scan=%s reason=invalid_peptide seq=%s",
                     filename,
                     scan,
                     spec_match.sequence,

@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from .. import utils
 from ..config import Config
 from ..data import db_utils, ms_io
+from ..denovo.chimera import ChimeraTokenizer, MskbChimeraTokenizer
 from ..denovo.dataloaders import DeNovoDataModule
 from ..denovo.evaluate import aa_match_batch, aa_match_metrics
 from ..denovo.model import DbSpec2Pep, Spec2Pep
@@ -59,6 +60,11 @@ class ModelRunner:
         overwrite_ckpt_check: Optional[bool] = True,
     ) -> None:
         """Initialize a ModelRunner."""
+        # In chimeric mode each prediction is split into up to two peptides, so
+        # returning multiple matches per spectrum is not well-defined.
+        if config.top_match != 1:
+            raise ValueError("'top_match' must be 1 in chimeric mode.")
+
         self.config = config
         self.model_filename = model_filename
         self.output_dir = output_dir
@@ -439,9 +445,9 @@ class ModelRunner:
     def initialize_tokenizer(self) -> None:
         """Initialize the peptide tokenizer."""
         if self.config.massivekb_tokenizer:
-            tokenizer_clss = MskbPeptideTokenizer
+            tokenizer_clss = MskbChimeraTokenizer
         else:
-            tokenizer_clss = PeptideTokenizer
+            tokenizer_clss = ChimeraTokenizer
 
         self.tokenizer = tokenizer_clss(
             residues=self.config.residues,

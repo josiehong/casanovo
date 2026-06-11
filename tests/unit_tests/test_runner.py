@@ -616,11 +616,12 @@ def test_initialize_tokenizer():
     mock_config.massivekb_tokenizer = True
     mock_config.residues = {"foo": 100}
     mock_config.replace_isoleucine_with_leucine = True
+    mock_config.top_match = 1
 
     runner = ModelRunner(config=mock_config)
 
     with unittest.mock.patch(
-        "casanovo.denovo.model_runner.MskbPeptideTokenizer"
+        "casanovo.denovo.model_runner.MskbChimeraTokenizer"
     ) as mock_tokenizer_cls:
         mock_tokenizer = unittest.mock.MagicMock()
         mock_tokenizer_cls.return_value = mock_tokenizer

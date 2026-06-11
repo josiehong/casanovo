@@ -36,6 +36,7 @@ from casanovo.config import Config
 from casanovo.data import db_utils, ms_io, psm
 from casanovo.denovo.dataloaders import DeNovoDataModule
 from casanovo.denovo.evaluate import aa_match, aa_match_batch, aa_match_metrics
+from casanovo.denovo.chimera import ChimeraTokenizer
 from casanovo.denovo.model import (
     DbSpec2Pep,
     Spec2Pep,
@@ -2833,9 +2834,15 @@ def test_db_spec2pep_forward_no_cache(tiny_config):
     )
     db_model = DbSpec2Pep(tokenizer=tokenizer)
 
-    # Mock the _forward_step method to confirm it's called
+    # Mock the _forward_step method to confirm it's called. It returns the
+    # scores and tokens for both the sequence and its (chimeric) complement.
     db_model._forward_step = unittest.mock.MagicMock(
-        return_value=(torch.zeros(1, 5, 25), torch.zeros(1, 4))
+        return_value=(
+            torch.zeros(1, 5, 25),
+            torch.zeros(1, 4),
+            torch.zeros(1, 5, 25),
+            torch.zeros(1, 4),
+        )
     )
 
     # Create a batch without pre-computed encoder outputs
@@ -3176,3 +3183,168 @@ def test_train_cli_tracking_peak_path(tmp_path, mgf_small, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert str(mgf_small) in captured.get("tracking", ())
+
+
+def test_chimera_tokenizer_split_and_compliment():
+    """The chimeric tokenizer splits on a top-level separator only."""
+    tokenizer = ChimeraTokenizer(residues={"[Acetyl]-": 42.0})
+
+    # A top-level separator splits two peptides; a ':' inside a modification
+    # group (e.g. a controlled-vocabulary accession) does not.
+    assert tokenizer._split_on_separator("PEPK:AAR") == ["PEPK", "AAR"]
+    assert tokenizer._split_on_separator("M[UNIMOD:35]K") == ["M[UNIMOD:35]K"]
+    assert tokenizer._split_on_separator("[UNIMOD:1]-AR:M[UNIMOD:35]K") == [
+        "[UNIMOD:1]-AR",
+        "M[UNIMOD:35]K",
+    ]
+
+    # split() inserts the separator token between the two peptides.
+    assert tokenizer.split("PEPK:AAR") == [
+        "P",
+        "E",
+        "P",
+        "K",
+        ":",
+        "A",
+        "A",
+        "R",
+    ]
+
+    # The complement swaps the peptide order.
+    assert tokenizer.compliment(["PEPK:AAR"]) == ["AAR:PEPK"]
+    assert tokenizer.compliment(["PEPK"]) == ["PEPK"]
+
+    # At most one separator is permitted.
+    with pytest.raises(ValueError):
+        tokenizer.split("A:B:C")
+
+
+def test_chimera_calculate_precursor_ions():
+    """Chimeric precursor m/z matches the standard tokenizer when single."""
+    std = depthcharge.tokenizers.peptides.PeptideTokenizer(reverse=True)
+    chi = ChimeraTokenizer(reverse=True)
+
+    # Non-chimeric: identical to the standard tokenizer.
+    assert chi.calculate_precursor_ions(
+        "PEPTIDEK", torch.tensor(2)
+    ).item() == pytest.approx(
+        std.calculate_precursor_ions("PEPTIDEK", torch.tensor(2)).item()
+    )
+
+    # Chimeric give_max_mz returns the larger of the two peptide m/z values.
+    tokens = chi.tokenize(["PEPTIDEK:AAR"])
+    mz = chi.calculate_precursor_ions(
+        tokens,
+        charges=torch.tensor([2]),
+        charges_two=torch.tensor([1]),
+        give_max_mz=True,
+    )
+    mz_one = chi.calculate_precursor_ions("PEPTIDEK", torch.tensor(2)).item()
+    mz_two = chi.calculate_precursor_ions("AAR", torch.tensor(1)).item()
+    assert mz.item() == pytest.approx(max(mz_one, mz_two))
+
+    # More than one separator is invalid.
+    with pytest.raises(ValueError):
+        chi.calculate_precursor_ions(
+            chi.tokenize(["A:B:C"]), torch.tensor([1])
+        )
+
+
+def _chimera_model(tiny_config, **kwargs):
+    config = Config(tiny_config)
+    return Spec2Pep(
+        tokenizer=ChimeraTokenizer(residues=config.residues),
+        **kwargs,
+    )
+
+
+def test_chimeric_loss_min_selection(tiny_config):
+    """The chimeric loss takes the minimum over the two peptide orderings."""
+    model = _chimera_model(tiny_config)
+    loss_fun = model.val_celoss  # no label smoothing, for exact comparisons
+
+    batch, length, vocab = 2, 3, model.vocab_size
+    truth = torch.tensor([[3, 4, 1], [5, 6, 1]])
+    truth_comp = torch.tensor([[7, 8, 1], [9, 10, 1]])
+
+    # Confident, correct logits for the primary ordering only.
+    pred = torch.zeros(batch, length + 1, vocab)
+    for b in range(batch):
+        for t in range(length):
+            pred[b, t, truth[b, t]] = 20.0
+    pred_comp = torch.zeros(batch, length + 1, vocab)
+    for b in range(batch):
+        for t in range(length):
+            pred_comp[b, t, truth_comp[b, t]] = 20.0
+
+    # Primary ordering is (near-)perfect, complement ordering is wrong for
+    # ``pred`` -> min should follow the primary ordering (small loss).
+    loss = model._calc_chimeric_loss(
+        loss_fun, pred, truth, pred_comp, truth_comp
+    )
+    assert loss.item() < 1e-2
+
+    # Degenerate (non-chimeric) case: complement equals the primary ordering,
+    # so the chimeric loss equals the plain token-mean cross-entropy.
+    degenerate = model._calc_chimeric_loss(loss_fun, pred, truth, pred, truth)
+    flat_pred = pred[:, :-1, :].reshape(-1, vocab)
+    mask = (truth != 0).float()
+    manual = (
+        loss_fun(flat_pred, truth.flatten()).reshape(batch, length) * mask
+    ).sum() / mask.sum()
+    assert degenerate.item() == pytest.approx(manual.item(), abs=1e-5)
+
+
+def test_finish_beams_chimeric_separator(tiny_config):
+    """Beams with multiple chimeric separators are discarded."""
+    model = _chimera_model(tiny_config, n_beams=4, min_peptide_len=2)
+    model.tokenizer.reverse = False
+    sep = model.chimeric_separator_idx
+    index = model.tokenizer.index
+
+    length = model.max_peptide_len + 1
+    step = 4
+    device = model.device
+
+    # (tokens, should_be_discarded): one separator is allowed, two are not.
+    peptides = [
+        ["P", "E", "P", "K", "R"],  # no separator
+        ["P", "E", ":", "A", "R"],  # one separator
+        ["P", ":", "E", ":", "R"],  # two separators -> discarded
+    ]
+    expected = torch.tensor([False, False, True], device=device)
+
+    tokens = torch.zeros(
+        len(peptides), length, dtype=torch.int64, device=device
+    )
+    for i, pep in enumerate(peptides):
+        tokens[i, : step + 1] = torch.tensor(
+            [sep if aa == ":" else index[aa] for aa in pep], device=device
+        )
+
+    _, discarded = model._finish_beams(tokens, step)
+    assert torch.equal(discarded, expected)
+
+
+def test_split_chimeric_prediction(tiny_config):
+    """A chimeric prediction is split into two single-peptide predictions."""
+    model = _chimera_model(tiny_config)
+    model.tokenizer.reverse = False
+
+    tokens = model.tokenizer.tokenize(["PEPK:AAR"])[0]
+    aa_scores = np.linspace(0.9, 0.5, len(tokens))
+
+    preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    assert len(preds) == 2
+    sequences = {seq for _, _, seq in preds}
+    assert sequences == {"PEPK", "AAR"}
+    # No separator token leaks into the emitted sequences.
+    assert all(":" not in seq for seq in sequences)
+
+    # A non-chimeric prediction yields a single, unchanged prediction.
+    tokens = model.tokenizer.tokenize(["PEPTIDEK"])[0]
+    aa_scores = np.linspace(0.9, 0.5, len(tokens))
+    single = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    assert len(single) == 1
+    assert single[0][2] == "PEPTIDEK"
+    assert single[0][0] == 0.7

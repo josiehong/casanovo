@@ -22,6 +22,8 @@ from depthcharge.tokenizers import PeptideTokenizer
 from torch.utils.data import DataLoader
 from torch.utils.data.datapipes.iter.combinatorics import ShufflerIterDataPipe
 
+from .chimera import ChimeraAnnotatedSpectrumDataset, ChimeraTokenizer
+
 logger = logging.getLogger("casanovo")
 
 
@@ -160,7 +162,7 @@ class DeNovoDataModule(pl.LightningDataModule):
         ]
         self.valid_charge = np.arange(1, max_charge + 1)
 
-        self.tokenizer = tokenizer or PeptideTokenizer()
+        self.tokenizer = tokenizer or ChimeraTokenizer()
 
         # Set to None to disable shuffling, otherwise Torch throws an error.
         self.shuffle = shuffle if shuffle else None
@@ -171,6 +173,17 @@ class DeNovoDataModule(pl.LightningDataModule):
         # Custom fields to read from the input files.
         self.custom_field_anno = CustomField(
             "seq", lambda x: x["params"]["seq"], pa.string()
+        )
+        # Charge of the second peptide of a chimeric annotation (``"0"`` when
+        # absent, i.e. for non-chimeric spectra).
+        self.custom_field_charge_two = CustomField(
+            "charge_two",
+            lambda x: (
+                "0"
+                if "charge_two" not in x["params"]
+                else x["params"]["charge_two"]
+            ),
+            pa.string(),
         )
         self.train_dataset = None
         # Per-file validation datasets: main (monitored) + tracking (log-only).
@@ -295,7 +308,13 @@ class DeNovoDataModule(pl.LightningDataModule):
         torch.utils.data.Dataset
             A PyTorch Dataset for the given peak files.
         """
-        custom_fields = [self.custom_field_anno] if annotated else []
+        is_chimeric = isinstance(self.tokenizer, ChimeraTokenizer)
+        if annotated:
+            custom_fields = [self.custom_field_anno]
+            if is_chimeric:
+                custom_fields.append(self.custom_field_charge_two)
+        else:
+            custom_fields = []
         lance_path = pathlib.Path(f"{self.lance_dir}/{mode}.lance")
 
         parse_params = dict(
@@ -317,7 +336,12 @@ class DeNovoDataModule(pl.LightningDataModule):
         )
 
         if annotated:
-            Dataset, params = AnnotatedSpectrumDataset, anno_dataset_params
+            params = anno_dataset_params
+            Dataset = (
+                ChimeraAnnotatedSpectrumDataset
+                if is_chimeric
+                else AnnotatedSpectrumDataset
+            )
         else:
             Dataset, params = SpectrumDataset, dataset_params
 

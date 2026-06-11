@@ -133,10 +133,17 @@ class Spec2Pep(pl.LightningModule):
         )
         self.softmax = torch.nn.Softmax(2)
         ignore_index = 0
+        # ``reduction="none"`` yields a per-token loss so that the
+        # permutation-invariant chimeric loss can mask padding and take the
+        # minimum over the two peptide orderings (see ``training_step``).
         self.celoss = torch.nn.CrossEntropyLoss(
-            ignore_index=ignore_index, label_smoothing=train_label_smoothing
+            ignore_index=ignore_index,
+            label_smoothing=train_label_smoothing,
+            reduction="none",
         )
-        self.val_celoss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.val_celoss = torch.nn.CrossEntropyLoss(
+            ignore_index=ignore_index, reduction="none"
+        )
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -200,6 +207,19 @@ class Spec2Pep(pl.LightningModule):
             persistent=False,
         )
 
+        # Chimeric separator token. Only a ChimeraTokenizer defines a
+        # ``chimeric_separator_token``; for a standard tokenizer chimeric
+        # handling is disabled and the model behaves as standard Casanovo.
+        self.chimeric_separator_token = getattr(
+            self.tokenizer, "chimeric_separator_token", None
+        )
+        self.is_chimeric = self.chimeric_separator_token is not None
+        self.chimeric_separator_idx = (
+            self.tokenizer.index[self.chimeric_separator_token]
+            if self.is_chimeric
+            else None
+        )
+
     @property
     def device(self) -> torch.device:
         """
@@ -235,7 +255,7 @@ class Spec2Pep(pl.LightningModule):
             score, the amino acid scores, and the predicted peptide
             sequence.
         """
-        mzs, ints, precursors, _ = self._process_batch(batch)
+        mzs, ints, precursors, _, _ = self._process_batch(batch)
         return self.beam_search_decode(mzs, ints, precursors)
 
     def beam_search_decode(
@@ -433,32 +453,50 @@ class Spec2Pep(pl.LightningModule):
         )
         discarded_beams[current_tokens == 0] = True
 
-        # Discard beams with invalid modification combinations
+        # Discard beams with invalid modification combinations. An N-terminal
+        # modification is only valid at the N-terminus of a peptide. With the
+        # current decoding convention this is position 0 (reverse tokenizer) or
+        # the final residue (forward tokenizer). For chimeric beams the second
+        # peptide adds another valid N-terminal position adjacent to the
+        # chimeric separator token, so up to one N-terminal modification per
+        # peptide is permitted.
         if step > 1:
             final_pos = torch.full((batch_size,), step, device=device)
             final_pos[ends_stop_token] = step - 1
 
-            # Vectorized check for multiple N-terminal modifications
             token_is_nterm = torch.isin(tokens, nterm_idx)
-            num_modifications = token_is_nterm.sum(dim=1)
-            has_n_term = num_modifications > 0
+            has_n_term = token_is_nterm.any(dim=1)
 
-            # We only need to this check if there are any n-term mods
             if torch.any(has_n_term).item():
-                # Catch multiple modifications, pretty straightforward
-                multiple_mods = num_modifications[has_n_term] > 1
+                is_valid_position = torch.zeros_like(tokens, dtype=torch.bool)
+                if self.is_chimeric:
+                    is_separator = tokens == self.chimeric_separator_idx
+                else:
+                    is_separator = torch.zeros_like(tokens, dtype=torch.bool)
 
-                # Vectorized check for internal N-terminal modifications.
-                # This will fail to catch internal modifications in some cases
-                # where there are multiple mods, but these are already discarded
-                # by the previous check.
-                n_terminal_pos = (
-                    0 if self.tokenizer.reverse else final_pos[has_n_term]
-                )
-                internal_mods = ~token_is_nterm[has_n_term, n_terminal_pos]
+                if self.tokenizer.reverse:
+                    # N-terminus at position 0 and just after a separator.
+                    is_valid_position[:, 0] = True
+                    is_valid_position[:, 1:] |= is_separator[:, :-1]
+                else:
+                    # N-terminus at the final residue and just before a
+                    # separator.
+                    batch_idx = torch.arange(batch_size, device=device)
+                    is_valid_position[batch_idx, final_pos] = True
+                    is_valid_position[:, :-1] |= is_separator[:, 1:]
 
-                # Only discard beams we have actually checked
-                discarded_beams[has_n_term] |= multiple_mods | internal_mods
+                # Any N-terminal modification not at a valid position (internal
+                # placement, or more than one per peptide) invalidates the beam.
+                invalid_nterm = token_is_nterm & ~is_valid_position
+                discarded_beams |= invalid_nterm.any(dim=1)
+
+        # Discard chimeric beams containing more than one separator token; a
+        # chimera consists of at most two peptides.
+        if self.is_chimeric:
+            n_separators = (
+                tokens[:, : step + 1] == self.chimeric_separator_idx
+            ).sum(dim=1)
+            discarded_beams |= n_separators > 1
 
         # Calculate peptide lengths, and adjust for stop tokens
         peptide_lens = torch.full((batch_size,), step + 1, device=device)
@@ -706,24 +744,88 @@ class Spec2Pep(pl.LightningModule):
         """
         for peptides in pred_cache.values():
             if len(peptides) > 0:
-                yield [
-                    (
-                        pep_score,
-                        (
-                            aa_scores[::-1]
-                            if self.tokenizer.reverse
-                            else aa_scores
-                        ),
-                        self.tokenizer.detokenize(
-                            torch.unsqueeze(pred_tokens, 0)
-                        )[0],
+                spectrum_preds = []
+                for pep_score, _, aa_scores, pred_tokens in heapq.nlargest(
+                    self.top_match, peptides
+                ):
+                    spectrum_preds.extend(
+                        self._split_prediction(
+                            pred_tokens, aa_scores, pep_score
+                        )
                     )
-                    for pep_score, _, aa_scores, pred_tokens in heapq.nlargest(
-                        self.top_match, peptides
-                    )
-                ]
+                yield spectrum_preds
             else:
                 yield []
+
+    def _split_prediction(
+        self,
+        pred_tokens: torch.Tensor,
+        aa_scores: np.ndarray,
+        pep_score: float,
+    ) -> List[Tuple[float, np.ndarray, str]]:
+        """
+        Split a (possibly chimeric) prediction into its peptide(s).
+
+        A chimeric prediction contains two peptides joined by the chimeric
+        separator token; it is split into two separate predictions, each with
+        its own detokenized sequence, amino acid scores, and (re-computed)
+        peptide score. For a non-chimeric prediction (or a non-chimeric
+        tokenizer) a single prediction is returned, preserving the original
+        peptide score.
+
+        The split is performed on the raw (tokenizer-order) tokens, *before*
+        applying the reverse-tokenizer score flip, so that each peptide is
+        detokenized and reversed independently.
+
+        Parameters
+        ----------
+        pred_tokens : torch.Tensor of shape (length,)
+            The predicted tokens for a single beam, in tokenizer order.
+        aa_scores : np.ndarray of shape (length,)
+            The amino acid scores for ``pred_tokens``, in tokenizer order.
+        pep_score : float
+            The peptide score of the (whole) prediction.
+
+        Returns
+        -------
+        List[Tuple[float, np.ndarray, str]]
+            One ``(peptide_score, aa_scores, sequence)`` tuple per peptide.
+        """
+
+        def _finalize(tokens: torch.Tensor, scores: np.ndarray, score: float):
+            sequence = self.tokenizer.detokenize(torch.unsqueeze(tokens, 0))[0]
+            if self.tokenizer.reverse:
+                scores = scores[::-1]
+            return score, scores, sequence
+
+        if not self.is_chimeric:
+            return [_finalize(pred_tokens, aa_scores, pep_score)]
+
+        separator_positions = (
+            (pred_tokens == self.chimeric_separator_idx)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
+        if not separator_positions:
+            return [_finalize(pred_tokens, aa_scores, pep_score)]
+
+        # Build [start, end) spans for each peptide around the separator(s).
+        spans, start = [], 0
+        for pos in separator_positions:
+            spans.append((start, pos))
+            start = pos + 1
+        spans.append((start, len(pred_tokens)))
+
+        predictions = []
+        for start, end in spans:
+            sub_tokens = pred_tokens[start:end]
+            if len(sub_tokens) == 0:
+                continue
+            sub_scores = aa_scores[start:end]
+            predictions.append(
+                _finalize(sub_tokens, sub_scores, _peptide_score(sub_scores))
+            )
+        return predictions
 
     def _process_batch(
         self, batch: Dict[str, torch.Tensor]
@@ -752,6 +854,10 @@ class Spec2Pep(pl.LightningModule):
         seqs : np.ndarray
             The spectrum identifiers (during de novo sequencing) or
             peptide sequences (during training).
+        seqs_comp : torch.Tensor | None
+            The tokenized complement (swapped peptide order) sequences for
+            chimeric training, or ``None`` when not available (e.g. during
+            de novo sequencing or with a non-chimeric dataset).
         """
         precursor_mzs = batch["precursor_mz"].squeeze(0)
         precursor_charges = batch["precursor_charge"].squeeze(0)
@@ -763,13 +869,77 @@ class Spec2Pep(pl.LightningModule):
         mzs = batch["mz_array"]
         intensities = batch["intensity_array"]
         seqs = batch.get("seq")
+        seqs_comp = batch.get("seq_compliment")
 
-        return mzs, intensities, precursors, seqs
+        return mzs, intensities, precursors, seqs, seqs_comp
+
+    def _calc_chimeric_loss(
+        self,
+        loss_fun: torch.nn.Module,
+        pred: torch.Tensor,
+        truth: torch.Tensor,
+        pred_comp: torch.Tensor,
+        truth_comp: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute the permutation-invariant chimeric cross-entropy loss.
+
+        The two peptides of a chimeric spectrum may be predicted in either
+        order, so the per-spectrum cross-entropy is computed for both the
+        ground-truth ordering and its complement (swapped order), and the
+        cheaper of the two is selected per spectrum (the optimal assignment for
+        two peptides). Padding tokens are excluded via an explicit mask
+        (``loss_fun`` uses ``reduction="none"``).
+
+        The selected per-spectrum losses are summed and divided by the total
+        number of (non-padding) tokens in the batch, i.e. a token-weighted
+        mean. A sequence and its complement contain the same tokens, so the
+        per-spectrum minimum selects the same ordering whether computed on
+        summed or averaged token losses. For non-chimeric data the complement
+        equals the original sequence, so this reduces exactly to the standard
+        token-mean cross-entropy used by non-chimeric Casanovo.
+
+        Parameters
+        ----------
+        loss_fun : torch.nn.Module
+            The (un-reduced) cross-entropy loss to apply.
+        pred, pred_comp : torch.Tensor of shape (batch_size, length, vocab)
+            The amino acid scores for the ground-truth and complement orderings.
+        truth, truth_comp : torch.Tensor of shape (batch_size, length)
+            The ground-truth and complement tokens.
+
+        Returns
+        -------
+        torch.Tensor
+            The scalar chimeric loss for the batch.
+        """
+        batch_size, seq_length = truth.shape
+        pred = pred[:, :-1, :].reshape(-1, self.vocab_size)
+        pred_comp = pred_comp[:, :-1, :].reshape(-1, self.vocab_size)
+
+        mask = (truth != 0).float()
+        mask_comp = (truth_comp != 0).float()
+        # Total cross-entropy per spectrum for each ordering.
+        loss_one = (
+            loss_fun(pred, truth.flatten()).reshape((batch_size, seq_length))
+            * mask
+        ).sum(dim=1)
+        loss_two = (
+            loss_fun(pred_comp, truth_comp.flatten()).reshape(
+                (batch_size, seq_length)
+            )
+            * mask_comp
+        ).sum(dim=1)
+
+        # Select the cheaper ordering per spectrum, then take a token-weighted
+        # mean over the batch.
+        best = torch.minimum(loss_one, loss_two)
+        return best.sum() / mask.sum()
 
     def _forward_step(
         self,
         batch: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         The forward learning step.
 
@@ -787,9 +957,16 @@ class Spec2Pep(pl.LightningModule):
         scores : torch.Tensor of shape (n_spectra, length, n_amino_acids)
             The individual amino acid scores for each prediction.
         tokens : torch.Tensor of shape (n_spectra, length)
-            The predicted tokens for each spectrum.
+            The ground-truth tokens for each spectrum.
+        scores_comp : torch.Tensor of shape (n_spectra, length, n_amino_acids)
+            The amino acid scores for the complement (swapped peptide order)
+            sequences. Equal to ``scores`` when complement tokens are not
+            available.
+        tokens_comp : torch.Tensor of shape (n_spectra, length)
+            The complement ground-truth tokens. Equal to ``tokens`` when
+            complement tokens are not available.
         """
-        mzs, ints, precursors, tokens = self._process_batch(batch)
+        mzs, ints, precursors, tokens, tokens_comp = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
         scores = self.decoder(
             tokens=tokens,
@@ -797,7 +974,23 @@ class Spec2Pep(pl.LightningModule):
             memory_key_padding_mask=mem_masks,
             precursors=precursors,
         )
-        return scores, tokens
+
+        # For chimeric training the loss is computed over both peptide
+        # orderings; decode the complement reusing the encoder output. When no
+        # complement is available (de novo sequencing or non-chimeric data),
+        # fall back to the primary ordering so the loss reduces to standard CE.
+        if tokens_comp is not None:
+            scores_comp = self.decoder(
+                tokens=tokens_comp,
+                memory=memories,
+                memory_key_padding_mask=mem_masks,
+                precursors=precursors,
+            )
+        else:
+            tokens_comp = tokens
+            scores_comp = scores
+
+        return scores, tokens, scores_comp, tokens_comp
 
     def training_step(
         self,
@@ -821,16 +1014,17 @@ class Spec2Pep(pl.LightningModule):
         torch.Tensor
             The loss of the training step.
         """
-        pred, truth = self._forward_step(batch)
-        pred = pred[:, :-1, :].reshape(-1, self.vocab_size)
-        loss = self.celoss(pred, truth.flatten())
+        pred, truth, pred_comp, truth_comp = self._forward_step(batch)
+        loss = self._calc_chimeric_loss(
+            self.celoss, pred, truth, pred_comp, truth_comp
+        )
         self.log(
             "train_CELoss",
             loss.detach(),
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=pred.shape[0],
+            batch_size=truth.shape[0],
         )
         return loss
 
@@ -864,11 +1058,12 @@ class Spec2Pep(pl.LightningModule):
         torch.Tensor
             The loss of the validation step.
         """
-        pred, truth = self._forward_step(batch)
-        pred = pred[:, :-1, :].reshape(-1, self.vocab_size)
-        loss = self.val_celoss(pred, truth.flatten())
+        pred, truth, pred_comp, truth_comp = self._forward_step(batch)
+        loss = self._calc_chimeric_loss(
+            self.val_celoss, pred, truth, pred_comp, truth_comp
+        )
 
-        batch_size = pred.shape[0]
+        batch_size = truth.shape[0]
         log_kwargs = dict(
             add_dataloader_idx=False,
             on_step=False,
@@ -1171,7 +1366,7 @@ class DbSpec2Pep(Spec2Pep):
             probs = self.softmax(logits)
             return probs, tokens
         else:
-            pred, truth = self._forward_step(batch)
+            pred, truth, _, _ = self._forward_step(batch)
             pred = self.softmax(pred)
             return pred, truth
 
@@ -1200,7 +1395,7 @@ class DbSpec2Pep(Spec2Pep):
 
         with torch.inference_mode():
             # Pre-compute encoder outputs for the entire batch.
-            mzs, intensities, precursors_all, _ = self._process_batch(batch)
+            mzs, intensities, precursors_all, _, _ = self._process_batch(batch)
             memories, mem_masks = self.encoder(mzs, intensities)
             enc_cache = {
                 "memory": memories,
@@ -1321,7 +1516,7 @@ class DbSpec2Pep(Spec2Pep):
 
         # Use pre-computed encoder outputs if available; otherwise compute once here.
         if enc_cache is None:
-            mzs, ints, precursors_all, _ = self._process_batch(batch)
+            mzs, ints, precursors_all, _, _ = self._process_batch(batch)
             memories, mem_masks = self.encoder(mzs, ints)
         else:
             memories, mem_masks = enc_cache["memory"], enc_cache["mem_masks"]

@@ -174,17 +174,6 @@ class DeNovoDataModule(pl.LightningDataModule):
         self.custom_field_anno = CustomField(
             "seq", lambda x: x["params"]["seq"], pa.string()
         )
-        # Charge of the second peptide of a chimeric annotation (``"0"`` when
-        # absent, i.e. for non-chimeric spectra).
-        self.custom_field_charge_two = CustomField(
-            "charge_two",
-            lambda x: (
-                "0"
-                if "charge_two" not in x["params"]
-                else x["params"]["charge_two"]
-            ),
-            pa.string(),
-        )
         self.train_dataset = None
         # Per-file validation datasets: main (monitored) + tracking (log-only).
         self.valid_datasets: list = []
@@ -309,12 +298,7 @@ class DeNovoDataModule(pl.LightningDataModule):
             A PyTorch Dataset for the given peak files.
         """
         is_chimeric = isinstance(self.tokenizer, ChimeraTokenizer)
-        if annotated:
-            custom_fields = [self.custom_field_anno]
-            if is_chimeric:
-                custom_fields.append(self.custom_field_charge_two)
-        else:
-            custom_fields = []
+        custom_fields = [self.custom_field_anno] if annotated else []
         lance_path = pathlib.Path(f"{self.lance_dir}/{mode}.lance")
 
         parse_params = dict(

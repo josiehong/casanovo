@@ -13,7 +13,6 @@ import lightning.pytorch as pl
 import lightning.pytorch.loggers
 import torch
 from depthcharge.tokenizers import PeptideTokenizer
-from depthcharge.tokenizers.peptides import MskbPeptideTokenizer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader

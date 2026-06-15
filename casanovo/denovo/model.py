@@ -210,12 +210,12 @@ class Spec2Pep(pl.LightningModule):
         # Chimeric separator token. Only a ChimeraTokenizer defines a
         # ``chimeric_separator_token``; for a standard tokenizer chimeric
         # handling is disabled and the model behaves as standard Casanovo.
-        self.chimeric_separator_token = getattr(
+        separator_token = getattr(
             self.tokenizer, "chimeric_separator_token", None
         )
-        self.is_chimeric = self.chimeric_separator_token is not None
+        self.is_chimeric = separator_token is not None
         self.chimeric_separator_idx = (
-            self.tokenizer.index[self.chimeric_separator_token]
+            self.tokenizer.index[separator_token]
             if self.is_chimeric
             else None
         )

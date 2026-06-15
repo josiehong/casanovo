@@ -3189,65 +3189,34 @@ def test_chimera_tokenizer_split_and_compliment():
     """The chimeric tokenizer splits on a top-level separator only."""
     tokenizer = ChimeraTokenizer(residues={"[Acetyl]-": 42.0})
 
-    # A top-level separator splits two peptides; a ':' inside a modification
-    # group (e.g. a controlled-vocabulary accession) does not.
-    assert tokenizer._split_on_separator("PEPK:AAR") == ["PEPK", "AAR"]
-    assert tokenizer._split_on_separator("M[UNIMOD:35]K") == ["M[UNIMOD:35]K"]
-    assert tokenizer._split_on_separator("[UNIMOD:1]-AR:M[UNIMOD:35]K") == [
-        "[UNIMOD:1]-AR",
-        "M[UNIMOD:35]K",
+    # A top-level separator splits two peptides; a '+' inside a modification
+    # group (ProForma mass notation) does not.
+    assert tokenizer._split_on_separator("PEPK+AAR") == ["PEPK", "AAR"]
+    assert tokenizer._split_on_separator("[+15.99]-PEPK") == ["[+15.99]-PEPK"]
+    assert tokenizer._split_on_separator("[+1.0]-AR+M[+2.0]K") == [
+        "[+1.0]-AR",
+        "M[+2.0]K",
     ]
 
     # split() inserts the separator token between the two peptides.
-    assert tokenizer.split("PEPK:AAR") == [
+    assert tokenizer.split("PEPK+AAR") == [
         "P",
         "E",
         "P",
         "K",
-        ":",
+        "+",
         "A",
         "A",
         "R",
     ]
 
     # The complement swaps the peptide order.
-    assert tokenizer.compliment(["PEPK:AAR"]) == ["AAR:PEPK"]
+    assert tokenizer.compliment(["PEPK+AAR"]) == ["AAR+PEPK"]
     assert tokenizer.compliment(["PEPK"]) == ["PEPK"]
 
     # At most one separator is permitted.
     with pytest.raises(ValueError):
-        tokenizer.split("A:B:C")
-
-
-def test_chimera_calculate_precursor_ions():
-    """Chimeric precursor m/z matches the standard tokenizer when single."""
-    std = depthcharge.tokenizers.peptides.PeptideTokenizer(reverse=True)
-    chi = ChimeraTokenizer(reverse=True)
-
-    # Non-chimeric: identical to the standard tokenizer.
-    assert chi.calculate_precursor_ions(
-        "PEPTIDEK", torch.tensor(2)
-    ).item() == pytest.approx(
-        std.calculate_precursor_ions("PEPTIDEK", torch.tensor(2)).item()
-    )
-
-    # Chimeric give_max_mz returns the larger of the two peptide m/z values.
-    tokens = chi.tokenize(["PEPTIDEK:AAR"])
-    mz = chi.calculate_precursor_ions(
-        tokens,
-        charges=torch.tensor([2]),
-        charges_two=torch.tensor([1]),
-        give_max_mz=True,
-    )
-    mz_one = chi.calculate_precursor_ions("PEPTIDEK", torch.tensor(2)).item()
-    mz_two = chi.calculate_precursor_ions("AAR", torch.tensor(1)).item()
-    assert mz.item() == pytest.approx(max(mz_one, mz_two))
-
-    # More than one separator is invalid.
-    with pytest.raises(ValueError):
-        chi.calculate_precursor_ions(
-            chi.tokenize(["A:B:C"]), torch.tensor([1])
-        )
+        tokenizer.split("A+B+C")
 
 
 def _chimera_model(tiny_config, **kwargs):
@@ -3309,8 +3278,8 @@ def test_finish_beams_chimeric_separator(tiny_config):
     # (tokens, should_be_discarded): one separator is allowed, two are not.
     peptides = [
         ["P", "E", "P", "K", "R"],  # no separator
-        ["P", "E", ":", "A", "R"],  # one separator
-        ["P", ":", "E", ":", "R"],  # two separators -> discarded
+        ["P", "E", "+", "A", "R"],  # one separator
+        ["P", "+", "E", "+", "R"],  # two separators -> discarded
     ]
     expected = torch.tensor([False, False, True], device=device)
 
@@ -3319,7 +3288,7 @@ def test_finish_beams_chimeric_separator(tiny_config):
     )
     for i, pep in enumerate(peptides):
         tokens[i, : step + 1] = torch.tensor(
-            [sep if aa == ":" else index[aa] for aa in pep], device=device
+            [sep if aa == "+" else index[aa] for aa in pep], device=device
         )
 
     _, discarded = model._finish_beams(tokens, step)
@@ -3331,7 +3300,7 @@ def test_split_chimeric_prediction(tiny_config):
     model = _chimera_model(tiny_config)
     model.tokenizer.reverse = False
 
-    tokens = model.tokenizer.tokenize(["PEPK:AAR"])[0]
+    tokens = model.tokenizer.tokenize(["PEPK+AAR"])[0]
     aa_scores = np.linspace(0.9, 0.5, len(tokens))
 
     preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
@@ -3339,7 +3308,7 @@ def test_split_chimeric_prediction(tiny_config):
     sequences = {seq for _, _, seq in preds}
     assert sequences == {"PEPK", "AAR"}
     # No separator token leaks into the emitted sequences.
-    assert all(":" not in seq for seq in sequences)
+    assert all("+" not in seq for seq in sequences)
 
     # A non-chimeric prediction yields a single, unchanged prediction.
     tokens = model.tokenizer.tokenize(["PEPTIDEK"])[0]

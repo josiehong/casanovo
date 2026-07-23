@@ -156,7 +156,13 @@ class Spec2Pep(pl.LightningModule):
                 f"Deprecated hyperparameter '{k}' removed from the model.",
                 DeprecationWarning,
             )
-        self.opt_kwargs = kwargs
+        # Keep only optimizer arguments. Model/inference hyperparameters can ride
+        # along in `kwargs` from a loaded checkpoint's saved hyper_parameters (e.g.
+        # stock Casanovo v5.2 bakes `precursor_mass_tol` / `isotope_error_range`
+        # into its hparams); forwarding those to Adam raises a TypeError.
+        _adam_keys = {"lr", "betas", "eps", "weight_decay", "amsgrad",
+                      "foreach", "maximize", "capturable", "differentiable", "fused"}
+        self.opt_kwargs = {k: v for k, v in kwargs.items() if k in _adam_keys}
 
         # Data properties.
         self.max_peptide_len = max_peptide_len
@@ -453,14 +459,15 @@ class Spec2Pep(pl.LightningModule):
         )
         discarded_beams[current_tokens == 0] = True
 
-        # Discard beams with invalid modification combinations. An N-terminal
-        # modification is only valid at the N-terminus of a peptide. With the
-        # current decoding convention this is position 0 (reverse tokenizer) or
-        # the final residue (forward tokenizer). For chimeric beams the second
-        # peptide adds another valid N-terminal position adjacent to the
-        # chimeric separator token, so up to one N-terminal modification per
-        # peptide is permitted.
-        if step > 1:
+        # Discard beams with an invalid N-terminal modification placement (an
+        # N-terminal modification is only valid at the N-terminus of a peptide:
+        # position 0 for the reverse tokenizer or the final residue for the
+        # forward tokenizer). For chimeric beams this is deferred to per-peptide
+        # post-processing in ``_split_prediction`` so that one invalid peptide
+        # does not discard a beam's other, valid peptides; chimeric beams are
+        # likewise not discarded for containing multiple separators, but split
+        # into their constituent peptides at output.
+        if step > 1 and not self.is_chimeric:
             final_pos = torch.full((batch_size,), step, device=device)
             final_pos[ends_stop_token] = step - 1
 
@@ -469,34 +476,16 @@ class Spec2Pep(pl.LightningModule):
 
             if torch.any(has_n_term).item():
                 is_valid_position = torch.zeros_like(tokens, dtype=torch.bool)
-                if self.is_chimeric:
-                    is_separator = tokens == self.chimeric_separator_idx
-                else:
-                    is_separator = torch.zeros_like(tokens, dtype=torch.bool)
-
                 if self.tokenizer.reverse:
-                    # N-terminus at position 0 and just after a separator.
                     is_valid_position[:, 0] = True
-                    is_valid_position[:, 1:] |= is_separator[:, :-1]
                 else:
-                    # N-terminus at the final residue and just before a
-                    # separator.
                     batch_idx = torch.arange(batch_size, device=device)
                     is_valid_position[batch_idx, final_pos] = True
-                    is_valid_position[:, :-1] |= is_separator[:, 1:]
 
                 # Any N-terminal modification not at a valid position (internal
-                # placement, or more than one per peptide) invalidates the beam.
+                # placement, or more than one) invalidates the beam.
                 invalid_nterm = token_is_nterm & ~is_valid_position
                 discarded_beams |= invalid_nterm.any(dim=1)
-
-        # Discard chimeric beams containing more than one separator token; a
-        # chimera consists of at most two peptides.
-        if self.is_chimeric:
-            n_separators = (
-                tokens[:, : step + 1] == self.chimeric_separator_idx
-            ).sum(dim=1)
-            discarded_beams |= n_separators > 1
 
         # Calculate peptide lengths, and adjust for stop tokens
         peptide_lens = torch.full((batch_size,), step + 1, device=device)
@@ -766,12 +755,13 @@ class Spec2Pep(pl.LightningModule):
         """
         Split a (possibly chimeric) prediction into its peptide(s).
 
-        A chimeric prediction contains two peptides joined by the chimeric
-        separator token; it is split into two separate predictions, each with
-        its own detokenized sequence, amino acid scores, and (re-computed)
-        peptide score. For a non-chimeric prediction (or a non-chimeric
-        tokenizer) a single prediction is returned, preserving the original
-        peptide score.
+        A chimeric prediction contains peptides joined by the chimeric
+        separator token; it is split on the separator(s), invalid peptides
+        (too short, or with a misplaced N-terminal modification) are dropped,
+        and the two highest-scoring peptides are returned, each with its own
+        detokenized sequence, amino acid scores, and (re-computed) peptide
+        score. For a non-chimeric prediction (or a non-chimeric tokenizer) a
+        single prediction is returned, preserving the original peptide score.
 
         The split is performed on the raw (tokenizer-order) tokens, *before*
         applying the reverse-tokenizer score flip, so that each peptide is
@@ -806,10 +796,9 @@ class Spec2Pep(pl.LightningModule):
             .nonzero(as_tuple=True)[0]
             .tolist()
         )
-        if not separator_positions:
-            return [_finalize(pred_tokens, aa_scores, pep_score)]
 
-        # Build [start, end) spans for each peptide around the separator(s).
+        # Build [start, end) spans for each peptide around the separator(s);
+        # a single span when there is no separator.
         spans, start = [], 0
         for pos in separator_positions:
             spans.append((start, pos))
@@ -819,13 +808,57 @@ class Spec2Pep(pl.LightningModule):
         predictions = []
         for start, end in spans:
             sub_tokens = pred_tokens[start:end]
-            if len(sub_tokens) == 0:
+            # Drop invalid peptides: too short, or an N-terminal modification
+            # placed off the peptide's N-terminus (which would detokenize to an
+            # invalid ProForma sequence). Valid siblings are kept.
+            if len(sub_tokens) < self.min_peptide_len:
+                continue
+            if not self._peptide_nterm_valid(sub_tokens):
                 continue
             sub_scores = aa_scores[start:end]
-            predictions.append(
-                _finalize(sub_tokens, sub_scores, _peptide_score(sub_scores))
+            # Preserve the original peptide score for a non-chimeric (single
+            # peptide) prediction; recompute per-peptide for a true chimera.
+            score = (
+                pep_score
+                if not separator_positions
+                else _peptide_score(sub_scores)
             )
-        return predictions
+            predictions.append(_finalize(sub_tokens, sub_scores, score))
+
+        # A chimera contains at most two peptides; keep the two highest-scoring
+        # ones (raw product score, no length normalization).
+        predictions.sort(key=lambda prediction: prediction[0], reverse=True)
+        return predictions[:2]
+
+    def _peptide_nterm_valid(self, sub_tokens: torch.Tensor) -> bool:
+        """
+        Whether a single peptide's N-terminal modification is well-placed.
+
+        An N-terminal modification is only valid at the peptide's N-terminus.
+        In tokenizer (generation) order that is the last token for the reverse
+        tokenizer or the first token for the forward tokenizer -- i.e. the
+        position that detokenizes to a leading ``[mod]-`` prefix. A mod placed
+        elsewhere detokenizes to a dangling ``-`` and is invalid ProForma.
+
+        Parameters
+        ----------
+        sub_tokens : torch.Tensor of shape (length,)
+            The tokens of a single peptide, in tokenizer order.
+
+        Returns
+        -------
+        bool
+            ``True`` if the peptide has no N-terminal modification or exactly
+            one placed at its N-terminus, ``False`` otherwise.
+        """
+        is_nterm = torch.isin(
+            sub_tokens, self.nterm_idx.to(sub_tokens.device)
+        )
+        if not bool(is_nterm.any()):
+            return True
+        nterm_pos = len(sub_tokens) - 1 if self.tokenizer.reverse else 0
+        is_nterm[nterm_pos] = False
+        return not bool(is_nterm.any())
 
     def _process_batch(
         self, batch: Dict[str, torch.Tensor]

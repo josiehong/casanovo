@@ -3264,8 +3264,8 @@ def test_chimeric_loss_min_selection(tiny_config):
     assert degenerate.item() == pytest.approx(manual.item(), abs=1e-5)
 
 
-def test_finish_beams_chimeric_separator(tiny_config):
-    """Beams with multiple chimeric separators are discarded."""
+def test_finish_beams_chimeric_keeps_separators(tiny_config):
+    """Chimeric beams are not discarded for containing multiple separators."""
     model = _chimera_model(tiny_config, n_beams=4, min_peptide_len=2)
     model.tokenizer.reverse = False
     sep = model.chimeric_separator_idx
@@ -3275,13 +3275,14 @@ def test_finish_beams_chimeric_separator(tiny_config):
     step = 4
     device = model.device
 
-    # (tokens, should_be_discarded): one separator is allowed, two are not.
+    # Zero, one, or two separators -- none should be discarded during search;
+    # multi-peptide handling is deferred to ``_split_prediction``.
     peptides = [
         ["P", "E", "P", "K", "R"],  # no separator
         ["P", "E", "+", "A", "R"],  # one separator
-        ["P", "+", "E", "+", "R"],  # two separators -> discarded
+        ["P", "+", "E", "+", "R"],  # two separators
     ]
-    expected = torch.tensor([False, False, True], device=device)
+    expected = torch.tensor([False, False, False], device=device)
 
     tokens = torch.zeros(
         len(peptides), length, dtype=torch.int64, device=device
@@ -3297,7 +3298,7 @@ def test_finish_beams_chimeric_separator(tiny_config):
 
 def test_split_chimeric_prediction(tiny_config):
     """A chimeric prediction is split into two single-peptide predictions."""
-    model = _chimera_model(tiny_config)
+    model = _chimera_model(tiny_config, min_peptide_len=2)
     model.tokenizer.reverse = False
 
     tokens = model.tokenizer.tokenize(["PEPK+AAR"])[0]
@@ -3317,3 +3318,40 @@ def test_split_chimeric_prediction(tiny_config):
     assert len(single) == 1
     assert single[0][2] == "PEPTIDEK"
     assert single[0][0] == 0.7
+
+
+def test_split_chimeric_prediction_top2_and_filtering(tiny_config):
+    """Splitting keeps the two highest-scoring valid peptides."""
+    model = _chimera_model(tiny_config, min_peptide_len=3)
+    model.tokenizer.reverse = False
+    sep = model.chimeric_separator_idx
+    index = model.tokenizer.index
+
+    def make_tokens(peptides):
+        # Build a multi-separator token tensor, as beam search would produce
+        # it (the tokenizer itself forbids more than one separator).
+        toks = []
+        for i, pep in enumerate(peptides):
+            if i > 0:
+                toks.append(sep)
+            toks += [index[aa] for aa in pep]
+        return torch.tensor(toks)
+
+    # Three peptides; the middle one is too short (2 < min_peptide_len=3) and
+    # is dropped, leaving the two valid ones.
+    tokens = make_tokens([["P", "E", "P", "K"], ["A", "A"], ["S", "A", "R"]])
+    aa_scores = np.full(len(tokens), 0.9)
+    preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    sequences = {seq for _, _, seq in preds}
+    assert sequences == {"PEPK", "SAR"}
+
+    # Three valid peptides of differing length -> at most two are returned,
+    # and (with equal per-residue scores) the shorter ones rank higher.
+    tokens = make_tokens(
+        [["A", "A", "R"], ["S", "A", "K"], list("PEPTANEK")]
+    )
+    aa_scores = np.full(len(tokens), 0.9)
+    preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    assert len(preds) == 2
+    sequences = {seq for _, _, seq in preds}
+    assert sequences == {"AAR", "SAK"}  # PEPTANEK (longest) scores lowest

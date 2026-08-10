@@ -3198,17 +3198,27 @@ def test_chimera_tokenizer_split_and_compliment():
         "M[+2.0]K",
     ]
 
-    # split() inserts the separator token between the two peptides.
+    # split() inserts the stop token as the peptide boundary, and '+' is not
+    # part of the vocabulary (it only joins the two peptides in the raw string).
     assert tokenizer.split("PEPK+AAR") == [
         "P",
         "E",
         "P",
         "K",
-        "+",
+        tokenizer.stop_token,
         "A",
         "A",
         "R",
     ]
+    assert "+" not in tokenizer.index
+    # A chimera therefore carries two stops and a single carries one.
+    assert (
+        tokenizer.tokenize(["PEPK+AAR"], add_stop=True)[0]
+        == tokenizer.stop_int
+    ).sum() == 2
+    assert (
+        tokenizer.tokenize(["PEPK"], add_stop=True)[0] == tokenizer.stop_int
+    ).sum() == 1
 
     # The complement swaps the peptide order.
     assert tokenizer.compliment(["PEPK+AAR"]) == ["AAR+PEPK"]

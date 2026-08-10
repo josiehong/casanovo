@@ -213,17 +213,26 @@ class Spec2Pep(pl.LightningModule):
             persistent=False,
         )
 
-        # Chimeric separator token. Only a ChimeraTokenizer defines a
-        # ``chimeric_separator_token``; for a standard tokenizer chimeric
-        # handling is disabled and the model behaves as standard Casanovo.
-        separator_token = getattr(
-            self.tokenizer, "chimeric_separator_token", None
+        self.sync_tokenizer_attrs()
+
+    def sync_tokenizer_attrs(self) -> None:
+        """(Re)derive the chimeric attributes from the current tokenizer.
+
+        Only a ChimeraTokenizer defines a ``chimeric_separator_token``; for a
+        standard tokenizer chimeric handling is disabled and the model behaves
+        as standard Casanovo. The peptide boundary is the stop token (there is
+        no ``+`` in the vocabulary), so the separator index *is* the stop index.
+
+        Called again by ``ModelRunner`` after a checkpoint is loaded: a
+        warm-started checkpoint carries the base (non-chimeric) tokenizer in its
+        hparams, so the values derived here at construction would be stale once
+        the config tokenizer is swapped in.
+        """
+        self.is_chimeric = (
+            getattr(self.tokenizer, "chimeric_separator_token", None) is not None
         )
-        self.is_chimeric = separator_token is not None
         self.chimeric_separator_idx = (
-            self.tokenizer.index[separator_token]
-            if self.is_chimeric
-            else None
+            self.stop_token if self.is_chimeric else None
         )
 
     @property
@@ -452,6 +461,13 @@ class Spec2Pep(pl.LightningModule):
             batch_size, dtype=torch.bool, device=device
         )
         ends_stop_token = current_tokens == self.stop_token
+        if getattr(self, "force_chimera", False):
+            # Force-chimera decode: the first stop is the peptide boundary, not
+            # the terminator, so a beam only finishes once a SECOND stop has been
+            # emitted (every spectrum gets two peptides). tokens[:, :step + 1] is
+            # the beam so far, including the current step.
+            n_stops = (tokens[:, : step + 1] == self.stop_token).sum(dim=1)
+            ends_stop_token = ends_stop_token & (n_stops >= 2)
         finished_beams[ends_stop_token] = True
 
         discarded_beams = torch.zeros(

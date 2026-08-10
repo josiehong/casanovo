@@ -34,7 +34,11 @@ class ChimeraTokenizer(PeptideTokenizer):
     stop_token : str | None
         The stop token to use.
     chimeric_separator_token : str
-        The token used to separate the two peptides of a chimeric annotation.
+        The token joining the two peptides in the raw annotation string
+        (``PEPTIDEA+PEPTIDEB``). It is *not* part of the token vocabulary. This
+        branch reuses the stop token as the peptide boundary, so a chimera
+        tokenizes to ``pep1 <stop> pep2 <stop>`` and the vocabulary matches a
+        standard (non-chimeric) tokenizer.
     """
 
     def __init__(
@@ -48,7 +52,6 @@ class ChimeraTokenizer(PeptideTokenizer):
     ) -> None:
         self.chimeric_separator_token = chimeric_separator_token
         residues = dict() if residues is None else dict(residues)
-        residues[chimeric_separator_token] = 0.0
 
         super().__init__(
             residues=residues,
@@ -144,7 +147,9 @@ class ChimeraTokenizer(PeptideTokenizer):
         if len(peptides) in [1, 2]:
             split = super().split(peptides[0])
             if len(peptides) == 2:
-                split += [self.chimeric_separator_token]
+                # The stop token is the boundary; ``tokenize`` appends the
+                # terminating stop, giving ``pep1 <stop> pep2 <stop>``.
+                split += [self.stop_token]
                 split += super().split(peptides[1])
         else:
             raise ValueError(

@@ -445,6 +445,7 @@ class ModelRunner:
             precursor_mass_tol=self.config.precursor_mass_tol,
             isotope_error_range=self.config.isotope_error_range,
             min_peptide_len=self.config.min_peptide_len,
+            max_peptide_len=self.config.max_peptide_len,
             top_match=self.config.top_match,
             n_beams=self.config.n_beams,
             n_log=self.config.n_log,

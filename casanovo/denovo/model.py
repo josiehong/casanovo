@@ -18,7 +18,6 @@ from ..data import ms_io, psm
 from ..denovo.transformers import PeptideDecoder, SpectrumEncoder
 from . import evaluate
 
-
 logger = logging.getLogger("casanovo")
 
 
@@ -77,7 +76,8 @@ class Spec2Pep(pl.LightningModule):
     n_log : int
         The number of epochs to wait between logging messages.
     train_label_smoothing : float
-        Smoothing factor when calculating the training loss.
+        Unused; retained for configuration compatibility. The CTC loss
+        does not support label smoothing.
     warmup_iters : int
         The number of iterations for the linear warm-up of the learning
         rate.
@@ -142,11 +142,8 @@ class Spec2Pep(pl.LightningModule):
             max_charge=max_charge,
         )
         self.softmax = torch.nn.Softmax(2)
-        ignore_index = 0
-        self.celoss = torch.nn.CrossEntropyLoss(
-            ignore_index=ignore_index, label_smoothing=train_label_smoothing
-        )
-        self.val_celoss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+        # Index 0 (padding) doubles as the CTC blank token.
+        self.ctc_loss = torch.nn.CTCLoss(blank=0, zero_infinity=True)
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -291,24 +288,22 @@ class Spec2Pep(pl.LightningModule):
 
         Returns
         -------
-        scores : torch.Tensor of shape (n_spectra, length, n_amino_acids)
-            The individual amino acid scores for each prediction.
-        seqs : torch.Tensor of shape (n_spectra, length)
-            The ground truth tokens for training, or zeros for inference.
+        scores : torch.Tensor of shape
+                (n_spectra, max_peptide_len + 1, n_amino_acids)
+            The frame-level amino acid scores for each prediction.
+        seqs : torch.Tensor of shape (n_spectra, length) or None
+            The ground truth tokens for training, or None for inference.
         """
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
 
-        if seqs is not None:
-            # Training: match ground truth length
-            zero_tokens = torch.zeros_like(seqs)
-        else:
-            # Inference: use max peptide length
-            zero_tokens = torch.zeros(
-                (mzs.shape[0], self.max_peptide_len),
-                dtype=torch.long,
-                device=self.device,
-            )
+        # Decode a fixed number of frames; the CTC loss aligns them to
+        # the (shorter) ground truth peptide.
+        zero_tokens = torch.zeros(
+            (mzs.shape[0], self.max_peptide_len),
+            dtype=torch.long,
+            device=self.device,
+        )
         scores = self.decoder(
             tokens=zero_tokens,
             memory=memories,
@@ -346,22 +341,22 @@ class Spec2Pep(pl.LightningModule):
 
         pred, truth = self._forward_step(batch)
 
-        batch_size, seq_len = truth.shape
-        pred = pred[:, :seq_len, :]
-
-        pred = pred.reshape(-1, self.vocab_size)
-
-        if mode == "train":
-            loss = self.celoss(pred, truth.flatten())
-        else:
-            loss = self.val_celoss(pred, truth.flatten())
+        log_probs = pred.log_softmax(-1).transpose(0, 1)  # (T, B, V)
+        input_lengths = torch.full(
+            (truth.shape[0],),
+            log_probs.shape[0],
+            dtype=torch.long,
+            device=truth.device,
+        )
+        target_lengths = (truth != 0).sum(dim=1)
+        loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
         self.log(
             f"{mode}_CELoss",
             loss.detach(),
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=pred.shape[0],
+            batch_size=truth.shape[0],
         )
         return loss
 
@@ -400,10 +395,18 @@ class Spec2Pep(pl.LightningModule):
             "".join(pep)
             for pep in self.tokenizer.detokenize(batch["seq"], join=False)
         ]
+        logits, _ = self.forward(batch)
         peptides_pred = [
-            pred
-            for spectrum_preds in self.forward(batch)
-            for _, _, pred in spectrum_preds
+            (
+                "".join(
+                    self.tokenizer.detokenize(
+                        torch.tensor([tokens]), join=False
+                    )[0]
+                )
+                if tokens
+                else ""
+            )
+            for tokens in self._ctc_decode(logits)[0]
         ]
         aa_precision, _, pep_precision = evaluate.aa_match_metrics(
             *evaluate.aa_match_batch(
@@ -421,133 +424,110 @@ class Spec2Pep(pl.LightningModule):
         )
         return loss
 
+    def _ctc_decode(
+        self, logits: torch.Tensor
+    ) -> Tuple[List[List[int]], List[List[float]]]:
+        """
+        Greedy CTC decoding of frame-level logits.
+
+        Collapse repeated frame predictions, remove blanks, and truncate
+        at the stop token. N-terminal modification tokens are only
+        retained at the peptide's N-terminus.
+
+        Parameters
+        ----------
+        logits : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The frame-level amino acid scores.
+
+        Returns
+        -------
+        sequences : List[List[int]]
+            The decoded token indices for each spectrum.
+        scores : List[List[float]]
+            The confidence for each decoded token, taken as the maximum
+            probability over the frames merged into that token.
+        """
+        probs = torch.softmax(logits, dim=-1)
+        frame_confs, frame_tokens = probs.max(dim=-1)
+        nterm_idx = set(self.nterm_idx.tolist())
+
+        sequences, scores = [], []
+        for tokens, confs in zip(frame_tokens.tolist(), frame_confs.tolist()):
+            seq, conf, prev = [], [], 0
+            for token, prob in zip(tokens, confs):
+                if token != 0 and token != prev:
+                    seq.append(token)
+                    conf.append(prob)
+                elif token != 0:
+                    conf[-1] = max(conf[-1], prob)
+                prev = token
+            if self.stop_token in seq:
+                stop = seq.index(self.stop_token)
+                seq, conf = seq[:stop], conf[:stop]
+            # With a reversed tokenizer the N-terminus is the last token.
+            nterm_pos = len(seq) - 1 if self.tokenizer.reverse else 0
+            keep = [
+                i == nterm_pos or token not in nterm_idx
+                for i, token in enumerate(seq)
+            ]
+            sequences.append([t for t, k in zip(seq, keep) if k])
+            scores.append([c for c, k in zip(conf, keep) if k])
+        return sequences, scores
+
     def predict_step(
         self, batch: Dict[str, torch.Tensor], *args
     ) -> List[psm.PepSpecMatch]:
         """
-        A single prediction step (non-autoregressive with N-term check).
+        A single prediction step (greedy CTC decoding).
 
         Parameters
         ----------
         batch : Dict[str, torch.Tensor]
             A batch from the SpectrumDataset, containing keys:
-            ``mz_array``, ``intensity_array``, ``precursor_mz``, ``precursor_charge``,
-            plus metadata like ``peak_file`` and ``scan_id``.
+            ``mz_array``, ``intensity_array``, ``precursor_mz``,
+            ``precursor_charge``, plus metadata like ``peak_file`` and
+            ``scan_id``.
 
         Returns
         -------
         predictions : List[psm.PepSpecMatch]
             Predicted PSMs for the given batch of spectra.
         """
-        # Forward pass
-        logits, _ = self._forward_step(batch)  # logits: (B, L, V)
-        device = logits.device
-        batch_size, L, V = logits.shape
+        logits, _ = self._forward_step(batch)
+        sequences, scores = self._ctc_decode(logits)
 
-        # N-term indices
-        nterm_idx = self.nterm_idx.to(device)
-        nterm_set = set(nterm_idx.tolist())
-
-        # Probabilities and argmax tokens
-        probs = torch.softmax(logits, dim=-1)  # (B, L, V)
-        predicted_tokens = probs.argmax(dim=-1)  # (B, L)
-
-        # Per-AA confidence
-        per_aa_conf = probs.gather(-1, predicted_tokens.unsqueeze(-1)).squeeze(
-            -1
-        )  # (B, L)
-
-        # N-term cleanup for non-reverse tokenizer
-        if not self.tokenizer.reverse and L > 1:
-            mask = torch.isin(predicted_tokens[:, 1:], nterm_idx)
-            predicted_tokens[:, 1:][mask] = 0
-
-        # N-term fix for reverse tokenizer
-        if self.tokenizer.reverse:
-            for b in range(batch_size):
-                # Find STOP token for this spectrum
-                stop_pos = L
-                for j, t in enumerate(predicted_tokens[b]):
-                    if t == self.stop_token or t == 0:
-                        stop_pos = j
-                        break
-
-                # Allowed N-term mod position = stop_pos - 1
-                valid_pos = max(0, stop_pos - 1)
-
-                # For all positions before STOP:
-                for j in range(stop_pos):
-                    tok = int(predicted_tokens[b, j].item())
-                    if tok in nterm_set and j != valid_pos:
-                        # Mask all N-term tokens and re-decide
-                        masked = logits[b, j].clone()
-                        masked[nterm_idx] = -float("inf")
-                        newtok = masked.argmax()
-                        newtok_idx = int(
-                            newtok.item()
-                        )  # Fixed: convert to int
-
-                        predicted_tokens[b, j] = newtok
-                        # New confidence
-                        new_probs = torch.softmax(masked, dim=0)
-                        per_aa_conf[b, j] = new_probs[
-                            newtok_idx
-                        ]  # Fixed: use int index
-
-        predictions: List[psm.PepSpecMatch] = []
-
-        for (
-            filename,
-            scan,
-            charge,
-            prec_mz,
-            tokens,
-            confs,
-        ) in zip(
+        predictions = []
+        for filename, scan, charge, prec_mz, tokens, confs in zip(
             batch["peak_file"],
             batch["scan_id"],
             batch["precursor_charge"],
             batch["precursor_mz"],
-            predicted_tokens,
-            per_aa_conf,
+            sequences,
+            scores,
         ):
-            # Find STOP position for this sequence
-            stop_pos = L
-            for j, t in enumerate(tokens):
-                if t == self.stop_token or t == 0:
-                    stop_pos = j
-                    break
-
-            valid_tokens = tokens[:stop_pos]
-            valid_scores = confs[:stop_pos].detach().cpu().numpy()
-
-            if len(valid_tokens) == 0:
+            if not tokens:
                 continue
 
-            # Detokenize (ensure CPU)
-            valid_tokens_cpu = valid_tokens.detach().cpu().unsqueeze(0)
             peptide = "".join(
-                self.tokenizer.detokenize(valid_tokens_cpu, join=False)[0]
+                self.tokenizer.detokenize(torch.tensor([tokens]), join=False)[
+                    0
+                ]
             )
-
-            # Reverse score order if needed
+            aa_scores = np.array(confs)
             if self.tokenizer.reverse:
-                valid_scores = valid_scores[::-1]
+                aa_scores = aa_scores[::-1]
 
-            pep_score = float(valid_scores.mean())
-
-            # Build PSM
-            spec_match = psm.PepSpecMatch(
-                sequence=peptide,
-                spectrum_id=(filename, scan),
-                peptide_score=pep_score,
-                charge=int(charge),
-                calc_mz=np.nan,
-                exp_mz=float(prec_mz.item()),
-                aa_scores=valid_scores,
+            predictions.append(
+                psm.PepSpecMatch(
+                    sequence=peptide,
+                    spectrum_id=(filename, scan),
+                    peptide_score=float(aa_scores.mean()),
+                    charge=int(charge),
+                    calc_mz=np.nan,
+                    exp_mz=float(prec_mz.item()),
+                    aa_scores=aa_scores,
+                )
             )
-
-            predictions.append(spec_match)
 
         return predictions
 

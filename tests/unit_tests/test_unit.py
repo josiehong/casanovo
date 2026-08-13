@@ -1839,10 +1839,10 @@ def test_train_val_step_functions():
     assert train_step_loss > 0
     assert val_step_loss > 0
 
-    # Check if smoothing is applied in training and not in validation
-    assert model.celoss.label_smoothing == 0.1
-    assert model.val_celoss.label_smoothing == 0
-    assert val_step_loss != train_step_loss
+    # Training and validation share the same CTC loss, with the padding
+    # index doubling as the blank token.
+    assert model.ctc_loss.blank == 0
+    assert torch.isclose(val_step_loss, train_step_loss)
 
 
 def test_run_map(mgf_small):
@@ -2149,7 +2149,7 @@ def test_beam_search_decode(tiny_config):
     assert torch.equal(
         discarded, torch.tensor([False, False, False, True], device=device)
     )
-    
+
 
 @pytest.mark.skip(reason="No Beam Search in Non-AR Model")
 def test_peptide_too_short_too_heavy(tiny_config):
@@ -2223,7 +2223,7 @@ def test_cache_finished_beams(tiny_config):
         pep for (_, _, _, pep) in pred_cache[0] if torch.equal(pep, true_tok)
     ]
     assert len(cached) == 1
-    
+
 
 @pytest.mark.skip(reason="No Beam Search in Non-AR Model")
 def test_get_top_peptide_ranking(tiny_config):
@@ -2273,7 +2273,7 @@ def test_get_top_peptide_multiple(topk, tiny_config):
     assert len(result) == topk
     for i in range(topk):
         assert result[i][2] == cache_items[i][1]
-        
+
 
 @pytest.mark.skip(reason="No Beam Search in Non-AR Model")
 @pytest.mark.parametrize("reverse", [True, False])

@@ -1839,9 +1839,9 @@ def test_train_val_step_functions():
     assert train_step_loss > 0
     assert val_step_loss > 0
 
-    # Training and validation share the same CTC loss, with the padding
-    # index doubling as the blank token.
-    assert model.ctc_loss.blank == 0
+    # Training and validation share the same CTC loss, with a dedicated
+    # blank class as the last vocabulary index.
+    assert model.ctc_loss.blank == model.blank_token == model.vocab_size - 1
     assert torch.isclose(val_step_loss, train_step_loss)
 
 

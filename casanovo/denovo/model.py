@@ -123,7 +123,10 @@ class Spec2Pep(pl.LightningModule):
         self.save_hyperparameters()
 
         self.tokenizer = tokenizer or PeptideTokenizer()
-        self.vocab_size = len(self.tokenizer) + 1
+        # Vocabulary: tokenizer tokens incl. padding (0), plus a
+        # dedicated CTC blank class as the last index.
+        self.vocab_size = len(self.tokenizer) + 2
+        self.blank_token = self.vocab_size - 1
         # Build the model.
         self.encoder = SpectrumEncoder(
             d_model=dim_model,
@@ -142,8 +145,10 @@ class Spec2Pep(pl.LightningModule):
             max_charge=max_charge,
         )
         self.softmax = torch.nn.Softmax(2)
-        # Index 0 (padding) doubles as the CTC blank token.
-        self.ctc_loss = torch.nn.CTCLoss(blank=0, zero_infinity=True)
+        self.ctc_loss = torch.nn.CTCLoss(
+            blank=self.blank_token, zero_infinity=True
+        )
+        self._ctc_infeasible_warned = False
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -349,6 +354,22 @@ class Spec2Pep(pl.LightningModule):
             device=truth.device,
         )
         target_lengths = (truth != 0).sum(dim=1)
+        # CTC needs one frame per token plus a blank between repeated
+        # tokens; longer peptides are unalignable and get zero loss
+        # (zero_infinity), so warn that they do not contribute.
+        repeats = ((truth[:, 1:] == truth[:, :-1]) & (truth[:, 1:] != 0)).sum(
+            dim=1
+        )
+        infeasible = target_lengths + repeats > input_lengths
+        if infeasible.any() and not self._ctc_infeasible_warned:
+            self._ctc_infeasible_warned = True
+            logger.warning(
+                "%d peptide(s) in this batch need more CTC frames than "
+                "max_peptide_len + 1 = %d and will contribute zero loss. "
+                "Increase max_peptide_len to include them in training.",
+                infeasible.sum().item(),
+                self.max_peptide_len + 1,
+            )
         loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
         self.log(
             f"{mode}_CELoss",
@@ -432,7 +453,9 @@ class Spec2Pep(pl.LightningModule):
 
         Collapse repeated frame predictions, remove blanks, and truncate
         at the stop token. N-terminal modification tokens are only
-        retained at the peptide's N-terminus.
+        valid at the peptide's N-terminus; elsewhere they are re-decided
+        from their frame with all N-terminal tokens masked out, and
+        dropped if the re-decision yields a blank or stop token.
 
         Parameters
         ----------
@@ -450,28 +473,42 @@ class Spec2Pep(pl.LightningModule):
         probs = torch.softmax(logits, dim=-1)
         frame_confs, frame_tokens = probs.max(dim=-1)
         nterm_idx = set(self.nterm_idx.tolist())
+        # Padding (0) is treated as non-emitting, like the blank.
+        silent = (0, self.blank_token)
 
         sequences, scores = [], []
-        for tokens, confs in zip(frame_tokens.tolist(), frame_confs.tolist()):
-            seq, conf, prev = [], [], 0
-            for token, prob in zip(tokens, confs):
-                if token != 0 and token != prev:
-                    seq.append(token)
-                    conf.append(prob)
-                elif token != 0:
-                    conf[-1] = max(conf[-1], prob)
+        for b, (tokens, confs) in enumerate(
+            zip(frame_tokens.tolist(), frame_confs.tolist())
+        ):
+            seq, conf, frames, prev = [], [], [], self.blank_token
+            for j, (token, prob) in enumerate(zip(tokens, confs)):
+                if token not in silent:
+                    if token != prev:
+                        seq.append(token)
+                        conf.append(prob)
+                        frames.append(j)
+                    elif prob > conf[-1]:
+                        conf[-1] = prob
+                        frames[-1] = j
                 prev = token
             if self.stop_token in seq:
                 stop = seq.index(self.stop_token)
-                seq, conf = seq[:stop], conf[:stop]
+                seq, conf, frames = seq[:stop], conf[:stop], frames[:stop]
             # With a reversed tokenizer the N-terminus is the last token.
             nterm_pos = len(seq) - 1 if self.tokenizer.reverse else 0
-            keep = [
-                i == nterm_pos or token not in nterm_idx
-                for i, token in enumerate(seq)
-            ]
-            sequences.append([t for t, k in zip(seq, keep) if k])
-            scores.append([c for c, k in zip(conf, keep) if k])
+            fixed_seq, fixed_conf = [], []
+            for i, (token, prob, frame) in enumerate(zip(seq, conf, frames)):
+                if i != nterm_pos and token in nterm_idx:
+                    masked = logits[b, frame].clone()
+                    masked[self.nterm_idx] = -float("inf")
+                    token = int(masked.argmax())
+                    if token in silent or token == self.stop_token:
+                        continue
+                    prob = torch.softmax(masked, dim=0)[token].item()
+                fixed_seq.append(token)
+                fixed_conf.append(prob)
+            sequences.append(fixed_seq)
+            scores.append(fixed_conf)
         return sequences, scores
 
     def predict_step(

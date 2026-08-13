@@ -72,12 +72,11 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         self.charge_encoder = torch.nn.Embedding(max_charge, d_model)
         self.mass_encoder = FloatEncoder(d_model)
 
-        # Override the output layer to have +1 in the second dimension
-        # compared to the AnalyteTransformerDecoder to account for
-        # padding as a possible class (=0) and avoid problems during
-        # beam search decoding.
+        # Override the output layer with one class beyond the token
+        # embeddings (which include padding at index 0): the last index
+        # serves as the dedicated CTC blank class.
         self.final = torch.nn.Linear(
-            d_model, self.token_encoder.num_embeddings
+            d_model, self.token_encoder.num_embeddings + 1
         )
 
     def global_token_hook(

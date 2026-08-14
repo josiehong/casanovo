@@ -20,6 +20,15 @@ from . import evaluate
 
 logger = logging.getLogger("casanovo")
 
+H2O_MASS = 18.010565
+ISOTOPE_SPACING = 1.00335
+# Precise mass control (PMC) decoding settings: the mass discretization
+# step, the widening of the readout windows to absorb accumulated
+# rounding error, and a cap on the backtracking table size.
+PMC_RESOLUTION = 0.01
+PMC_MASS_GUARD = 0.1
+PMC_MAX_POINTER_BYTES = 1_000_000_000
+
 
 class Spec2Pep(pl.LightningModule):
     """
@@ -149,6 +158,7 @@ class Spec2Pep(pl.LightningModule):
             blank=self.blank_token, zero_infinity=True
         )
         self._ctc_infeasible_warned = False
+        self._pmc_size_warned = False
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -511,6 +521,212 @@ class Spec2Pep(pl.LightningModule):
             scores.append(fixed_conf)
         return sequences, scores
 
+    def _residue_mass_windows(
+        self, precursor_mass: float, guard: float = 0.0
+    ) -> List[Tuple[float, float]]:
+        """
+        Acceptable total residue mass windows for a precursor.
+
+        One window per isotope error in ``isotope_error_range``, each
+        spanning the precursor mass tolerance (in ppm), expressed in
+        residue-sum space (i.e. with the water mass removed).
+
+        Parameters
+        ----------
+        precursor_mass : float
+            The observed precursor neutral mass.
+        guard : float
+            Extra widening (in Da) applied to both window edges.
+
+        Returns
+        -------
+        List[Tuple[float, float]]
+            The (lower, upper) bounds of each window.
+        """
+        tol = self.precursor_mass_tol * precursor_mass / 1e6
+        return [
+            (center - tol - guard, center + tol + guard)
+            for iso in range(
+                self.isotope_error_range[0], self.isotope_error_range[1] + 1
+            )
+            for center in [precursor_mass - iso * ISOTOPE_SPACING - H2O_MASS]
+        ]
+
+    def _fits_precursor_mass(
+        self, tokens: List[int], precursor_mass: float
+    ) -> bool:
+        """
+        Check whether a peptide matches the precursor mass.
+
+        Parameters
+        ----------
+        tokens : List[int]
+            The decoded token indices.
+        precursor_mass : float
+            The observed precursor neutral mass.
+
+        Returns
+        -------
+        bool
+            True if the total residue mass falls within the precursor
+            mass tolerance for any allowed isotope error.
+        """
+        mass = (
+            self.token_masses[torch.tensor(tokens, dtype=torch.long)]
+            .sum()
+            .item()
+        )
+        return any(
+            lo <= mass <= hi
+            for lo, hi in self._residue_mass_windows(precursor_mass)
+        )
+
+    def _pmc_decode(
+        self, logits: torch.Tensor, precursor_mass: float
+    ) -> Optional[Tuple[List[int], List[float]]]:
+        """
+        Precise mass control (PMC) decoding for a single spectrum.
+
+        Knapsack-like dynamic programming over the CTC lattice (after
+        PrimeNovo): find the highest-probability CTC path whose
+        collapsed peptide's total residue mass matches the precursor
+        mass within tolerance, considering all allowed isotope errors.
+        The DP state is (discretized emitted mass, last path symbol);
+        the last symbol is needed to apply the CTC collapse rules
+        (a repeated symbol without an intervening blank does not emit).
+
+        Stop, padding, N-terminal modification, and non-positive-mass
+        tokens are excluded from the search.
+
+        Parameters
+        ----------
+        logits : torch.Tensor of shape (n_frames, n_tokens)
+            The frame-level amino acid scores for one spectrum.
+        precursor_mass : float
+            The observed precursor neutral mass.
+
+        Returns
+        -------
+        Optional[Tuple[List[int], List[float]]]
+            The decoded token indices and per-token confidences, or
+            None if no mass-matching path exists (or the search was
+            skipped because the DP table would be too large).
+        """
+        device = logits.device
+        n_frames, vocab = logits.shape
+        windows = self._residue_mass_windows(
+            precursor_mass, guard=PMC_MASS_GUARD
+        )
+        hi_max = max(hi for _, hi in windows)
+        if hi_max <= 0:
+            return None
+        n_bins = int(hi_max / PMC_RESOLUTION) + 2
+        if n_frames * n_bins * vocab > PMC_MAX_POINTER_BYTES:
+            if not self._pmc_size_warned:
+                self._pmc_size_warned = True
+                logger.warning(
+                    "Skipping precise mass control decoding for large "
+                    "precursor masses; the DP table would exceed %d bytes.",
+                    PMC_MAX_POINTER_BYTES,
+                )
+            return None
+
+        # Emittable tokens and their discretized masses.
+        excluded = {
+            0,
+            self.blank_token,
+            self.stop_token,
+            *self.nterm_idx.tolist(),
+        }
+        deltas = {}
+        for c in range(min(vocab, self.token_masses.shape[0])):
+            mass = self.token_masses[c].item()
+            if c not in excluded and 0 < mass <= hi_max:
+                deltas[c] = round(mass / PMC_RESOLUTION)
+        if not deltas:
+            return None
+
+        log_probs = logits.log_softmax(-1)
+        neg_inf = float("-inf")
+        blank = self.blank_token
+        # score[m, c]: best log-probability of any path prefix with
+        # discretized emitted mass m and last symbol c.
+        score = torch.full((n_bins, vocab), neg_inf, device=device)
+        score[0, blank] = 0.0
+        # pointers[t, m, c]: last symbol of the predecessor state; a
+        # pointer equal to c itself encodes a repeat (no new emission).
+        pointers = torch.empty((n_frames, n_bins, vocab), dtype=torch.int8)
+        for t in range(n_frames):
+            lp = log_probs[t]
+            top2 = score.topk(2, dim=1)
+            best, best_arg = top2.values[:, 0], top2.indices[:, 0]
+            second, second_arg = top2.values[:, 1], top2.indices[:, 1]
+            new_score = torch.full_like(score, neg_inf)
+            new_ptr = torch.full(
+                (n_bins, vocab), -1, dtype=torch.int8, device=device
+            )
+            # Blank keeps the mass and may follow any symbol.
+            new_score[:, blank] = best + lp[blank]
+            new_ptr[:, blank] = best_arg.to(torch.int8)
+            for c, delta in deltas.items():
+                # Continue the current run of c: no new emission.
+                repeat = score[:, c] + lp[c]
+                # Start a new emission of c after a different symbol.
+                prev_best = torch.where(best_arg == c, second, best)
+                prev_arg = torch.where(best_arg == c, second_arg, best_arg)
+                emit = torch.full((n_bins,), neg_inf, device=device)
+                emit_arg = torch.full(
+                    (n_bins,), -1, dtype=torch.long, device=device
+                )
+                if delta < n_bins:
+                    emit[delta:] = prev_best[: n_bins - delta] + lp[c]
+                    emit_arg[delta:] = prev_arg[: n_bins - delta]
+                use_emit = emit > repeat
+                new_score[:, c] = torch.where(use_emit, emit, repeat)
+                new_ptr[:, c] = torch.where(
+                    use_emit,
+                    emit_arg.to(torch.int8),
+                    torch.full_like(new_ptr[:, c], c),
+                )
+            score = new_score
+            pointers[t] = new_ptr.cpu()
+
+        # Read out the best final state within any mass window.
+        mass_axis = torch.arange(n_bins, device=device) * PMC_RESOLUTION
+        allowed = torch.zeros(n_bins, dtype=torch.bool, device=device)
+        for lo, hi in windows:
+            allowed |= (mass_axis >= lo) & (mass_axis <= hi)
+        score[~allowed] = neg_inf
+        best_val, flat_idx = score.flatten().max(dim=0)
+        if not torch.isfinite(best_val):
+            return None
+        m = int(flat_idx.item()) // vocab
+        c = int(flat_idx.item()) % vocab
+
+        # Backtrack, aggregating each emission's confidence as the
+        # maximum probability over its merged frames.
+        probs = log_probs.exp()
+        emissions = []
+        run_conf = None
+        for t in reversed(range(n_frames)):
+            prev = int(pointers[t, m, c])
+            if c != blank:
+                prob = probs[t, c].item()
+                run_conf = prob if run_conf is None else max(run_conf, prob)
+                if prev != c:
+                    # Frame t started this emission of c.
+                    emissions.append((c, run_conf))
+                    run_conf = None
+                    m -= deltas[c]
+            c = prev
+
+        tokens = [c for c, _ in reversed(emissions)]
+        confs = [s for _, s in reversed(emissions)]
+        # Verify the exact (non-discretized) mass before accepting.
+        if not tokens or not self._fits_precursor_mass(tokens, precursor_mass):
+            return None
+        return tokens, confs
+
     def predict_step(
         self, batch: Dict[str, torch.Tensor], *args
     ) -> List[psm.PepSpecMatch]:
@@ -532,6 +748,17 @@ class Spec2Pep(pl.LightningModule):
         """
         logits, _ = self._forward_step(batch)
         sequences, scores = self._ctc_decode(logits)
+
+        # Precise mass control: when the greedy peptide does not match
+        # the precursor mass, search for the best CTC path that does.
+        _, _, precursors, _ = self._process_batch(batch)
+        for i, tokens in enumerate(sequences):
+            precursor_mass = precursors[i, 0].item()
+            if tokens and self._fits_precursor_mass(tokens, precursor_mass):
+                continue
+            pmc = self._pmc_decode(logits[i], precursor_mass)
+            if pmc is not None:
+                sequences[i], scores[i] = pmc
 
         predictions = []
         for filename, scan, charge, prec_mz, tokens, confs in zip(

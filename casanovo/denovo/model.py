@@ -24,10 +24,13 @@ H2O_MASS = 18.010565
 ISOTOPE_SPACING = 1.00335
 # Precise mass control (PMC) decoding settings: the mass discretization
 # step, the widening of the readout windows to absorb accumulated
-# rounding error, and a cap on the backtracking table size.
+# rounding error, a cap on the backtracking table size, and the minimum
+# frame probability for a token to be considered for emission (frames
+# where every token falls below it reduce to a blank-only update).
 PMC_RESOLUTION = 0.01
 PMC_MASS_GUARD = 0.1
 PMC_MAX_POINTER_BYTES = 1_000_000_000
+PMC_MIN_EMIT_PROB = 1e-4
 
 
 class Spec2Pep(pl.LightningModule):
@@ -596,7 +599,10 @@ class Spec2Pep(pl.LightningModule):
         (a repeated symbol without an intervening blank does not emit).
 
         Stop, padding, N-terminal modification, and non-positive-mass
-        tokens are excluded from the search.
+        tokens are excluded from the search. As an approximation for
+        speed, a token may only be emitted at frames where its
+        probability exceeds ``PMC_MIN_EMIT_PROB``; frames without any
+        such token reduce to a blank-only update.
 
         Parameters
         ----------
@@ -638,13 +644,24 @@ class Spec2Pep(pl.LightningModule):
             self.stop_token,
             *self.nterm_idx.tolist(),
         }
-        deltas = {}
+        emit_tokens, emit_deltas = [], []
         for c in range(min(vocab, self.token_masses.shape[0])):
             mass = self.token_masses[c].item()
             if c not in excluded and 0 < mass <= hi_max:
-                deltas[c] = round(mass / PMC_RESOLUTION)
-        if not deltas:
+                emit_tokens.append(c)
+                emit_deltas.append(round(mass / PMC_RESOLUTION))
+        if not emit_tokens:
             return None
+        deltas = dict(zip(emit_tokens, emit_deltas))
+        emit_idx = torch.tensor(emit_tokens, device=device)
+        emit_i8 = emit_idx.unsqueeze(1).to(torch.int8)
+        delta_idx = torch.tensor(emit_deltas, device=device)
+
+        # Per-token mass shifts as gather indices over the mass axis:
+        # src_bins[e, m] = m - delta_e, valid where m >= delta_e.
+        bins = torch.arange(n_bins, device=device)
+        src_bins = (bins.unsqueeze(0) - delta_idx.unsqueeze(1)).clamp(min=0)
+        valid = bins.unsqueeze(0) >= delta_idx.unsqueeze(1)
 
         log_probs = logits.log_softmax(-1)
         neg_inf = float("-inf")
@@ -655,41 +672,68 @@ class Spec2Pep(pl.LightningModule):
         score[0, blank] = 0.0
         # pointers[t, m, c]: last symbol of the predecessor state; a
         # pointer equal to c itself encodes a repeat (no new emission).
-        pointers = torch.empty((n_frames, n_bins, vocab), dtype=torch.int8)
+        # Kept on the model device; backtracking reads single entries.
+        pointers = torch.empty(
+            (n_frames, n_bins, vocab), dtype=torch.int8, device=device
+        )
+        # Tokens below PMC_MIN_EMIT_PROB at a frame are not considered
+        # for emission there; frames without any candidate token reduce
+        # to a blank-only update. This prunes the (typically blank-
+        # dominated) majority of frames at negligible approximation
+        # cost.
+        min_lp = float(np.log(PMC_MIN_EMIT_PROB))
+        candidates = log_probs[:, emit_idx] > min_lp  # (n_frames, E)
         for t in range(n_frames):
             lp = log_probs[t]
-            top2 = score.topk(2, dim=1)
-            best, best_arg = top2.values[:, 0], top2.indices[:, 0]
-            second, second_arg = top2.values[:, 1], top2.indices[:, 1]
+            sel = candidates[t].nonzero(as_tuple=True)[0]
             new_score = torch.full_like(score, neg_inf)
             new_ptr = torch.full(
                 (n_bins, vocab), -1, dtype=torch.int8, device=device
             )
+            if sel.numel() == 0:
+                # Blank-only frame: every state transitions to blank.
+                best, best_arg = score.max(dim=1)
+                new_score[:, blank] = best + lp[blank]
+                new_ptr[:, blank] = best_arg.to(torch.int8)
+                score = new_score
+                pointers[t] = new_ptr
+                continue
+            top2 = score.topk(2, dim=1)
+            best, best_arg = top2.values[:, 0], top2.indices[:, 0]
+            second, second_arg = top2.values[:, 1], top2.indices[:, 1]
+            sel_tokens = emit_idx[sel]
+            # Best predecessor excluding each candidate token itself,
+            # shifted by that token's mass: a new emission of token e at
+            # mass m extends the best path at mass m - delta_e whose
+            # last symbol differs from e.
+            is_self = best_arg.unsqueeze(0) == sel_tokens.unsqueeze(1)
+            excl_val = torch.where(
+                is_self, second.unsqueeze(0), best.unsqueeze(0)
+            )
+            excl_arg = torch.where(
+                is_self, second_arg.unsqueeze(0), best_arg.unsqueeze(0)
+            )
+            emit_val = excl_val.gather(1, src_bins[sel]) + lp[
+                sel_tokens
+            ].unsqueeze(1)
+            emit_val = emit_val.masked_fill(~valid[sel], neg_inf)
+            emit_arg = excl_arg.gather(1, src_bins[sel])
+            # Continue the current run: no new emission.
+            repeat = score[:, sel_tokens].T + lp[sel_tokens].unsqueeze(1)
+            use_emit = emit_val > repeat
+            emit_score = torch.where(use_emit, emit_val, repeat)
+            emit_ptr = torch.where(
+                use_emit,
+                emit_arg.to(torch.int8),
+                emit_i8[sel].expand_as(use_emit),
+            )
             # Blank keeps the mass and may follow any symbol.
             new_score[:, blank] = best + lp[blank]
             new_ptr[:, blank] = best_arg.to(torch.int8)
-            for c, delta in deltas.items():
-                # Continue the current run of c: no new emission.
-                repeat = score[:, c] + lp[c]
-                # Start a new emission of c after a different symbol.
-                prev_best = torch.where(best_arg == c, second, best)
-                prev_arg = torch.where(best_arg == c, second_arg, best_arg)
-                emit = torch.full((n_bins,), neg_inf, device=device)
-                emit_arg = torch.full(
-                    (n_bins,), -1, dtype=torch.long, device=device
-                )
-                if delta < n_bins:
-                    emit[delta:] = prev_best[: n_bins - delta] + lp[c]
-                    emit_arg[delta:] = prev_arg[: n_bins - delta]
-                use_emit = emit > repeat
-                new_score[:, c] = torch.where(use_emit, emit, repeat)
-                new_ptr[:, c] = torch.where(
-                    use_emit,
-                    emit_arg.to(torch.int8),
-                    torch.full_like(new_ptr[:, c], c),
-                )
+            new_score[:, sel_tokens] = emit_score.T
+            new_ptr[:, sel_tokens] = emit_ptr.T
             score = new_score
-            pointers[t] = new_ptr.cpu()
+            pointers[t] = new_ptr
 
         # Read out the best final state within any mass window.
         mass_axis = torch.arange(n_bins, device=device) * PMC_RESOLUTION
@@ -705,7 +749,7 @@ class Spec2Pep(pl.LightningModule):
 
         # Backtrack, aggregating each emission's confidence as the
         # maximum probability over its merged frames.
-        probs = log_probs.exp()
+        probs = log_probs.exp().cpu()
         emissions = []
         run_conf = None
         for t in reversed(range(n_frames)):

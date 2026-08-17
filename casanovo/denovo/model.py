@@ -92,7 +92,7 @@ class Spec2Pep(pl.LightningModule):
     tokenizer: PeptideTokenizer | None
         Tokenizer object to process peptide sequences.
     **kwargs : Dict
-        Additional keyword arguments passed to the Adam optimizer.
+        Additional keyword arguments passed to the AdamW optimizer.
     """
 
     def __init__(
@@ -679,15 +679,15 @@ class Spec2Pep(pl.LightningModule):
         """
         Initialize the optimizer.
 
-        We use the Adam optimizer with a cosine learning rate scheduler.
+        We use the AdamW optimizer with a cosine learning rate scheduler.
 
         Returns
         -------
         Tuple[List[torch.optim.Optimizer], Dict[str, Any]]
-            The initialized Adam optimizer and its learning rate
+            The initialized AdamW optimizer and its learning rate
             scheduler.
         """
-        optimizer = torch.optim.Adam(self.parameters(), **self.opt_kwargs)
+        optimizer = torch.optim.AdamW(self.parameters(), **self.opt_kwargs)
         # Apply learning rate scheduler per step.
         lr_scheduler = CosineWarmupScheduler(
             optimizer, self.warmup_iters, self.cosine_schedule_period_iters

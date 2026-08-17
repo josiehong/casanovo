@@ -173,6 +173,14 @@ replace_isoleucine_with_leucine: true
 # MassIVE-KB style tokenizer, otherwise ProForma syntax.
 massivekb_tokenizer: false
 
+# Peak-claim channel: a zero-initialized per-peak input flag marking peaks
+# explained by an already-decoded peptide's fragment ions. Enables two-pass
+# training (first peptide on the clean encoding, second on the flagged one)
+# and two-pass decoding. A claim-less checkpoint can be warm-started.
+claim_channel: false
+# Fragment-matching tolerance (ppm) for computing the claim flags.
+claim_fragment_tol_ppm: 20.0
+
 # AMINO ACID AND MODIFICATION VOCABULARY
 residues:
   "G": 57.021464

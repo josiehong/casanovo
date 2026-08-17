@@ -3357,11 +3357,124 @@ def test_split_chimeric_prediction_top2_and_filtering(tiny_config):
 
     # Three valid peptides of differing length -> at most two are returned,
     # and (with equal per-residue scores) the shorter ones rank higher.
-    tokens = make_tokens(
-        [["A", "A", "R"], ["S", "A", "K"], list("PEPTANEK")]
-    )
+    tokens = make_tokens([["A", "A", "R"], ["S", "A", "K"], list("PEPTANEK")])
     aa_scores = np.full(len(tokens), 0.9)
     preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
     assert len(preds) == 2
     sequences = {seq for _, _, seq in preds}
     assert sequences == {"AAR", "SAK"}  # PEPTANEK (longest) scores lowest
+
+
+def test_claim_encoder_zero_init(tiny_config):
+    """At zero init, claim flags do not change the encoder output."""
+    model = _chimera_model(tiny_config, claim_channel=True)
+    model.eval()
+
+    torch.manual_seed(0)
+    mzs = torch.rand(3, 10) * 1000 + 100
+    mzs[:, 8:] = 0.0  # padding
+    ints = torch.rand(3, 10)
+    ints[:, 8:] = 0.0
+    claims = torch.rand(3, 10) > 0.5
+
+    with torch.no_grad():
+        clean, mask_clean = model.encoder(mzs, ints)
+        flagged, mask_flagged = model.encoder(mzs, ints, claims=claims)
+    assert torch.equal(mask_clean, mask_flagged)
+    assert torch.allclose(clean, flagged)
+
+    # A non-zero claim vector changes the flagged encoding.
+    with torch.no_grad():
+        model.encoder.claim_vec += 1.0
+        perturbed, _ = model.encoder(mzs, ints, claims=claims)
+    assert not torch.allclose(clean, perturbed)
+
+    # A model without the channel has no claim parameter.
+    plain = _chimera_model(tiny_config)
+    assert not hasattr(plain.encoder, "claim_vec")
+
+
+def test_compute_claims_by_ions(tiny_config):
+    """Claim flags match b/y ions (and isotopes), not decoy peaks."""
+    from depthcharge.constants import H2O
+
+    from casanovo.data.db_utils import ISOTOPE_SPACING, PROTON
+
+    model = _chimera_model(tiny_config, claim_channel=True)
+    res = model.tokenizer.residues
+
+    b2 = res["P"] + res["E"] + PROTON
+    y1 = res["K"] + H2O + PROTON
+    mzs = torch.tensor(
+        [[b2, y1, b2 + ISOTOPE_SPACING, 400.0, 0.0]], dtype=torch.float64
+    )
+    tokens = model.tokenizer.tokenize(["PEPK"])
+    charges = torch.tensor([2])
+
+    flags = model.compute_claims(tokens, mzs, charges)
+    assert flags.tolist() == [[True, True, True, False, False]]
+
+    # Fragment charge 2 requires precursor charge >= 3.
+    b2_z2 = (res["P"] + res["E"] + 2 * PROTON) / 2
+    mzs2 = torch.tensor([[b2_z2, 400.0]], dtype=torch.float64)
+    assert model.compute_claims(tokens, mzs2, torch.tensor([2])).tolist() == [
+        [False, False]
+    ]
+    assert model.compute_claims(tokens, mzs2, torch.tensor([3])).tolist() == [
+        [True, False]
+    ]
+
+
+def test_first_segment(tiny_config):
+    """The first segment of a nosep chimera is the first peptide + stop."""
+    model = _chimera_model(tiny_config)
+    seqs = model.tokenizer.tokenize(["PEPK+AAR", "PEPTANEK"], add_stop=True)
+    seg = model._first_segment(seqs)
+
+    stop = model.stop_token
+    assert (seg[0] == stop).sum() == 1
+    assert (seg[0] != 0).sum() == 5  # PEPK + stop
+    assert torch.equal(seg[0][:5], seqs[0][:5])
+    # A single-peptide sequence is unchanged.
+    assert torch.equal(seg[1], seqs[1])
+
+
+def test_claim_loss_and_two_pass_decode(tiny_config):
+    """The claim loss backpropagates to the claim vector; decode runs."""
+    model = _chimera_model(
+        tiny_config, claim_channel=True, min_peptide_len=2, n_beams=1
+    )
+
+    torch.manual_seed(0)
+    seqs = ["PEPK+AAR", "PEPTANEK"]
+    # Include real fragment peaks of both peptides so claims fire.
+    from depthcharge.constants import H2O
+
+    from casanovo.data.db_utils import PROTON
+
+    res = model.tokenizer.residues
+    mzs = torch.rand(2, 12) * 1000 + 100
+    mzs[0, 0] = res["P"] + res["E"] + PROTON  # b2 of PEPK
+    mzs[0, 1] = res["K"] + H2O + PROTON  # y1 of PEPK
+    mzs[0, 2] = res["R"] + H2O + PROTON  # y1 of AAR
+    batch = {
+        "mz_array": mzs,
+        "intensity_array": torch.rand(2, 12),
+        "precursor_mz": torch.tensor([500.9, 450.2]),
+        "precursor_charge": torch.tensor([2, 3]),
+        "seq": model.tokenizer.tokenize(seqs, add_stop=True),
+        "seq_compliment": model.tokenizer.tokenize(
+            model.tokenizer.compliment(seqs), add_stop=True
+        ),
+    }
+
+    loss = model._calc_claim_loss(batch, model.val_celoss)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.encoder.claim_vec.grad is not None
+    assert model.encoder.claim_vec.grad.abs().sum() > 0
+
+    model.eval()
+    with torch.no_grad():
+        first, second = model.two_pass_decode(batch)
+    assert len(first) == len(second) == 2

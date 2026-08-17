@@ -101,6 +101,8 @@ class Config:
         precision=str,
         replace_isoleucine_with_leucine=bool,
         massivekb_tokenizer=bool,
+        claim_channel=bool,
+        claim_fragment_tol_ppm=float,
         residues=dict,
         new_token_init=dict,
     )
@@ -133,6 +135,10 @@ class Config:
                             )
 
                         warnings.warn(warning_msg, DeprecationWarning)
+                # Claim-channel options default when absent, so config
+                # files predating the claim channel keep working.
+                self._user_config.setdefault("claim_channel", False)
+                self._user_config.setdefault("claim_fragment_tol_ppm", 20.0)
                 # Check for missing entries in config file.
                 config_missing = self._params.keys() - self._user_config.keys()
                 if len(config_missing) > 0:

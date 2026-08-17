@@ -12,15 +12,20 @@ import lightning.pytorch as pl
 import numpy as np
 import torch
 import tqdm
+from depthcharge.constants import H2O
 from depthcharge.tokenizers import PeptideTokenizer
 
 from .. import config
 from ..data import ms_io, psm
-from ..data.db_utils import PROTON
+from ..data.db_utils import ISOTOPE_SPACING, PROTON
 from ..denovo.transformers import PeptideDecoder, SpectrumEncoder
 from . import evaluate
 
 logger = logging.getLogger("casanovo")
+
+# Neutral losses for claim-channel fragment matching (monoisotopic).
+CO = 27.99491461957
+NH3 = 17.02654910101
 
 
 class Spec2Pep(pl.LightningModule):
@@ -107,6 +112,8 @@ class Spec2Pep(pl.LightningModule):
         out_writer: Optional[ms_io.MztabWriter] = None,
         calculate_precision: bool = False,
         tokenizer: PeptideTokenizer | None = None,
+        claim_channel: bool = False,
+        claim_fragment_tol_ppm: float = 20.0,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -115,12 +122,15 @@ class Spec2Pep(pl.LightningModule):
         self.tokenizer = tokenizer or PeptideTokenizer()
         self.vocab_size = len(self.tokenizer) + 1
         # Build the model.
+        self.claim_channel = claim_channel
+        self.claim_fragment_tol_ppm = claim_fragment_tol_ppm
         self.encoder = SpectrumEncoder(
             d_model=dim_model,
             n_head=n_head,
             dim_feedforward=dim_feedforward,
             n_layers=n_layers,
             dropout=dropout,
+            claim_channel=claim_channel,
         )
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
@@ -160,8 +170,18 @@ class Spec2Pep(pl.LightningModule):
         # along in `kwargs` from a loaded checkpoint's saved hyper_parameters (e.g.
         # stock Casanovo v5.2 bakes `precursor_mass_tol` / `isotope_error_range`
         # into its hparams); forwarding those to Adam raises a TypeError.
-        _adam_keys = {"lr", "betas", "eps", "weight_decay", "amsgrad",
-                      "foreach", "maximize", "capturable", "differentiable", "fused"}
+        _adam_keys = {
+            "lr",
+            "betas",
+            "eps",
+            "weight_decay",
+            "amsgrad",
+            "foreach",
+            "maximize",
+            "capturable",
+            "differentiable",
+            "fused",
+        }
         self.opt_kwargs = {k: v for k, v in kwargs.items() if k in _adam_keys}
 
         # Data properties.
@@ -213,6 +233,17 @@ class Spec2Pep(pl.LightningModule):
             persistent=False,
         )
 
+        # Token-mass tables for fragment matching (claim channel); filled by
+        # ``sync_tokenizer_attrs`` so they track tokenizer swaps.
+        self.register_buffer(
+            "token_masses", torch.zeros(self.vocab_size), persistent=False
+        )
+        self.register_buffer(
+            "is_residue",
+            torch.zeros(self.vocab_size, dtype=torch.bool),
+            persistent=False,
+        )
+
         self.sync_tokenizer_attrs()
 
     def sync_tokenizer_attrs(self) -> None:
@@ -229,11 +260,20 @@ class Spec2Pep(pl.LightningModule):
         the config tokenizer is swapped in.
         """
         self.is_chimeric = (
-            getattr(self.tokenizer, "chimeric_separator_token", None) is not None
+            getattr(self.tokenizer, "chimeric_separator_token", None)
+            is not None
         )
         self.chimeric_separator_idx = (
             self.stop_token if self.is_chimeric else None
         )
+
+        masses = torch.zeros(len(self.tokenizer) + 1)
+        residue = torch.zeros(len(self.tokenizer) + 1, dtype=torch.bool)
+        for aa, mass in self.tokenizer.residues.items():
+            masses[self.tokenizer.index[aa]] = mass
+            residue[self.tokenizer.index[aa]] = True
+        self.token_masses = masses.to(self.token_masses.device)
+        self.is_residue = residue.to(self.is_residue.device)
 
     @property
     def device(self) -> torch.device:
@@ -273,11 +313,52 @@ class Spec2Pep(pl.LightningModule):
         mzs, ints, precursors, _, _ = self._process_batch(batch)
         return self.beam_search_decode(mzs, ints, precursors)
 
+    def two_pass_decode(self, batch: Dict[str, torch.Tensor]) -> Tuple[
+        List[List[Tuple[float, np.ndarray, str]]],
+        List[List[Tuple[float, np.ndarray, str]]],
+    ]:
+        """
+        Two-pass claim decoding of a batch of MS/MS spectra.
+
+        Pass 1 decodes the first peptide from the clean spectrum. Its
+        fragment ions then flag the peaks it explains (the claims), and
+        pass 2 decodes the second peptide from the re-encoded, flagged
+        spectrum. Both passes are standard first-position beam searches,
+        so the two peptides' scores are directly comparable.
+
+        Returns
+        -------
+        first, second : List[List[Tuple[float, np.ndarray, str]]]
+            Per-spectrum predictions of pass 1 (clean encoding) and
+            pass 2 (claims from pass 1's top peptide).
+        """
+        mzs, ints, precursors, _, _ = self._process_batch(batch)
+        first = self.beam_search_decode(mzs, ints, precursors)
+
+        seqs = [preds[0][2] if preds else "" for preds in first]
+        nonempty = [i for i, s in enumerate(seqs) if s]
+        tokens = torch.zeros(
+            len(seqs), 1, dtype=torch.int64, device=mzs.device
+        )
+        if nonempty:
+            tok = self.tokenizer.tokenize([seqs[i] for i in nonempty]).to(
+                mzs.device
+            )
+            tokens = torch.zeros(
+                len(seqs), tok.shape[1], dtype=tok.dtype, device=mzs.device
+            )
+            tokens[nonempty] = tok
+        claims = self.compute_claims(tokens, mzs, precursors[:, 1])
+
+        second = self.beam_search_decode(mzs, ints, precursors, claims=claims)
+        return first, second
+
     def beam_search_decode(
         self,
         mzs: torch.Tensor,
         intensities: torch.Tensor,
         precursors: torch.Tensor,
+        claims: torch.Tensor | None = None,
     ) -> List[List[Tuple[float, np.ndarray, str]]]:
         """
         Beam search decoding of the spectrum predictions.
@@ -308,7 +389,7 @@ class Spec2Pep(pl.LightningModule):
             score, the amino acid scores, and the predicted peptide
             sequence.
         """
-        memories, mem_masks = self.encoder(mzs, intensities)
+        memories, mem_masks = self.encoder(mzs, intensities, claims=claims)
 
         # Get device from self for consistent placement
         device = self.device
@@ -867,9 +948,7 @@ class Spec2Pep(pl.LightningModule):
             ``True`` if the peptide has no N-terminal modification or exactly
             one placed at its N-terminus, ``False`` otherwise.
         """
-        is_nterm = torch.isin(
-            sub_tokens, self.nterm_idx.to(sub_tokens.device)
-        )
+        is_nterm = torch.isin(sub_tokens, self.nterm_idx.to(sub_tokens.device))
         if not bool(is_nterm.any()):
             return True
         nterm_pos = len(sub_tokens) - 1 if self.tokenizer.reverse else 0
@@ -985,6 +1064,167 @@ class Spec2Pep(pl.LightningModule):
         best = torch.minimum(loss_one, loss_two)
         return best.sum() / mask.sum()
 
+    def _first_segment(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Zero out everything after a sequence's first stop token.
+
+        With the stop-as-separator representation this extracts the first
+        peptide (stop included) of a chimeric sequence; a single-peptide
+        sequence is returned unchanged.
+        """
+        stops = (tokens == self.stop_token).cumsum(dim=1)
+        keep = (stops == 0) | ((tokens == self.stop_token) & (stops == 1))
+        return tokens * keep
+
+    @torch.no_grad()
+    def compute_claims(
+        self,
+        tokens: torch.Tensor,
+        mzs: torch.Tensor,
+        charges: torch.Tensor | None = None,
+        chunk_size: int = 32,
+    ) -> torch.Tensor:
+        """
+        Flag the peaks claimed (explained) by a peptide's fragment ions.
+
+        Candidate ions follow the lab's annotation convention
+        (lib/annotate_utils.py: spectrum_utils with ion types "aby",
+        common neutral losses, isotopes, ppm tolerance): b and y ions,
+        their H2O/NH3 neutral losses, a ions, isotopes 0-2, at fragment
+        charges 1 to min(2, max(1, precursor_charge - 1)). Immonium and
+        internal ions are excluded as they are not discriminative
+        between co-eluting peptides.
+
+        Parameters
+        ----------
+        tokens : torch.Tensor of shape (n_spectra, len)
+            One tokenized peptide per spectrum (tokenizer order; stop and
+            padding tokens are ignored).
+        mzs : torch.Tensor of shape (n_spectra, n_peaks)
+            The zero-padded peak m/z values of each spectrum.
+        charges : torch.Tensor of shape (n_spectra,), optional
+            Precursor charges, used to cap the fragment charge. If None,
+            fragment charges 1 and 2 are both considered.
+        chunk_size : int
+            Number of spectra matched at once, bounding the temporary
+            (chunk, n_peaks, n_candidates) distance tensor.
+
+        Returns
+        -------
+        torch.Tensor of shape (n_spectra, n_peaks), dtype bool
+            True for every peak within ``claim_fragment_tol_ppm`` of a
+            candidate ion of the corresponding peptide.
+        """
+        device = tokens.device
+        # Drop trailing all-padding columns (a first segment is much
+        # shorter than the full chimeric sequence width).
+        width = (tokens != 0).any(dim=0)
+        if width.any():
+            tokens = tokens[:, : int(width.nonzero().max()) + 1]
+        masses = self.token_masses.to(device)[tokens]
+        residue = self.is_residue.to(device)[tokens]
+        masses = masses * residue
+        prefix = torch.cumsum(masses, dim=1)
+        total = masses.sum(dim=1, keepdim=True)
+        # A cleavage site follows each residue except the last (the full
+        # peptide is the precursor, not a fragment). With a reverse
+        # tokenizer the stored prefix is the C-terminal (y) side.
+        n_res = residue.sum(dim=1, keepdim=True)
+        site = residue & (residue.cumsum(dim=1) < n_res)
+        y_sum, b_sum = (
+            (prefix, total - prefix)
+            if self.tokenizer.reverse
+            else (total - prefix, prefix)
+        )
+
+        # Neutral fragment masses: b, a, b-H2O, b-NH3, y, y-H2O, y-NH3.
+        neutral = [b_sum, b_sum - CO, b_sum - H2O, b_sum - NH3]
+        neutral += [y_sum + H2O, y_sum, y_sum + H2O - NH3]
+        neutral = torch.cat(neutral, dim=1)  # (B, 7L)
+        site7 = site.repeat(1, 7)
+
+        frags, valid = [], []
+        max_z2 = (
+            charges.to(device) >= 3
+            if charges is not None
+            else torch.ones(tokens.shape[0], dtype=torch.bool, device=device)
+        )
+        for z in (1, 2):
+            z_ok = site7 if z == 1 else site7 & max_z2[:, None]
+            for iso in (0, 1, 2):
+                frags.append(
+                    (neutral + z * PROTON + iso * ISOTOPE_SPACING) / z
+                )
+                valid.append(z_ok)
+        frag = torch.cat(frags, dim=1)  # (B, 42L)
+        valid = torch.cat(valid, dim=1)
+
+        tol = self.claim_fragment_tol_ppm * 1e-6
+        flags = torch.zeros_like(mzs, dtype=torch.bool)
+        for lo in range(0, mzs.shape[0], chunk_size):
+            hi = lo + chunk_size
+            diff = (mzs[lo:hi, :, None] - frag[lo:hi, None, :]).abs()
+            hit = (diff <= frag[lo:hi, None, :] * tol) & valid[lo:hi, None, :]
+            flags[lo:hi] = hit.any(dim=2)
+        return flags & (mzs > 0)
+
+    def _calc_claim_loss(
+        self, batch: Dict[str, torch.Tensor], loss_fun: torch.nn.Module
+    ) -> torch.Tensor:
+        """
+        Compute the two-pass permutation-invariant claim-channel loss.
+
+        Every peptide is supervised at first position: the first peptide
+        on the clean encoding, the second on the encoding whose peaks are
+        flagged with the ground-truth first peptide's claims (matching
+        the two-pass decode). For a chimeric spectrum both orderings are
+        evaluated and the cheaper one is selected per spectrum; a
+        single-peptide spectrum contributes its standard cross-entropy on
+        the clean encoding only. Token-weighted mean, as in
+        ``_calc_chimeric_loss``.
+        """
+        mzs, ints, precursors, seqs, seqs_comp = self._process_batch(batch)
+        p_tok = self._first_segment(seqs)
+        q_tok = (
+            self._first_segment(seqs_comp) if seqs_comp is not None else p_tok
+        )
+
+        memories, mem_masks = self.encoder(mzs, ints)
+
+        def _seg_loss(tok, memory, mem_mask, prec):
+            pred = self.decoder(
+                tokens=tok,
+                memory=memory,
+                memory_key_padding_mask=mem_mask,
+                precursors=prec,
+            )[:, :-1, :].reshape(-1, self.vocab_size)
+            mask = (tok != 0).float()
+            loss = loss_fun(pred, tok.flatten()).reshape(tok.shape) * mask
+            return loss.sum(dim=1), mask.sum(dim=1)
+
+        loss_p, n_p = _seg_loss(p_tok, memories, mem_masks, precursors)
+        chim = (seqs == self.stop_token).sum(dim=1) > 1
+        if not chim.any():
+            return loss_p.sum() / n_p.sum()
+
+        p_c, q_c = p_tok[chim], q_tok[chim]
+        mzs_c, ints_c = mzs[chim], ints[chim]
+        prec_c = precursors[chim]
+        loss_q, n_q = _seg_loss(q_c, memories[chim], mem_masks[chim], prec_c)
+        z_c = prec_c[:, 1]
+        mem_p, mask_p = self.encoder(
+            mzs_c, ints_c, claims=self.compute_claims(p_c, mzs_c, z_c)
+        )
+        mem_q, mask_q = self.encoder(
+            mzs_c, ints_c, claims=self.compute_claims(q_c, mzs_c, z_c)
+        )
+        loss_qp, _ = _seg_loss(q_c, mem_p, mask_p, prec_c)
+        loss_pq, _ = _seg_loss(p_c, mem_q, mask_q, prec_c)
+
+        best = torch.minimum(loss_p[chim] + loss_qp, loss_q + loss_pq)
+        total = loss_p[~chim].sum() + best.sum()
+        return total / (n_p.sum() + n_q.sum())
+
     def _forward_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1063,17 +1303,20 @@ class Spec2Pep(pl.LightningModule):
         torch.Tensor
             The loss of the training step.
         """
-        pred, truth, pred_comp, truth_comp = self._forward_step(batch)
-        loss = self._calc_chimeric_loss(
-            self.celoss, pred, truth, pred_comp, truth_comp
-        )
+        if self.claim_channel:
+            loss = self._calc_claim_loss(batch, self.celoss)
+        else:
+            pred, truth, pred_comp, truth_comp = self._forward_step(batch)
+            loss = self._calc_chimeric_loss(
+                self.celoss, pred, truth, pred_comp, truth_comp
+            )
         self.log(
             "train_CELoss",
             loss.detach(),
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=truth.shape[0],
+            batch_size=batch["mz_array"].shape[0],
         )
         return loss
 
@@ -1107,12 +1350,15 @@ class Spec2Pep(pl.LightningModule):
         torch.Tensor
             The loss of the validation step.
         """
-        pred, truth, pred_comp, truth_comp = self._forward_step(batch)
-        loss = self._calc_chimeric_loss(
-            self.val_celoss, pred, truth, pred_comp, truth_comp
-        )
+        if self.claim_channel:
+            loss = self._calc_claim_loss(batch, self.val_celoss)
+        else:
+            pred, truth, pred_comp, truth_comp = self._forward_step(batch)
+            loss = self._calc_chimeric_loss(
+                self.val_celoss, pred, truth, pred_comp, truth_comp
+            )
 
-        batch_size = truth.shape[0]
+        batch_size = batch["mz_array"].shape[0]
         log_kwargs = dict(
             add_dataloader_idx=False,
             on_step=False,

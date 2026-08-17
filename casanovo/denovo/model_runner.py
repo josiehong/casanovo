@@ -493,6 +493,8 @@ class ModelRunner:
             calculate_precision=self.config.calculate_precision,
             out_writer=self.writer,
             tokenizer=tokenizer,
+            claim_channel=self.config.claim_channel,
+            claim_fragment_tol_ppm=self.config.claim_fragment_tol_ppm,
         )
 
         # Reconfigurable non-architecture related parameters for a
@@ -510,6 +512,8 @@ class ModelRunner:
             train_label_smoothing=self.config.train_label_smoothing,
             calculate_precision=self.config.calculate_precision,
             out_writer=self.writer,
+            claim_channel=self.config.claim_channel,
+            claim_fragment_tol_ppm=self.config.claim_fragment_tol_ppm,
         )
 
         if self.model_filename is None:
@@ -538,11 +542,16 @@ class ModelRunner:
         # otherwise use the provided configuration.
         device = torch.empty(1).device  # Use the default device.
         model_clss = DbSpec2Pep if db_search else Spec2Pep
+        # With the claim channel enabled the checkpoint may predate the
+        # channel; non-strict loading leaves the (zero-initialized) claim
+        # parameters at their init, which is the intended warm start.
+        strict = not self.config.claim_channel
         try:
             self.model = model_clss.load_from_checkpoint(
                 self.model_filename,
                 map_location=device,
                 weights_only=False,
+                strict=strict,
                 **loaded_model_params,
             )
             # Use tokenizer initialized from config file instead of loaded
@@ -577,6 +586,7 @@ class ModelRunner:
                     self.model_filename,
                     map_location=device,
                     weights_only=False,
+                    strict=strict,
                     **model_params,
                 )
                 ckpt_tokenizer = self.model.hparams.get("tokenizer")

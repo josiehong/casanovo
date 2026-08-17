@@ -137,6 +137,12 @@ class SpectrumEncoder(SpectrumTransformerEncoder):
         The function to encode the (m/z, intensity) tuples of each mass
         spectrum. `True` uses the default sinusoidal encoding and `False`
         instead performs a 1 to `d_model` learned linear projection.
+    claim_channel : bool, optional
+        Add a per-peak claim-flag input channel: a learned vector added to
+        the embedding of every peak flagged as claimed (i.e. matched by a
+        previously decoded peptide's fragment ions). Zero-initialized, so
+        at initialization the encoder is identical to one without the
+        channel and a claim-less checkpoint can be warm-started.
     """
 
     def __init__(
@@ -147,6 +153,7 @@ class SpectrumEncoder(SpectrumTransformerEncoder):
         n_layers: int = 1,
         dropout: float = 0,
         peak_encoder: PeakEncoder | Callable | bool = True,
+        claim_channel: bool = False,
     ):
         """Initialize a SpectrumEncoder."""
         super().__init__(
@@ -154,6 +161,53 @@ class SpectrumEncoder(SpectrumTransformerEncoder):
         )
 
         self.latent_spectrum = torch.nn.Parameter(torch.randn(1, 1, d_model))
+        if claim_channel:
+            self.claim_vec = torch.nn.Parameter(torch.zeros(d_model))
+
+    def forward(
+        self,
+        mz_array: torch.Tensor,
+        intensity_array: torch.Tensor,
+        *args: torch.Tensor,
+        claims: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        **kwargs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Embed a batch of mass spectra, optionally with peak-claim flags.
+
+        Identical to ``SpectrumTransformerEncoder.forward`` except that
+        ``claims`` (bool tensor of shape (n_spectra, n_peaks), or None)
+        adds ``claim_vec`` to the embedding of every flagged peak.
+        """
+        spectra = torch.stack([mz_array, intensity_array], dim=2)
+
+        src_key_padding_mask = spectra.sum(dim=2) == 0
+        global_token_mask = torch.tensor([[False]] * spectra.shape[0]).type_as(
+            src_key_padding_mask
+        )
+        src_key_padding_mask = torch.cat(
+            [global_token_mask, src_key_padding_mask], dim=1
+        )
+
+        peaks = self.peak_encoder(spectra)
+        if claims is not None:
+            peaks = peaks + claims.to(peaks.dtype)[:, :, None] * self.claim_vec
+
+        latent_spectra = self.global_token_hook(
+            *args,
+            mz_array=mz_array,
+            intensity_array=intensity_array,
+            **kwargs,
+        )
+
+        peaks = torch.cat([latent_spectra[:, None, :], peaks], dim=1)
+        out = self.transformer_encoder(
+            peaks,
+            mask=mask,
+            src_key_padding_mask=src_key_padding_mask,
+        )
+        return out, src_key_padding_mask
 
     def global_token_hook(
         self,

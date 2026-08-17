@@ -198,6 +198,7 @@ class ModelRunner:
             self.model,
             self.loaders.train_dataloader(),
             self.loaders.val_dataloader(),
+            ckpt_path=self.model_filename,
         )
 
     def log_metrics(self, test_dataloader: DataLoader) -> None:

@@ -25,7 +25,6 @@ from ..denovo.dataloaders import DeNovoDataModule
 from ..denovo.evaluate import aa_match_batch, aa_match_metrics
 from ..denovo.model import DbSpec2Pep, Spec2Pep
 
-
 logger = logging.getLogger("casanovo")
 
 
@@ -458,6 +457,8 @@ class ModelRunner:
             cosine_schedule_period_iters=self.config.cosine_schedule_period_iters,
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
+            muon_lr=self.config.muon_lr,
+            muon_momentum=self.config.muon_momentum,
             train_label_smoothing=self.config.train_label_smoothing,
             calculate_precision=self.config.calculate_precision,
             out_writer=self.writer,
@@ -478,6 +479,8 @@ class ModelRunner:
             cosine_schedule_period_iters=self.config.cosine_schedule_period_iters,
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
+            muon_lr=self.config.muon_lr,
+            muon_momentum=self.config.muon_momentum,
             train_label_smoothing=self.config.train_label_smoothing,
             calculate_precision=self.config.calculate_precision,
             out_writer=self.writer,

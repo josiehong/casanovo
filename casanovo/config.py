@@ -10,7 +10,6 @@ import yaml
 
 from . import utils
 
-
 logger = logging.getLogger("casanovo")
 
 
@@ -89,6 +88,8 @@ class Config:
         cosine_schedule_period_iters=int,
         learning_rate=float,
         weight_decay=float,
+        muon_lr=float,
+        muon_momentum=float,
         train_label_smoothing=float,
         train_batch_size=int,
         max_epochs=int,

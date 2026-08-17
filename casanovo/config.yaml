@@ -127,10 +127,16 @@ dim_intensity:
 warmup_iters: 100_000
 # The number of iterations for the cosine half period of the learning rate.
 cosine_schedule_period_iters: 600_000
-# Learning rate for weight updates during training.
+# Learning rate for the auxiliary AdamW parameter group (embeddings, output
+# head, biases, and normalization parameters).
 learning_rate: 5e-4
-# Regularization term for weight updates.
+# Regularization term for weight updates (both parameter groups).
 weight_decay: 1e-5
+# Learning rate for the Muon parameter group (hidden weight matrices). Muon
+# updates have unit RMS, so this is on a different scale than learning_rate.
+muon_lr: 0.02
+# Momentum for the Muon parameter group.
+muon_momentum: 0.95
 # Amount of label smoothing when computing the training loss.
 train_label_smoothing: 0.01
 

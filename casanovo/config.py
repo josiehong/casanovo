@@ -10,7 +10,6 @@ import yaml
 
 from . import utils
 
-
 logger = logging.getLogger("casanovo")
 
 
@@ -25,6 +24,12 @@ _config_deprecated = dict(
     model_save_folder_path=None,
     reverse_peptides=None,
 )
+
+# Options added after existing config files were written. They default from
+# the packaged config.yaml when a user config omits them, so adding an option
+# does not invalidate every config in the wild (casanovo otherwise requires a
+# user config to list every key).
+_config_optional = frozenset({"muon_lr", "muon_momentum"})
 
 
 class Config:
@@ -89,6 +94,8 @@ class Config:
         cosine_schedule_period_iters=int,
         learning_rate=float,
         weight_decay=float,
+        muon_lr=float,
+        muon_momentum=float,
         train_label_smoothing=float,
         train_batch_size=int,
         max_epochs=int,
@@ -134,7 +141,11 @@ class Config:
 
                         warnings.warn(warning_msg, DeprecationWarning)
                 # Check for missing entries in config file.
-                config_missing = self._params.keys() - self._user_config.keys()
+                config_missing = (
+                    self._params.keys()
+                    - self._user_config.keys()
+                    - _config_optional
+                )
                 if len(config_missing) > 0:
                     raise KeyError(
                         "Missing expected config option(s): "

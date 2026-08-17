@@ -1086,13 +1086,23 @@ class Spec2Pep(pl.LightningModule):
             split_idx = torch.where(split_mask)[0]
             split_idx[-1] += 1
 
+            is_chimeric = bool((peptide == separator_int).any())
             for curr_start_idx, curr_end_idx in zip(
                 split_idx[:-1], split_idx[1:]
             ):
                 next_aa_scores = aa_scores[curr_start_idx:curr_end_idx]
                 next_peptide = peptide[curr_start_idx:curr_end_idx]
-                if next_peptide[0] == separator_int:
+                is_pep2 = bool(next_peptide[0] == separator_int)
+                is_pep1 = is_chimeric and not is_pep2
+                if is_pep2:
+                    # Strip the leading separator from both tokens and scores;
+                    # pep2's own terminator (STOP) is already accounted for.
+                    next_aa_scores = next_aa_scores[1:]
                     next_peptide = next_peptide[1:]
+                elif is_pep1:
+                    # Include the trailing separator's score as pep1's
+                    # terminator, mirroring the non-chimeric stop token handling.
+                    next_aa_scores = aa_scores[curr_start_idx : curr_end_idx + 1]
 
                 estimated_charge, calc_mz = _estimate_charge_state(
                     next_peptide,
@@ -1102,8 +1112,12 @@ class Spec2Pep(pl.LightningModule):
                 )
                 next_aa_scores, next_pep_score = _aa_pep_score(
                     next_aa_scores,
-                    True # Don't penalize precursor mass 
+                    True # Don't penalize precursor mass
                 )
+                if is_pep1:
+                    # Strip the separator score from the reported aa-level
+                    # scores, mirroring stop token stripping.
+                    next_aa_scores = next_aa_scores[:-1]
                 next_peptide = self.tokenizer.detokenize(
                     next_peptide.unsqueeze(0)
                 )[0]

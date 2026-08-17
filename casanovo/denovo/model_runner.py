@@ -193,10 +193,25 @@ class ModelRunner:
         self.initialize_data_module(train_paths, valid_paths)
         self.loaders.setup()
 
+        # `--model` alone means transfer learning: the weights are loaded
+        # but training starts fresh, with a new optimizer and the schedule
+        # at step 0. `resume_training: true` instead continues the run the
+        # checkpoint came from, restoring optimizer and scheduler state and
+        # the step count, so the cosine schedule picks up mid-decay.
+        resume_from = None
+        if self.config.resume_training:
+            if self.model_filename is None:
+                raise ValueError(
+                    "resume_training is set but no model file was given; "
+                    "pass the checkpoint to continue from with --model"
+                )
+            resume_from = self.model_filename
+            logger.info("Resuming training from %s", resume_from)
         self.trainer.fit(
             self.model,
             self.loaders.train_dataloader(),
             self.loaders.val_dataloader(),
+            ckpt_path=resume_from,
         )
 
     def log_metrics(self, test_dataloader: DataLoader) -> None:

@@ -29,7 +29,7 @@ _config_deprecated = dict(
 # the packaged config.yaml when a user config omits them, so adding an option
 # does not invalidate every config in the wild (casanovo otherwise requires a
 # user config to list every key).
-_config_optional = frozenset({"muon_lr", "muon_momentum"})
+_config_optional = frozenset({"muon_lr", "muon_momentum", "resume_training"})
 
 
 class Config:
@@ -99,6 +99,7 @@ class Config:
         train_label_smoothing=float,
         train_batch_size=int,
         max_epochs=int,
+        resume_training=bool,
         shuffle=bool,
         shuffle_buffer_size=int,
         num_sanity_val_steps=int,

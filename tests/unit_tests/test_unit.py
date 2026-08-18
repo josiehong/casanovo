@@ -1892,6 +1892,78 @@ def test_pmc_decode():
     assert model._pmc_decode(logits, 5_000.0) is None
 
 
+def _pmc_model():
+    """A small model with the MassIVE-KB tokenizer for PMC tests."""
+    # from_massivekb carries the modification tokens, including the
+    # N-terminal ones; MskbPeptideTokenizer alone is canonical-only.
+    tokenizer = depthcharge.tokenizers.PeptideTokenizer.from_massivekb(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    return Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=1,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    )
+
+
+def test_pmc_decode_nterm_mod():
+    """N-terminal modifications decode only at the N-terminus."""
+    model = _pmc_model()
+    idx = model.tokenizer.index
+    aa_g, aa_k = idx["G"], idx["K"]
+    nterm = next(
+        i for i in model.nterm_idx.tolist() if model.token_masses[i].item() > 0
+    )
+
+    # The tokenizer is reversed, so frames run C-terminus first and the
+    # modification belongs at the last frame.
+    logits = torch.full((3, model.vocab_size), -10.0)
+    logits[0, aa_k] = 5.0
+    logits[1, aa_g] = 5.0
+    logits[2, nterm] = 5.0
+    masses = model.token_masses
+    precursor_mass = (
+        masses[aa_k] + masses[aa_g] + masses[nterm]
+    ).item() + 18.010565
+
+    tokens, confs = model._pmc_decode(logits, precursor_mass)
+    assert tokens == [aa_k, aa_g, nterm]
+    assert len(confs) == len(tokens)
+    assert model._fits_precursor_mass(tokens, precursor_mass)
+
+    # The same evidence with the modification at the C-terminal end
+    # describes an invalid peptide, so no path is returned.
+    assert model._pmc_decode(logits.flip(0), precursor_mass) is None
+
+
+def test_pmc_decode_coarse_resolution(monkeypatch):
+    """A precursor too heavy for the fine mass grid still decodes."""
+    model = _pmc_model()
+    idx = model.tokenizer.index
+    aa_k, aa_g, aa_a, aa_e = idx["K"], idx["G"], idx["A"], idx["E"]
+
+    logits = torch.full((4, model.vocab_size), -10.0)
+    logits[0, aa_k] = 5.0
+    logits[1, aa_g] = 5.0
+    logits[1, aa_a] = 4.9
+    logits[2, aa_e] = 5.0
+    logits[3, model.blank_token] = 5.0
+    masses = model.token_masses
+    precursor_mass = (
+        masses[aa_k] + masses[aa_a] + masses[aa_e]
+    ).item() + 18.010565
+
+    # A budget this small cannot hold the 0.01 Da grid; decoding should
+    # coarsen the grid instead of giving up on mass control.
+    monkeypatch.setattr(denovo.model, "PMC_MAX_POINTER_BYTES", 50_000)
+    tokens, _ = model._pmc_decode(logits, precursor_mass)
+    assert tokens == [aa_k, aa_a, aa_e]
+    assert model._fits_precursor_mass(tokens, precursor_mass)
+
+
 def test_run_map(mgf_small):
     out_writer = ms_io.MztabWriter("dummy.mztab")
     # Set peak file by base file name only.

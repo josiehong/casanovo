@@ -598,11 +598,16 @@ class Spec2Pep(pl.LightningModule):
         the last symbol is needed to apply the CTC collapse rules
         (a repeated symbol without an intervening blank does not emit).
 
-        Stop, padding, N-terminal modification, and non-positive-mass
-        tokens are excluded from the search. As an approximation for
-        speed, a token may only be emitted at frames where its
+        Stop, padding, and non-positive-mass tokens are excluded from
+        the search; N-terminal modifications of positive mass may only
+        be emitted as the peptide's first residue. As an approximation
+        for speed, a token may only be emitted at frames where its
         probability exceeds ``PMC_MIN_EMIT_PROB``; frames without any
         such token reduce to a blank-only update.
+
+        The mass grid is discretized at ``PMC_RESOLUTION``, coarsened
+        for heavy precursors so that the backtracking table stays under
+        ``PMC_MAX_POINTER_BYTES``.
 
         Parameters
         ----------
@@ -620,36 +625,61 @@ class Spec2Pep(pl.LightningModule):
         """
         device = logits.device
         n_frames, vocab = logits.shape
-        windows = self._residue_mass_windows(
-            precursor_mass, guard=PMC_MASS_GUARD
-        )
-        hi_max = max(hi for _, hi in windows)
-        if hi_max <= 0:
-            return None
-        n_bins = int(hi_max / PMC_RESOLUTION) + 2
-        if n_frames * n_bins * vocab > PMC_MAX_POINTER_BYTES:
-            if not self._pmc_size_warned:
-                self._pmc_size_warned = True
-                logger.warning(
-                    "Skipping precise mass control decoding for large "
-                    "precursor masses; the DP table would exceed %d bytes.",
-                    PMC_MAX_POINTER_BYTES,
-                )
-            return None
+        # A reversed tokenizer emits the peptide C-terminus first, which
+        # would put an N-terminal modification last. Decoding the frames
+        # back to front puts it first in either case, so the "N-terminal
+        # tokens open the peptide" rule below is the only one needed;
+        # the emitted tokens are flipped back before returning.
+        if self.tokenizer.reverse:
+            logits = logits.flip(0)
 
-        # Emittable tokens and their discretized masses.
-        excluded = {
-            0,
-            self.blank_token,
-            self.stop_token,
-            *self.nterm_idx.tolist(),
-        }
-        emit_tokens, emit_deltas = [], []
+        # Mass discretization. The pointer table is the memory
+        # bottleneck, so pick the finest resolution whose table fits in
+        # PMC_MAX_POINTER_BYTES rather than giving up on mass control
+        # for heavy precursors. A coarser grid only widens the candidate
+        # set: the exact, non-discretized mass is verified before a path
+        # is accepted. The readout guard absorbs accumulated rounding
+        # error, which grows with the resolution and with the number of
+        # emissions, and reduces to PMC_MASS_GUARD at the default.
+        base = self._residue_mass_windows(precursor_mass, PMC_MASS_GUARD)
+        hi_base = max(hi for _, hi in base)
+        if hi_base <= 0:
+            return None
+        max_bins = max(4, PMC_MAX_POINTER_BYTES // (n_frames * vocab))
+        resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
+        guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
+        windows = self._residue_mass_windows(precursor_mass, guard)
+        hi_max = max(hi for _, hi in windows)
+        n_bins = int(hi_max / resolution) + 2
+        if n_bins > max_bins:
+            # The widened guard pushed the table back over budget.
+            resolution = hi_max / (max_bins - 2)
+            n_bins = int(hi_max / resolution) + 2
+        if resolution > PMC_RESOLUTION and not self._pmc_size_warned:
+            self._pmc_size_warned = True
+            logger.warning(
+                "Coarsening precise mass control decoding to %.4f Da for "
+                "large precursor masses to keep the DP table under %d "
+                "bytes.",
+                resolution,
+                PMC_MAX_POINTER_BYTES,
+            )
+
+        # Emittable tokens and their discretized masses. Padding, the
+        # blank, and the stop token do not emit; negative-mass tokens
+        # (e.g. the ammonia-loss N-terminal modification) cannot be
+        # placed on a mass axis that only increases, so they stay out of
+        # the search. N-terminal modifications with positive mass are
+        # emittable, but only as the first residue (see `nterm_only`).
+        excluded = {0, self.blank_token, self.stop_token}
+        nterm = set(self.nterm_idx.tolist())
+        emit_tokens, emit_deltas, emit_nterm = [], [], []
         for c in range(min(vocab, self.token_masses.shape[0])):
             mass = self.token_masses[c].item()
             if c not in excluded and 0 < mass <= hi_max:
                 emit_tokens.append(c)
-                emit_deltas.append(round(mass / PMC_RESOLUTION))
+                emit_deltas.append(round(mass / resolution))
+                emit_nterm.append(c in nterm)
         if not emit_tokens:
             return None
         deltas = dict(zip(emit_tokens, emit_deltas))
@@ -662,6 +692,12 @@ class Spec2Pep(pl.LightningModule):
         bins = torch.arange(n_bins, device=device)
         src_bins = (bins.unsqueeze(0) - delta_idx.unsqueeze(1)).clamp(min=0)
         valid = bins.unsqueeze(0) >= delta_idx.unsqueeze(1)
+        # An N-terminal modification may only open the peptide. Every
+        # emittable token has positive mass, so "nothing emitted yet" is
+        # exactly mass bin 0, and requiring the source bin to be 0 means
+        # requiring the target bin to be the token's own mass.
+        nterm_only = torch.tensor(emit_nterm, device=device).unsqueeze(1)
+        valid &= ~nterm_only | (bins.unsqueeze(0) == delta_idx.unsqueeze(1))
 
         log_probs = logits.log_softmax(-1)
         neg_inf = float("-inf")
@@ -736,7 +772,7 @@ class Spec2Pep(pl.LightningModule):
             pointers[t] = new_ptr
 
         # Read out the best final state within any mass window.
-        mass_axis = torch.arange(n_bins, device=device) * PMC_RESOLUTION
+        mass_axis = torch.arange(n_bins, device=device) * resolution
         allowed = torch.zeros(n_bins, dtype=torch.bool, device=device)
         for lo, hi in windows:
             allowed |= (mass_axis >= lo) & (mass_axis <= hi)
@@ -766,6 +802,11 @@ class Spec2Pep(pl.LightningModule):
 
         tokens = [c for c, _ in reversed(emissions)]
         confs = [s for _, s in reversed(emissions)]
+        if self.tokenizer.reverse:
+            # Undo the frame flip so the caller still receives the
+            # tokens in the tokenizer's own order.
+            tokens.reverse()
+            confs.reverse()
         # Verify the exact (non-discretized) mass before accepting.
         if not tokens or not self._fits_precursor_mass(tokens, precursor_mass):
             return None

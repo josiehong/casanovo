@@ -495,6 +495,7 @@ class ModelRunner:
             tokenizer=tokenizer,
             claim_channel=self.config.claim_channel,
             claim_fragment_tol_ppm=self.config.claim_fragment_tol_ppm,
+            claim_abstain_frac=self.config.claim_abstain_frac,
         )
 
         # Reconfigurable non-architecture related parameters for a
@@ -514,6 +515,7 @@ class ModelRunner:
             out_writer=self.writer,
             claim_channel=self.config.claim_channel,
             claim_fragment_tol_ppm=self.config.claim_fragment_tol_ppm,
+            claim_abstain_frac=self.config.claim_abstain_frac,
         )
 
         if self.model_filename is None:

@@ -103,6 +103,7 @@ class Config:
         massivekb_tokenizer=bool,
         claim_channel=bool,
         claim_fragment_tol_ppm=float,
+        claim_abstain_frac=float,
         residues=dict,
         new_token_init=dict,
     )
@@ -139,6 +140,7 @@ class Config:
                 # files predating the claim channel keep working.
                 self._user_config.setdefault("claim_channel", False)
                 self._user_config.setdefault("claim_fragment_tol_ppm", 20.0)
+                self._user_config.setdefault("claim_abstain_frac", 0.25)
                 # Check for missing entries in config file.
                 config_missing = self._params.keys() - self._user_config.keys()
                 if len(config_missing) > 0:

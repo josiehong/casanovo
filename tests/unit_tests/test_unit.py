@@ -3478,3 +3478,72 @@ def test_claim_loss_and_two_pass_decode(tiny_config):
     with torch.no_grad():
         first, second = model.two_pass_decode(batch)
     assert len(first) == len(second) == 2
+
+
+def test_claim_abstention_loss(tiny_config):
+    """Singles train the flagged pass toward an immediate stop."""
+    from depthcharge.constants import H2O
+
+    from casanovo.data.db_utils import PROTON
+
+    def batch_for(model, seqs):
+        res = model.tokenizer.residues
+        mzs = torch.rand(len(seqs), 12) * 1000 + 100
+        mzs[0, 0] = res["P"] + res["E"] + PROTON
+        mzs[0, 1] = res["K"] + H2O + PROTON
+        return {
+            "mz_array": mzs,
+            "intensity_array": torch.rand(len(seqs), 12),
+            "precursor_mz": torch.tensor([500.9] * len(seqs)),
+            "precursor_charge": torch.tensor([2] * len(seqs)),
+            "seq": model.tokenizer.tokenize(seqs, add_stop=True),
+            "seq_compliment": model.tokenizer.tokenize(
+                model.tokenizer.compliment(seqs), add_stop=True
+            ),
+        }
+
+    # Singles-only batch, abstention on: the flagged pass now runs, so
+    # the claim vector receives gradient where it previously got none.
+    torch.manual_seed(0)
+    model = _chimera_model(
+        tiny_config, claim_channel=True, claim_abstain_frac=1.0
+    )
+    loss = model._calc_claim_loss(
+        batch_for(model, ["PEPTANEK", "PEPKAAR"]), model.val_celoss
+    )
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert model.encoder.claim_vec.grad.abs().sum() > 0
+
+    # Abstention off: singles reduce to the clean-encoding loss alone,
+    # and no gradient reaches the claim vector.
+    torch.manual_seed(0)
+    model0 = _chimera_model(
+        tiny_config, claim_channel=True, claim_abstain_frac=0.0
+    )
+    batch = batch_for(model0, ["PEPTANEK", "PEPKAAR"])
+    loss0 = model0._calc_claim_loss(batch, model0.val_celoss)
+    loss0.backward()
+    assert model0.encoder.claim_vec.grad is None  # never used
+
+    # frac=0 matches the plain token-mean CE on the first segments.
+    tok = model0._first_segment(batch["seq"])
+    pred = model0.decoder(
+        tokens=tok,
+        memory=model0.encoder(batch["mz_array"], batch["intensity_array"])[0],
+        memory_key_padding_mask=model0.encoder(
+            batch["mz_array"], batch["intensity_array"]
+        )[1],
+        precursors=torch.vstack(
+            [
+                (batch["precursor_mz"] - 1.007276) * batch["precursor_charge"],
+                batch["precursor_charge"],
+                batch["precursor_mz"],
+            ]
+        ).T,
+    )[:, :-1, :].reshape(-1, model0.vocab_size)
+    mask = (tok != 0).float()
+    manual = (
+        model0.val_celoss(pred, tok.flatten()).reshape(tok.shape) * mask
+    ).sum() / mask.sum()
+    assert loss0.item() == pytest.approx(manual.item(), abs=1e-6)

@@ -114,6 +114,7 @@ class Spec2Pep(pl.LightningModule):
         tokenizer: PeptideTokenizer | None = None,
         claim_channel: bool = False,
         claim_fragment_tol_ppm: float = 20.0,
+        claim_abstain_frac: float = 0.25,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -124,6 +125,7 @@ class Spec2Pep(pl.LightningModule):
         # Build the model.
         self.claim_channel = claim_channel
         self.claim_fragment_tol_ppm = claim_fragment_tol_ppm
+        self.claim_abstain_frac = claim_abstain_frac
         self.encoder = SpectrumEncoder(
             d_model=dim_model,
             n_head=n_head,
@@ -1178,10 +1180,13 @@ class Spec2Pep(pl.LightningModule):
         on the clean encoding, the second on the encoding whose peaks are
         flagged with the ground-truth first peptide's claims (matching
         the two-pass decode). For a chimeric spectrum both orderings are
-        evaluated and the cheaper one is selected per spectrum; a
+        evaluated and the cheaper one is selected per spectrum. A
         single-peptide spectrum contributes its standard cross-entropy on
-        the clean encoding only. Token-weighted mean, as in
-        ``_calc_chimeric_loss``.
+        the clean encoding, plus (for a random ``claim_abstain_frac`` of
+        singles per batch) an abstention term: on the encoding flagged
+        with the peptide's own claims, the correct second peptide is
+        empty, so the target is an immediate stop token. Token-weighted
+        mean, as in ``_calc_chimeric_loss``.
         """
         mzs, ints, precursors, seqs, seqs_comp = self._process_batch(batch)
         p_tok = self._first_segment(seqs)
@@ -1204,26 +1209,58 @@ class Spec2Pep(pl.LightningModule):
 
         loss_p, n_p = _seg_loss(p_tok, memories, mem_masks, precursors)
         chim = (seqs == self.stop_token).sum(dim=1) > 1
-        if not chim.any():
-            return loss_p.sum() / n_p.sum()
+        total = loss_p[~chim].sum()
+        n_tokens = n_p.sum()
 
-        p_c, q_c = p_tok[chim], q_tok[chim]
-        mzs_c, ints_c = mzs[chim], ints[chim]
-        prec_c = precursors[chim]
-        loss_q, n_q = _seg_loss(q_c, memories[chim], mem_masks[chim], prec_c)
-        z_c = prec_c[:, 1]
-        mem_p, mask_p = self.encoder(
-            mzs_c, ints_c, claims=self.compute_claims(p_c, mzs_c, z_c)
-        )
-        mem_q, mask_q = self.encoder(
-            mzs_c, ints_c, claims=self.compute_claims(q_c, mzs_c, z_c)
-        )
-        loss_qp, _ = _seg_loss(q_c, mem_p, mask_p, prec_c)
-        loss_pq, _ = _seg_loss(p_c, mem_q, mask_q, prec_c)
+        # Abstention on singles: all of the peptide's peaks are claimed,
+        # so the flagged pass should decode nothing (stop at position 0).
+        singles = ~chim
+        if self.claim_abstain_frac > 0 and singles.any():
+            pick = singles & (
+                torch.rand(seqs.shape[0], device=seqs.device)
+                < self.claim_abstain_frac
+            )
+            if pick.any():
+                claims_s = self.compute_claims(
+                    p_tok[pick], mzs[pick], precursors[pick][:, 1]
+                )
+                mem_s, mask_s = self.encoder(
+                    mzs[pick], ints[pick], claims=claims_s
+                )
+                stop_tok = torch.full(
+                    (int(pick.sum()), 1),
+                    self.stop_token,
+                    dtype=seqs.dtype,
+                    device=seqs.device,
+                )
+                loss_a, n_a = _seg_loss(
+                    stop_tok, mem_s, mask_s, precursors[pick]
+                )
+                total = total + loss_a.sum()
+                n_tokens = n_tokens + n_a.sum()
 
-        best = torch.minimum(loss_p[chim] + loss_qp, loss_q + loss_pq)
-        total = loss_p[~chim].sum() + best.sum()
-        return total / (n_p.sum() + n_q.sum())
+        if chim.any():
+            p_c, q_c = p_tok[chim], q_tok[chim]
+            mzs_c, ints_c = mzs[chim], ints[chim]
+            prec_c = precursors[chim]
+            loss_q, n_q = _seg_loss(
+                q_c, memories[chim], mem_masks[chim], prec_c
+            )
+            z_c = prec_c[:, 1]
+            mem_p, mask_p = self.encoder(
+                mzs_c, ints_c, claims=self.compute_claims(p_c, mzs_c, z_c)
+            )
+            mem_q, mask_q = self.encoder(
+                mzs_c, ints_c, claims=self.compute_claims(q_c, mzs_c, z_c)
+            )
+            loss_qp, _ = _seg_loss(q_c, mem_p, mask_p, prec_c)
+            loss_pq, _ = _seg_loss(p_c, mem_q, mask_q, prec_c)
+
+            best = torch.minimum(loss_p[chim] + loss_qp, loss_q + loss_pq)
+            total = total + best.sum()
+            n_tokens = n_tokens + n_q.sum()
+
+        return total / n_tokens
 
     def _forward_step(
         self,

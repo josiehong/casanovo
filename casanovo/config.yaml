@@ -180,6 +180,10 @@ massivekb_tokenizer: false
 claim_channel: false
 # Fragment-matching tolerance (ppm) for computing the claim flags.
 claim_fragment_tol_ppm: 20.0
+# Fraction of single-peptide spectra per batch given the abstention term:
+# on the encoding flagged with the peptide's own claims, the target is an
+# immediate stop (no second peptide left to decode).
+claim_abstain_frac: 0.25
 
 # AMINO ACID AND MODIFICATION VOCABULARY
 residues:

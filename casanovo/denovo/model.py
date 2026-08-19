@@ -671,8 +671,10 @@ class Spec2Pep(pl.LightningModule):
         zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
         n_bins = zero_bin + int(hi_max / resolution) + 2
         if n_bins > max_bins:
-            # The widened guard pushed the table back over budget.
-            resolution = hi_max / (max_bins - 2)
+            # The widened guard pushed the table back over budget. The
+            # offset bins have to come out of the budget too, so solve for
+            # the resolution with them already reserved.
+            resolution = hi_max / max(1, max_bins - zero_bin - 2)
             zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
             n_bins = zero_bin + int(hi_max / resolution) + 2
         if resolution > PMC_RESOLUTION and not self._pmc_size_warned:
@@ -736,6 +738,14 @@ class Spec2Pep(pl.LightningModule):
         # pointers[t, m, c]: last symbol of the predecessor state; a
         # pointer equal to c itself encodes a repeat (no new emission).
         # Kept on the model device; backtracking reads single entries.
+        # int8 holds the symbol index, so the alphabet has to fit in it:
+        # above 127 the cast would wrap and backtracking would follow the
+        # wrong symbols without any error.
+        if vocab > 127:
+            raise ValueError(
+                f"PMC decoding stores predecessors as int8, so it supports "
+                f"at most 127 tokens, but the vocabulary has {vocab}"
+            )
         pointers = torch.empty(
             (n_frames, n_bins, vocab), dtype=torch.int8, device=device
         )

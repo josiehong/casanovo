@@ -603,16 +603,21 @@ class Spec2Pep(pl.LightningModule):
         the last symbol is needed to apply the CTC collapse rules
         (a repeated symbol without an intervening blank does not emit).
 
-        Stop, padding, and non-positive-mass tokens are excluded from
-        the search; N-terminal modifications of positive mass may only
-        be emitted as the peptide's first residue. As an approximation
-        for speed, a token may only be emitted at frames where its
-        probability exceeds ``PMC_MIN_EMIT_PROB``; frames without any
-        such token reduce to a blank-only update.
+        Stop and padding are excluded from the search, as is any
+        non-terminal residue of zero or negative mass (it could repeat
+        without bound, which a fixed axis cannot hold). N-terminal
+        modifications may only be emitted as the peptide's first
+        residue, and that is also what bounds the axis below zero: only
+        they may carry a negative mass, so at most one such step is ever
+        taken. As an approximation for speed, a token may only be
+        emitted at frames where its probability exceeds
+        ``PMC_MIN_EMIT_PROB``; frames without any such token reduce to a
+        blank-only update.
 
         The mass grid is discretized at ``PMC_RESOLUTION``, coarsened
         for heavy precursors so that the backtracking table stays under
-        ``PMC_MAX_POINTER_BYTES``.
+        ``PMC_MAX_POINTER_BYTES``. Bin ``zero_bin`` holds zero mass, with
+        the bins below it reserved for the negative excursion.
 
         Parameters
         ----------
@@ -655,11 +660,21 @@ class Spec2Pep(pl.LightningModule):
         guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
         windows = self._residue_mass_windows(precursor_mass, guard)
         hi_max = max(hi for _, hi in windows)
-        n_bins = int(hi_max / resolution) + 2
+        # Negative-mass tokens (the ammonia-loss N-terminal modification)
+        # push the running total below zero, so the axis starts below it.
+        # Only N-terminal modifications may be negative and only one may be
+        # emitted, so one token's worth of headroom is enough.
+        neg_mass = min(
+            (self.token_masses[c].item() for c in self.nterm_idx.tolist()),
+            default=0.0,
+        )
+        zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
+        n_bins = zero_bin + int(hi_max / resolution) + 2
         if n_bins > max_bins:
             # The widened guard pushed the table back over budget.
             resolution = hi_max / (max_bins - 2)
-            n_bins = int(hi_max / resolution) + 2
+            zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
+            n_bins = zero_bin + int(hi_max / resolution) + 2
         if resolution > PMC_RESOLUTION and not self._pmc_size_warned:
             self._pmc_size_warned = True
             logger.warning(
@@ -671,20 +686,24 @@ class Spec2Pep(pl.LightningModule):
             )
 
         # Emittable tokens and their discretized masses. Padding, the
-        # blank, and the stop token do not emit; negative-mass tokens
-        # (e.g. the ammonia-loss N-terminal modification) cannot be
-        # placed on a mass axis that only increases, so they stay out of
-        # the search. N-terminal modifications with positive mass are
-        # emittable, but only as the first residue (see `nterm_only`).
+        # blank, and the stop token do not emit. N-terminal modifications
+        # are emittable but only as the first residue (see `nterm_only`),
+        # which is also what bounds the negative headroom: a negative mass
+        # is allowed only for those, so at most one can be emitted.
         excluded = {0, self.blank_token, self.stop_token}
         nterm = set(self.nterm_idx.tolist())
         emit_tokens, emit_deltas, emit_nterm = [], [], []
         for c in range(min(vocab, self.token_masses.shape[0])):
             mass = self.token_masses[c].item()
-            if c not in excluded and 0 < mass <= hi_max:
-                emit_tokens.append(c)
-                emit_deltas.append(round(mass / resolution))
-                emit_nterm.append(c in nterm)
+            if c in excluded or mass > hi_max:
+                continue
+            if mass <= 0 and c not in nterm:
+                # A non-terminal residue of zero or negative mass could
+                # repeat without bound, which the fixed axis cannot hold.
+                continue
+            emit_tokens.append(c)
+            emit_deltas.append(round(mass / resolution))
+            emit_nterm.append(c in nterm)
         if not emit_tokens:
             return None
         deltas = dict(zip(emit_tokens, emit_deltas))
@@ -693,16 +712,19 @@ class Spec2Pep(pl.LightningModule):
         delta_idx = torch.tensor(emit_deltas, device=device)
 
         # Per-token mass shifts as gather indices over the mass axis:
-        # src_bins[e, m] = m - delta_e, valid where m >= delta_e.
+        # src_bins[e, m] = m - delta_e. A negative delta moves the source
+        # ABOVE the target, so both ends of the axis have to be checked.
         bins = torch.arange(n_bins, device=device)
-        src_bins = (bins.unsqueeze(0) - delta_idx.unsqueeze(1)).clamp(min=0)
-        valid = bins.unsqueeze(0) >= delta_idx.unsqueeze(1)
-        # An N-terminal modification may only open the peptide. Every
-        # emittable token has positive mass, so "nothing emitted yet" is
-        # exactly mass bin 0, and requiring the source bin to be 0 means
-        # requiring the target bin to be the token's own mass.
+        raw_src = bins.unsqueeze(0) - delta_idx.unsqueeze(1)
+        valid = (raw_src >= 0) & (raw_src < n_bins)
+        src_bins = raw_src.clamp(0, n_bins - 1)
+        # An N-terminal modification may only open the peptide. "Nothing
+        # emitted yet" is the zero-mass bin, so requiring the source to be
+        # `zero_bin` means requiring the target to be zero_bin + delta.
         nterm_only = torch.tensor(emit_nterm, device=device).unsqueeze(1)
-        valid &= ~nterm_only | (bins.unsqueeze(0) == delta_idx.unsqueeze(1))
+        valid &= ~nterm_only | (
+            bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
+        )
 
         log_probs = logits.log_softmax(-1)
         neg_inf = float("-inf")
@@ -710,7 +732,7 @@ class Spec2Pep(pl.LightningModule):
         # score[m, c]: best log-probability of any path prefix with
         # discretized emitted mass m and last symbol c.
         score = torch.full((n_bins, vocab), neg_inf, device=device)
-        score[0, blank] = 0.0
+        score[zero_bin, blank] = 0.0
         # pointers[t, m, c]: last symbol of the predecessor state; a
         # pointer equal to c itself encodes a repeat (no new emission).
         # Kept on the model device; backtracking reads single entries.
@@ -777,7 +799,9 @@ class Spec2Pep(pl.LightningModule):
             pointers[t] = new_ptr
 
         # Read out the best final state within any mass window.
-        mass_axis = torch.arange(n_bins, device=device) * resolution
+        mass_axis = (
+            torch.arange(n_bins, device=device) - zero_bin
+        ) * resolution
         allowed = torch.zeros(n_bins, dtype=torch.bool, device=device)
         for lo, hi in windows:
             allowed |= (mass_axis >= lo) & (mass_axis <= hi)

@@ -1939,6 +1939,38 @@ def test_pmc_decode_nterm_mod():
     assert model._pmc_decode(logits.flip(0), precursor_mass) is None
 
 
+def test_pmc_decode_all_nterm_mods():
+    """Every N-terminal modification decodes, negative mass included."""
+    model = _pmc_model()
+    idx = model.tokenizer.index
+    aa_g, aa_k = idx["G"], idx["K"]
+    masses = model.token_masses
+
+    for label in (
+        "[Ammonia-loss]-",
+        "[Acetyl]-",
+        "[+25.980265]-",
+        "[Carbamyl]-",
+    ):
+        nterm = idx[label]
+        logits = torch.full((3, model.vocab_size), -10.0)
+        logits[0, aa_k] = 5.0
+        logits[1, aa_g] = 5.0
+        logits[2, nterm] = 5.0
+        precursor_mass = (
+            masses[aa_k] + masses[aa_g] + masses[nterm]
+        ).item() + 18.010565
+
+        tokens, _ = model._pmc_decode(logits, precursor_mass)
+        assert tokens == [aa_k, aa_g, nterm], label
+        assert model._fits_precursor_mass(tokens, precursor_mass), label
+        # Still rejected at the wrong end, negative mass or not.
+        assert model._pmc_decode(logits.flip(0), precursor_mass) is None, label
+
+    # Ammonia loss is the one that needs bins below zero.
+    assert masses[idx["[Ammonia-loss]-"]].item() < 0
+
+
 def test_pmc_decode_coarse_resolution(monkeypatch):
     """A precursor too heavy for the fine mass grid still decodes."""
     model = _pmc_model()

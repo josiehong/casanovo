@@ -84,7 +84,8 @@ class Spec2Pep(pl.LightningModule):
     tokenizer: PeptideTokenizer | None
         Tokenizer object to process peptide sequences.
     **kwargs : Dict
-        Additional keyword arguments passed to the Adam optimizer.
+        Additional keyword arguments passed to the Muon+AdamW
+        optimizer (e.g. ``lr`` and ``weight_decay``).
     """
 
     def __init__(
@@ -1107,15 +1108,29 @@ class Spec2Pep(pl.LightningModule):
         """
         Initialize the optimizer.
 
-        We use the Adam optimizer with a cosine learning rate scheduler.
+        We use a hybrid Muon+AdamW optimizer with a cosine learning
+        rate scheduler. Muon updates the hidden 2D weight matrices,
+        while AdamW updates embeddings, the output head, and all
+        non-matrix parameters (biases, norms, scalars).
 
         Returns
         -------
         Tuple[List[torch.optim.Optimizer], Dict[str, Any]]
-            The initialized Adam optimizer and its learning rate
+            The initialized Muon+AdamW optimizer and its learning rate
             scheduler.
         """
-        optimizer = torch.optim.Adam(self.parameters(), **self.opt_kwargs)
+        muon_params, adamw_params = [], []
+        for module in self.modules():
+            for param in module.parameters(recurse=False):
+                if (
+                    param.ndim == 2
+                    and not isinstance(module, torch.nn.Embedding)
+                    and module is not self.decoder.final
+                ):
+                    muon_params.append(param)
+                else:
+                    adamw_params.append(param)
+        optimizer = MuonAdamW(muon_params, adamw_params, **self.opt_kwargs)
         # Apply learning rate scheduler per step.
         lr_scheduler = CosineWarmupScheduler(
             optimizer, self.warmup_iters, self.cosine_schedule_period_iters
@@ -1463,6 +1478,98 @@ def _calc_match_score(
     aa_scores = [per_aa_np[i, : lengths_np[i]] for i in range(B)]
 
     return peptide_scores, aa_scores
+
+
+class MuonAdamW(torch.optim.Optimizer):
+    """
+    Hybrid optimizer applying Muon to hidden weight matrices and AdamW
+    to all other parameters.
+
+    Muon is only defined for 2D weight matrices, so embeddings, the
+    output head, biases, norms, and scalar parameters are optimized
+    with AdamW, following standard Muon practice. Both optimizers are
+    exposed behind a single `torch.optim.Optimizer` interface so that
+    Lightning's automatic optimization, gradient clipping, and LR
+    scheduling work unchanged. Muon uses the ``match_rms_adamw``
+    learning rate adjustment, so a single learning rate is shared by
+    both components.
+
+    Parameters
+    ----------
+    muon_params : List[torch.Tensor]
+        The 2D hidden weight matrices to optimize with Muon.
+    adamw_params : List[torch.Tensor]
+        All remaining parameters, to optimize with AdamW.
+    lr : float
+        The shared learning rate.
+    weight_decay : float
+        The decoupled weight decay applied by both optimizers.
+    muon_momentum : float
+        The momentum used by Muon.
+    **adamw_kwargs : Dict
+        Additional keyword arguments passed to the AdamW optimizer.
+    """
+
+    def __init__(
+        self,
+        muon_params: List[torch.Tensor],
+        adamw_params: List[torch.Tensor],
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+        muon_momentum: float = 0.95,
+        **adamw_kwargs: Dict,
+    ):
+        # Intentionally do not call `super().__init__()`: the two inner
+        # optimizers own the parameter groups and state, and this class
+        # only presents their union.
+        self.muon = torch.optim.Muon(
+            muon_params,
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=muon_momentum,
+            adjust_lr_fn="match_rms_adamw",
+        )
+        self.adamw = torch.optim.AdamW(
+            adamw_params, lr=lr, weight_decay=weight_decay, **adamw_kwargs
+        )
+        self.defaults = dict(lr=lr, weight_decay=weight_decay)
+
+    @property
+    def param_groups(self) -> List[Dict[str, Any]]:
+        # The concatenated list holds references to the inner group
+        # dicts, so LR scheduler updates propagate to both optimizers.
+        return self.muon.param_groups + self.adamw.param_groups
+
+    @property
+    def state(self) -> Dict[torch.Tensor, Any]:
+        merged = dict(self.muon.state)
+        merged.update(self.adamw.state)
+        return merged
+
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        self.muon.step()
+        self.adamw.step()
+        return loss
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.muon.zero_grad(set_to_none=set_to_none)
+        self.adamw.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "muon": self.muon.state_dict(),
+            "adamw": self.adamw.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.muon.load_state_dict(state_dict["muon"])
+        self.adamw.load_state_dict(state_dict["adamw"])
+
+    def __repr__(self) -> str:
+        return f"MuonAdamW(\nmuon={self.muon},\nadamw={self.adamw}\n)"
 
 
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):

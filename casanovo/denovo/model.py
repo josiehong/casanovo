@@ -151,6 +151,12 @@ class Spec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
         )
+        # Self-conditioning: which decoder layers score their own hidden
+        # states and feed the prediction forward, and how much of the loss
+        # those auxiliary predictions carry. Empty list disables it, and the
+        # model is then identical to the plain CTC decoder.
+        self.self_cond_layers = tuple(kwargs.pop("self_cond_layers", ()) or ())
+        self.self_cond_weight = float(kwargs.pop("self_cond_weight", 0.5))
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
             d_model=dim_model,
@@ -159,6 +165,7 @@ class Spec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
             max_charge=max_charge,
+            self_cond_layers=self.self_cond_layers,
         )
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(
@@ -301,6 +308,7 @@ class Spec2Pep(pl.LightningModule):
     def _forward_step(
         self,
         batch: Dict[str, torch.Tensor],
+        return_intermediates: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         The forward learning step for non-autoregressive decoding.
@@ -317,6 +325,10 @@ class Spec2Pep(pl.LightningModule):
             The frame-level amino acid scores for each prediction.
         seqs : torch.Tensor of shape (n_spectra, length) or None
             The ground truth tokens for training, or None for inference.
+        intermediates : list of torch.Tensor
+            Only when ``return_intermediates``: the scores from each
+            self-conditioning layer, for the auxiliary CTC losses. Empty
+            unless ``self_cond_layers`` is set.
         """
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
@@ -328,13 +340,24 @@ class Spec2Pep(pl.LightningModule):
             dtype=torch.long,
             device=self.device,
         )
-        scores = self.decoder(
-            tokens=zero_tokens,
-            memory=memories,
-            memory_key_padding_mask=mem_masks,
-            precursors=precursors,
-        )
+        if self.self_cond_layers or return_intermediates:
+            scores, intermediates = self.decoder.forward_self_conditioned(
+                tokens=zero_tokens,
+                memory=memories,
+                memory_key_padding_mask=mem_masks,
+                precursors=precursors,
+            )
+        else:
+            scores = self.decoder(
+                tokens=zero_tokens,
+                memory=memories,
+                memory_key_padding_mask=mem_masks,
+                precursors=precursors,
+            )
+            intermediates = []
 
+        if return_intermediates:
+            return scores, seqs, intermediates
         return scores, seqs
 
     def training_step(
@@ -363,7 +386,9 @@ class Spec2Pep(pl.LightningModule):
             The loss of the training step.
         """
 
-        pred, truth = self._forward_step(batch)
+        pred, truth, intermediates = self._forward_step(
+            batch, return_intermediates=True
+        )
 
         log_probs = pred.log_softmax(-1).transpose(0, 1)  # (T, B, V)
         input_lengths = torch.full(
@@ -390,6 +415,34 @@ class Spec2Pep(pl.LightningModule):
                 self.max_peptide_len + 1,
             )
         loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
+        if intermediates:
+            # Self-conditioned CTC: the same objective on each conditioning
+            # layer's own prediction, so those layers are trained to say
+            # something worth feeding forward. Weight splits the total
+            # between the final layer and the average of the intermediates,
+            # which keeps the loss on the same scale as without them.
+            aux = torch.stack(
+                [
+                    self.ctc_loss(
+                        scores.log_softmax(-1).transpose(0, 1),
+                        truth,
+                        input_lengths,
+                        target_lengths,
+                    )
+                    for scores in intermediates
+                ]
+            ).mean()
+            loss = (1 - self.self_cond_weight) * loss + (
+                self.self_cond_weight * aux
+            )
+            self.log(
+                f"{mode}_CTCLoss_intermediate",
+                aux.detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=truth.shape[0],
+            )
         self.log(
             f"{mode}_CELoss",
             loss.detach(),

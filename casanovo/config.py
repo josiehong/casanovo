@@ -29,7 +29,14 @@ _config_deprecated = dict(
 # the packaged config.yaml when a user config omits them, so adding an option
 # does not invalidate every config in the wild (casanovo otherwise requires a
 # user config to list every key).
-_config_optional = frozenset({"muon_lr", "muon_momentum"})
+_config_optional = frozenset(
+    {
+        "muon_lr",
+        "muon_momentum",
+        "self_cond_layers",
+        "self_cond_weight",
+    }
+)
 
 
 class Config:
@@ -96,6 +103,8 @@ class Config:
         weight_decay=float,
         muon_lr=float,
         muon_momentum=float,
+        self_cond_layers=list,
+        self_cond_weight=float,
         train_label_smoothing=float,
         train_batch_size=int,
         max_epochs=int,

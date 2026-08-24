@@ -1,6 +1,6 @@
 """Transformer encoder and decoder for the de novo sequencing task."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import torch
 from depthcharge.encoders import FloatEncoder, PeakEncoder, PositionalEncoder
@@ -55,6 +55,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         positional_encoder: PositionalEncoder | bool = True,
         padding_int: int | None = None,
         max_charge: int = 4,
+        self_cond_layers: Sequence[int] = (),
     ) -> None:
         """Initialize a PeptideDecoder."""
 
@@ -78,6 +79,96 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         self.final = torch.nn.Linear(
             d_model, self.token_encoder.num_embeddings + 1
         )
+
+        # Self-conditioning: the layers after which this decoder scores its
+        # own hidden states and feeds the prediction back in. Empty means the
+        # decoder behaves exactly as it did before and grows no parameters,
+        # so a checkpoint trained without it still loads.
+        self.self_cond_layers = tuple(
+            k for k in sorted(set(self_cond_layers)) if 1 <= k < n_layers
+        )
+        if self.self_cond_layers:
+            # Maps a distribution over the vocabulary back to model space.
+            # No bias: a constant offset would be the same at every frame
+            # and could be absorbed by the layer that follows.
+            self.cond_proj = torch.nn.Linear(
+                self.final.out_features, d_model, bias=False
+            )
+        else:
+            self.cond_proj = None
+
+    def forward_self_conditioned(
+        self,
+        tokens: torch.Tensor | None,
+        *args: torch.Tensor,
+        memory: torch.Tensor | None,
+        memory_key_padding_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        **kwargs: dict,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """
+        Decode, scoring the stack's own hidden states along the way.
+
+        Self-conditioned CTC (Nozaki and Komatsu, Interspeech 2021):
+        after each layer in ``self_cond_layers`` the hidden states are
+        scored with the same output layer the model already has, and that
+        prediction is projected back to model space and added to the
+        states before the next layer runs. Positions are therefore no
+        longer predicted independently of one another, at the cost of one
+        auxiliary loss per conditioning layer during training and nothing
+        at inference.
+
+        This has to open up the layer stack rather than call
+        ``transformer_decoder`` in one shot, so it repeats the input
+        preparation from ``embed``. The masks are built the same way,
+        including the all-False target mask that makes attention
+        non-causal.
+
+        Returns
+        -------
+        scores : torch.Tensor of shape (batch, len_seq, n_tokens)
+            The final-layer scores, identical in meaning to ``forward``.
+        intermediates : list of torch.Tensor
+            One score tensor per conditioning layer, for the auxiliary
+            CTC losses. Empty when self-conditioning is off, in which
+            case the scores match ``forward`` exactly.
+        """
+        if tokens is None:
+            tokens = torch.tensor([[]]).to(self.device)
+
+        encoded = self.token_encoder(tokens)
+        global_token = self.global_token_hook(tokens, *args, **kwargs)
+        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
+
+        tgt_key_padding_mask = encoded.sum(axis=2) == 0
+        tgt_key_padding_mask[:, 0] = False
+        encoded = self.positional_encoder(encoded)
+
+        # Non-causal attention, as in `embed` above: every frame sees
+        # every other frame.
+        length = encoded.shape[1]
+        tgt_mask = torch.zeros(
+            (length, length), dtype=torch.bool, device=encoded.device
+        )
+
+        intermediates = []
+        for depth, layer in enumerate(self.transformer_decoder.layers, 1):
+            encoded = layer(
+                encoded,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_mask=memory_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
+            if depth in self.self_cond_layers:
+                scores = self.final(encoded)
+                intermediates.append(scores)
+                encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
+
+        if self.transformer_decoder.norm is not None:
+            encoded = self.transformer_decoder.norm(encoded)
+        return self.final(encoded), intermediates
 
     def global_token_hook(
         self,

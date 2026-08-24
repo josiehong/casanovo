@@ -137,6 +137,14 @@ weight_decay: 1e-5
 muon_lr: 0.02
 # Momentum for the Muon parameter group.
 muon_momentum: 0.95
+# Self-conditioned CTC: decoder layers (1-based) after which the model scores
+# its own hidden states and feeds that prediction into the next layer, so
+# positions are no longer predicted independently. Empty disables it and the
+# decoder is then identical to plain CTC. E.g. [2, 4] on a 9-layer decoder.
+self_cond_layers: []
+# Share of the training loss carried by those intermediate predictions; the
+# final layer carries the rest. Ignored when self_cond_layers is empty.
+self_cond_weight: 0.5
 # Amount of label smoothing when computing the training loss.
 train_label_smoothing: 0.01
 

@@ -415,12 +415,24 @@ class Spec2Pep(pl.LightningModule):
                 self.max_peptide_len + 1,
             )
         loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
+        # The final layer's CTC loss is what gets logged as `*_CTCLoss`, so it
+        # stays comparable with runs that predate self-conditioning and keeps
+        # driving best-checkpoint selection. The combined objective below is
+        # what the optimizer sees; logging that instead would mix in the
+        # shallower layers' worse predictions and both compare wrongly against
+        # earlier curves and pick checkpoints on the wrong quantity.
+        self.log(
+            f"{mode}_CTCLoss",
+            loss.detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=truth.shape[0],
+        )
         if intermediates:
             # Self-conditioned CTC: the same objective on each conditioning
             # layer's own prediction, so those layers are trained to say
-            # something worth feeding forward. Weight splits the total
-            # between the final layer and the average of the intermediates,
-            # which keeps the loss on the same scale as without them.
+            # something worth feeding forward.
             aux = torch.stack(
                 [
                     self.ctc_loss(
@@ -435,22 +447,18 @@ class Spec2Pep(pl.LightningModule):
             loss = (1 - self.self_cond_weight) * loss + (
                 self.self_cond_weight * aux
             )
-            self.log(
-                f"{mode}_CTCLoss_intermediate",
-                aux.detach(),
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=truth.shape[0],
-            )
-        self.log(
-            f"{mode}_CELoss",
-            loss.detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=truth.shape[0],
-        )
+            for key, value in (
+                (f"{mode}_CTCLoss_intermediate", aux),
+                (f"{mode}_CTCLoss_total", loss),
+            ):
+                self.log(
+                    key,
+                    value.detach(),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=truth.shape[0],
+                )
         return loss
 
     def validation_step(
@@ -982,9 +990,9 @@ class Spec2Pep(pl.LightningModule):
         """
         Log the training loss at the end of each epoch.
         """
-        if "train_CELoss" in self.trainer.callback_metrics:
+        if "train_CTCLoss" in self.trainer.callback_metrics:
             train_loss = (
-                self.trainer.callback_metrics["train_CELoss"].detach().item()
+                self.trainer.callback_metrics["train_CTCLoss"].detach().item()
             )
         else:
             train_loss = np.nan
@@ -999,7 +1007,7 @@ class Spec2Pep(pl.LightningModule):
         callback_metrics = self.trainer.callback_metrics
         metrics = {
             "step": self.trainer.global_step,
-            "valid": callback_metrics["valid_CELoss"].detach().item(),
+            "valid": callback_metrics["valid_CTCLoss"].detach().item(),
         }
 
         if self.calculate_precision:

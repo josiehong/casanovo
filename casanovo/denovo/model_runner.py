@@ -102,7 +102,7 @@ class ModelRunner:
             ),
             ModelCheckpoint(
                 dirpath=output_dir,
-                monitor="valid_CELoss",
+                monitor="valid_CTCLoss",
                 filename=best_filename,
                 enable_version_counter=False,
             ),

@@ -117,6 +117,7 @@ class Config:
         warmup_iters=int,
         cosine_schedule_period_iters=int,
         learning_rate=float,
+        muon_lr=float,
         weight_decay=float,
         train_label_smoothing=float,
         train_batch_size=int,

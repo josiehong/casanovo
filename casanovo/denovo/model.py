@@ -1501,7 +1501,11 @@ class MuonAdamW(torch.optim.Optimizer):
     adamw_params : List[torch.Tensor]
         All remaining parameters, to optimize with AdamW.
     lr : float
-        The shared learning rate.
+        The AdamW learning rate, also used by Muon unless `muon_lr` is
+        given.
+    muon_lr : Optional[float]
+        A separate learning rate for the Muon component. `None` falls
+        back to `lr`.
     weight_decay : float
         The decoupled weight decay applied by both optimizers.
     muon_momentum : float
@@ -1515,6 +1519,7 @@ class MuonAdamW(torch.optim.Optimizer):
         muon_params: List[torch.Tensor],
         adamw_params: List[torch.Tensor],
         lr: float = 1e-3,
+        muon_lr: Optional[float] = None,
         weight_decay: float = 0.0,
         muon_momentum: float = 0.95,
         **adamw_kwargs: Dict,
@@ -1524,7 +1529,7 @@ class MuonAdamW(torch.optim.Optimizer):
         # only presents their union.
         self.muon = torch.optim.Muon(
             muon_params,
-            lr=lr,
+            lr=lr if muon_lr is None else muon_lr,
             weight_decay=weight_decay,
             momentum=muon_momentum,
             adjust_lr_fn="match_rms_adamw",

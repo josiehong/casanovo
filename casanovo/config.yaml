@@ -126,8 +126,13 @@ dim_intensity:
 warmup_iters: 100_000
 # The number of iterations for the cosine half period of the learning rate.
 cosine_schedule_period_iters: 600_000
-# Learning rate for weight updates during training.
+# Learning rate for weight updates during training. Applies to the AdamW
+# component of the Muon+AdamW optimizer, and to the Muon component unless
+# `muon_lr` is set.
 learning_rate: 5e-4
+# Learning rate for the Muon component (hidden 2D weight matrices).
+# Leave blank to use `learning_rate`.
+muon_lr:
 # Regularization term for weight updates.
 weight_decay: 1e-5
 # Amount of label smoothing when computing the training loss.

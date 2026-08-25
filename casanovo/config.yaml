@@ -153,9 +153,12 @@ train_label_smoothing: 0.01
 train_batch_size: 32
 # Max number of training epochs.
 max_epochs: 30
-# Continue the run a checkpoint came from, restoring optimizer and scheduler
-# state and the step count, instead of loading only its weights. Requires
-# --model. Leave false to fine-tune a trained model on new data.
+# Continue the run a checkpoint came from instead of loading only its
+# weights: optimizer and scheduler state, the step count, and the training
+# hyperparameters (learning rates, schedule, loss weights, ...) all come from
+# the checkpoint, and differing config values are reported and ignored.
+# max_epochs still comes from this file, so a finished run can be extended.
+# Requires --model. Leave false to fine-tune a trained model on new data.
 resume_training: false
 # Shuffle dataset during training.
 shuffle: true

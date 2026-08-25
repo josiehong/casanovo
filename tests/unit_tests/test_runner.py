@@ -65,6 +65,32 @@ def test_initialize_model(tmp_path, mgf_small):
         runner.initialize_model(train=False)
         mock_verify.assert_called_once()
 
+    # Fine-tuning takes the training hyperparameters from the config,
+    # resuming takes them from the checkpoint.
+    config.learning_rate = 1e-3
+    config.warmup_iters = 7
+    config.self_cond_weight = 0.25
+    runner = ModelRunner(config=config, model_filename=str(ckpt))
+    runner.initialize_tokenizer()
+    runner.initialize_model(train=True)
+    assert runner.model.hparams.lr == 1e-3
+    assert runner.model.hparams.warmup_iters == 7
+    assert runner.model.hparams.self_cond_weight == 0.25
+
+    config.resume_training = True
+    runner = ModelRunner(config=config, model_filename=str(ckpt))
+    runner.initialize_tokenizer()
+    runner.initialize_model(train=True)
+    assert runner.model.hparams.lr == Config().learning_rate
+    assert runner.model.hparams.warmup_iters == Config().warmup_iters
+    assert runner.model.hparams.self_cond_weight == Config().self_cond_weight
+    # Inference is unaffected by resume_training.
+    runner = ModelRunner(config=config, model_filename=str(ckpt))
+    runner.initialize_tokenizer()
+    runner.initialize_model(train=False)
+    assert runner.model.hparams.lr == 1e-3
+    config.resume_training = False
+
     # If the model initialization throws and EOFError, then the Spec2Pep model
     # has tried to load the weights.
     weights = tmp_path / "blah"

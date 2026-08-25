@@ -28,6 +28,22 @@ from ..denovo.model import DbSpec2Pep, Spec2Pep
 logger = logging.getLogger("casanovo")
 
 
+# Hyperparameters that define the optimization itself. Resuming a run takes
+# these from the checkpoint, so the restored optimizer and scheduler state
+# still belongs to the schedule and loss being trained under.
+_TRAINING_HPARAMS = (
+    "warmup_iters",
+    "cosine_schedule_period_iters",
+    "lr",
+    "weight_decay",
+    "muon_lr",
+    "muon_momentum",
+    "self_cond_layers",
+    "self_cond_weight",
+    "train_label_smoothing",
+)
+
+
 class ModelRunner:
     """A class to run Casanovo models.
 
@@ -506,6 +522,17 @@ class ModelRunner:
             out_writer=self.writer,
         )
 
+        # Resuming a run means continuing its optimization as it was: the
+        # training hyperparameters come from the checkpoint rather than the
+        # config, so the schedule and the loss are the ones the restored
+        # optimizer state belongs to. Inference and logging settings are
+        # unrelated to that and stay reconfigurable. Config values that are
+        # overridden this way are reported below.
+        resume = train and self.config.resume_training
+        if resume:
+            for param in _TRAINING_HPARAMS:
+                del loaded_model_params[param]
+
         if self.model_filename is None:
             if db_search:
                 logger.error("A model file must be provided for DB search")
@@ -542,10 +569,14 @@ class ModelRunner:
             # Use tokenizer initialized from config file instead of loaded
             # from checkpoint file.
             self.model.tokenizer = tokenizer
-            architecture_params = set(model_params.keys()) - set(
+            checkpoint_params = set(model_params.keys()) - set(
                 loaded_model_params.keys()
             )
-            for param in architecture_params:
+            for param in checkpoint_params:
+                if param not in self.model.hparams:
+                    # Checkpoint predates this hyperparameter; the model
+                    # fell back to its default.
+                    continue
                 if model_params[param] != self.model.hparams[param]:
                     if param == "tokenizer":
                         self._verify_tokenizer(
@@ -554,10 +585,11 @@ class ModelRunner:
                     else:
                         logger.warning(
                             "Mismatching %s parameter in model checkpoint (%s) vs"
-                            " config file (%s); using the checkpoint.",
+                            " config file (%s); using the checkpoint%s.",
                             param,
                             self.model.hparams[param],
                             model_params[param],
+                            " (resume_training)" if resume else "",
                         )
         except RuntimeError:
             # This only doesn't work if the weights are from an older

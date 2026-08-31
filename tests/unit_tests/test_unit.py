@@ -1892,6 +1892,40 @@ def test_pmc_decode():
     assert model._pmc_decode(logits, 5_000.0) is None
 
 
+def test_pmc_decode_infinite_tolerance():
+    """`precursor_mass_tol: "inf"` turns PMC off instead of crashing.
+
+    An infinite tolerance is how the PMC branches disable precise mass
+    control: every peptide "fits", so predict_step short-circuits. An
+    EMPTY greedy peptide is the one case that reaches the search anyway,
+    because the guard there reads `if tokens and ...`. The window is then
+    unbounded and the mass axis used to come out NaN.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=1,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        precursor_mass_tol=float("inf"),
+    )
+    # Any peptide satisfies an infinite window, so PMC is never reached
+    # for a non-empty decode -- this is what makes "inf" mean "PMC off".
+    idx = tokenizer.index
+    assert model._fits_precursor_mass([idx["K"], idx["G"], idx["E"]], 1234.5)
+
+    # All-blank frames collapse to nothing, which is the case that does
+    # reach the search.
+    logits = torch.full((4, model.vocab_size), -10.0)
+    logits[:, model.blank_token] = 5.0
+    assert model._ctc_decode(logits.unsqueeze(0))[0][0] == []
+    assert model._pmc_decode(logits, 1234.5) is None
+
+
 def test_pmc_decode_charge_range():
     """A wrong annotated charge is recoverable via ``charge_range``."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(

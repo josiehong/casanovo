@@ -859,6 +859,14 @@ class Spec2Pep(pl.LightningModule):
         hi_base = max(hi for _, _, hi in base)
         if hi_base <= 0:
             return None
+        # An unbounded window constrains nothing: precursor_mass_tol is
+        # "inf", which is how PMC is turned off. Bail out rather than build
+        # a mass axis of infinite extent, whose resolution would come out
+        # inf and whose bin count would be NaN. Only an empty greedy
+        # peptide reaches here under an infinite tolerance, since a
+        # non-empty one already "fits" and predict_step skips the search.
+        if not np.isfinite(hi_base):
+            return None
         max_bins = max(4, PMC_MAX_POINTER_BYTES // (n_frames * vocab))
         resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
         guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)

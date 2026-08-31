@@ -5,7 +5,17 @@ import heapq
 import itertools
 import logging
 import warnings
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import einops
 import lightning.pytorch as pl
@@ -23,6 +33,7 @@ logger = logging.getLogger("casanovo")
 
 H2O_MASS = 18.010565
 ISOTOPE_SPACING = 1.00335
+PROTON_MASS = 1.007276
 # Precise mass control (PMC) decoding settings: the mass discretization
 # step, the widening of the readout windows to absorb accumulated
 # rounding error, a cap on the backtracking table size, and the minimum
@@ -81,6 +92,17 @@ class Spec2Pep(pl.LightningModule):
         predicted precursor m/z's that fit the specified isotope error:
         `abs(calc_mz - (precursor_mz - isotope * 1.00335 / precursor_charge))
         < precursor_mass_tol`
+    charge_range : Optional[Tuple[int, int]]
+        Precursor charges to consider during precise mass control
+        decoding, as an inclusive `(min, max)` pair. `None` (the
+        default) trusts the charge annotated on the spectrum and is
+        exactly the previous behaviour. A range instead treats the
+        annotation as possibly wrong: the neutral mass is recomputed
+        from the observed m/z at every charge in the range, a peptide is
+        accepted if it matches under any of them, and the charge that
+        matched is the one reported for the PSM. Widening the range
+        widens the mass axis the DP has to span, which can force a
+        coarser discretization for heavy precursors (see `_pmc_decode`).
     min_peptide_len : int
         The minimum length of predicted peptides.
     n_beams : int
@@ -123,6 +145,7 @@ class Spec2Pep(pl.LightningModule):
         max_charge: int = 5,
         precursor_mass_tol: float = 50,
         isotope_error_range: Tuple[int, int] = (0, 1),
+        charge_range: Optional[Tuple[int, int]] = None,
         min_peptide_len: int = 6,
         n_beams: int = 1,
         top_match: int = 1,
@@ -194,6 +217,9 @@ class Spec2Pep(pl.LightningModule):
         self.residues = residues
         self.precursor_mass_tol = precursor_mass_tol
         self.isotope_error_range = isotope_error_range
+        self.charge_range = (
+            None if charge_range is None else tuple(charge_range)
+        )
         self.min_peptide_len = min_peptide_len
         self.n_beams = n_beams
         self.top_match = top_match
@@ -291,7 +317,7 @@ class Spec2Pep(pl.LightningModule):
         """
         precursor_mzs = batch["precursor_mz"].squeeze(0)
         precursor_charges = batch["precursor_charge"].squeeze(0)
-        precursor_masses = (precursor_mzs - 1.007276) * precursor_charges
+        precursor_masses = (precursor_mzs - PROTON_MASS) * precursor_charges
         precursors = torch.vstack(
             [precursor_masses, precursor_charges, precursor_mzs]
         ).T
@@ -591,39 +617,132 @@ class Spec2Pep(pl.LightningModule):
             scores.append(fixed_conf)
         return sequences, scores
 
+    def _precursor_candidates(
+        self,
+        precursor_mass: float,
+        precursor_mz: Optional[float] = None,
+        precursor_charge: Optional[int] = None,
+    ) -> List[Tuple[Optional[int], float]]:
+        """
+        The (charge, neutral mass) pairs to accept for one spectrum.
+
+        With ``charge_range`` unset this is the annotated charge alone,
+        and ``precursor_mass`` is used as given. With a range set, the
+        annotated charge is treated as a guess: the neutral mass is
+        recomputed from the observed m/z at each charge in the range.
+
+        Parameters
+        ----------
+        precursor_mass : float
+            The neutral mass implied by the annotated charge.
+        precursor_mz : Optional[float]
+            The observed precursor m/z. Required to consider charges
+            other than the annotated one; without it the annotated
+            charge is the only candidate whatever ``charge_range`` says.
+        precursor_charge : Optional[int]
+            The annotated precursor charge, reported back for the
+            no-range case so callers need no special case for it.
+
+        Returns
+        -------
+        List[Tuple[Optional[int], float]]
+            One (charge, neutral mass) pair per candidate charge.
+        """
+        if self.charge_range is None or precursor_mz is None:
+            return [(precursor_charge, precursor_mass)]
+        lo, hi = self.charge_range
+        return [
+            (z, (precursor_mz - PROTON_MASS) * z) for z in range(lo, hi + 1)
+        ]
+
     def _residue_mass_windows(
-        self, precursor_mass: float, guard: float = 0.0
-    ) -> List[Tuple[float, float]]:
+        self,
+        candidates: Sequence[Tuple[Optional[int], float]],
+        guard: float = 0.0,
+    ) -> List[Tuple[Optional[int], float, float]]:
         """
         Acceptable total residue mass windows for a precursor.
 
-        One window per isotope error in ``isotope_error_range``, each
+        One window per (candidate charge, isotope error) pair, each
         spanning the precursor mass tolerance (in ppm), expressed in
         residue-sum space (i.e. with the water mass removed).
 
         Parameters
         ----------
-        precursor_mass : float
-            The observed precursor neutral mass.
+        candidates : Sequence[Tuple[Optional[int], float]]
+            The (charge, neutral mass) pairs to accept, as returned by
+            ``_precursor_candidates``.
         guard : float
             Extra widening (in Da) applied to both window edges.
 
         Returns
         -------
-        List[Tuple[float, float]]
-            The (lower, upper) bounds of each window.
+        List[Tuple[Optional[int], float, float]]
+            The charge and the (lower, upper) bounds of each window.
         """
-        tol = self.precursor_mass_tol * precursor_mass / 1e6
         return [
-            (center - tol - guard, center + tol + guard)
+            (charge, center - tol - guard, center + tol + guard)
+            for charge, precursor_mass in candidates
+            for tol in [self.precursor_mass_tol * precursor_mass / 1e6]
             for iso in range(
                 self.isotope_error_range[0], self.isotope_error_range[1] + 1
             )
             for center in [precursor_mass - iso * ISOTOPE_SPACING - H2O_MASS]
         ]
 
+    def _matching_window(
+        self,
+        tokens: List[int],
+        precursor_mass: float,
+        precursor_mz: Optional[float] = None,
+        precursor_charge: Optional[int] = None,
+    ) -> Optional[Tuple[Optional[int], float, float]]:
+        """
+        The mass window a peptide falls in, if it falls in any.
+
+        Returned rather than a bare charge because the charge is itself
+        None when ``charge_range`` is unset and no annotated charge was
+        supplied, which a caller must not confuse with "no match".
+
+        Parameters
+        ----------
+        tokens : List[int]
+            The decoded token indices.
+        precursor_mass : float
+            The neutral mass implied by the annotated charge.
+        precursor_mz : Optional[float]
+            The observed precursor m/z, needed to consider charges
+            other than the annotated one.
+        precursor_charge : Optional[int]
+            The annotated precursor charge.
+
+        Returns
+        -------
+        Optional[Tuple[Optional[int], float, float]]
+            The charge and bounds of the first window the peptide's
+            residue mass falls in, or None if it falls in none. Windows
+            are tried in ascending charge order, so a peptide that fits
+            at more than one charge is assigned the lowest.
+        """
+        mass = (
+            self.token_masses[torch.tensor(tokens, dtype=torch.long)]
+            .sum()
+            .item()
+        )
+        candidates = self._precursor_candidates(
+            precursor_mass, precursor_mz, precursor_charge
+        )
+        for window in self._residue_mass_windows(candidates):
+            if window[1] <= mass <= window[2]:
+                return window
+        return None
+
     def _fits_precursor_mass(
-        self, tokens: List[int], precursor_mass: float
+        self,
+        tokens: List[int],
+        precursor_mass: float,
+        precursor_mz: Optional[float] = None,
+        precursor_charge: Optional[int] = None,
     ) -> bool:
         """
         Check whether a peptide matches the precursor mass.
@@ -633,34 +752,42 @@ class Spec2Pep(pl.LightningModule):
         tokens : List[int]
             The decoded token indices.
         precursor_mass : float
-            The observed precursor neutral mass.
+            The neutral mass implied by the annotated charge.
+        precursor_mz : Optional[float]
+            The observed precursor m/z, needed to consider charges
+            other than the annotated one.
+        precursor_charge : Optional[int]
+            The annotated precursor charge.
 
         Returns
         -------
         bool
             True if the total residue mass falls within the precursor
-            mass tolerance for any allowed isotope error.
+            mass tolerance for any allowed isotope error, at any
+            allowed charge.
         """
-        mass = (
-            self.token_masses[torch.tensor(tokens, dtype=torch.long)]
-            .sum()
-            .item()
-        )
-        return any(
-            lo <= mass <= hi
-            for lo, hi in self._residue_mass_windows(precursor_mass)
+        return (
+            self._matching_window(
+                tokens, precursor_mass, precursor_mz, precursor_charge
+            )
+            is not None
         )
 
     def _pmc_decode(
-        self, logits: torch.Tensor, precursor_mass: float
-    ) -> Optional[Tuple[List[int], List[float]]]:
+        self,
+        logits: torch.Tensor,
+        precursor_mass: float,
+        precursor_mz: Optional[float] = None,
+        precursor_charge: Optional[int] = None,
+    ) -> Optional[Tuple[List[int], List[float], Optional[int]]]:
         """
         Precise mass control (PMC) decoding for a single spectrum.
 
         Knapsack-like dynamic programming over the CTC lattice (after
         PrimeNovo): find the highest-probability CTC path whose
         collapsed peptide's total residue mass matches the precursor
-        mass within tolerance, considering all allowed isotope errors.
+        mass within tolerance, considering all allowed isotope errors
+        and, when ``charge_range`` is set, all allowed charges.
         The DP state is (discretized emitted mass, last path symbol);
         the last symbol is needed to apply the CTC collapse rules
         (a repeated symbol without an intervening blank does not emit).
@@ -681,21 +808,31 @@ class Spec2Pep(pl.LightningModule):
         The mass grid is discretized at ``PMC_RESOLUTION``, coarsened
         for heavy precursors so that the backtracking table stays under
         ``PMC_MAX_POINTER_BYTES``. Bin ``zero_bin`` holds zero mass, with
-        the bins below it reserved for the negative excursion.
+        the bins below it reserved for the negative excursion. One axis
+        spans every candidate window, so a ``charge_range`` whose upper
+        end is well above the annotated charge stretches the axis in
+        proportion and can trip that coarsening on spectra where the
+        annotated charge alone would not have.
 
         Parameters
         ----------
         logits : torch.Tensor of shape (n_frames, n_tokens)
             The frame-level amino acid scores for one spectrum.
         precursor_mass : float
-            The observed precursor neutral mass.
+            The neutral mass implied by the annotated charge.
+        precursor_mz : Optional[float]
+            The observed precursor m/z, needed to consider charges
+            other than the annotated one.
+        precursor_charge : Optional[int]
+            The annotated precursor charge.
 
         Returns
         -------
-        Optional[Tuple[List[int], List[float]]]
-            The decoded token indices and per-token confidences, or
-            None if no mass-matching path exists (or the search was
-            skipped because the DP table would be too large).
+        Optional[Tuple[List[int], List[float], Optional[int]]]
+            The decoded token indices, the per-token confidences, and
+            the charge whose window the peptide matched, or None if no
+            mass-matching path exists (or the search was skipped because
+            the DP table would be too large).
         """
         device = logits.device
         n_frames, vocab = logits.shape
@@ -715,15 +852,18 @@ class Spec2Pep(pl.LightningModule):
         # is accepted. The readout guard absorbs accumulated rounding
         # error, which grows with the resolution and with the number of
         # emissions, and reduces to PMC_MASS_GUARD at the default.
-        base = self._residue_mass_windows(precursor_mass, PMC_MASS_GUARD)
-        hi_base = max(hi for _, hi in base)
+        candidates = self._precursor_candidates(
+            precursor_mass, precursor_mz, precursor_charge
+        )
+        base = self._residue_mass_windows(candidates, PMC_MASS_GUARD)
+        hi_base = max(hi for _, _, hi in base)
         if hi_base <= 0:
             return None
         max_bins = max(4, PMC_MAX_POINTER_BYTES // (n_frames * vocab))
         resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
         guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
-        windows = self._residue_mass_windows(precursor_mass, guard)
-        hi_max = max(hi for _, hi in windows)
+        windows = self._residue_mass_windows(candidates, guard)
+        hi_max = max(hi for _, _, hi in windows)
         # Negative-mass tokens (the ammonia-loss N-terminal modification)
         # push the running total below zero, so the axis starts below it.
         # Only N-terminal modifications may be negative and only one may be
@@ -880,7 +1020,7 @@ class Spec2Pep(pl.LightningModule):
             torch.arange(n_bins, device=device) - zero_bin
         ) * resolution
         allowed = torch.zeros(n_bins, dtype=torch.bool, device=device)
-        for lo, hi in windows:
+        for _, lo, hi in windows:
             allowed |= (mass_axis >= lo) & (mass_axis <= hi)
         score[~allowed] = neg_inf
         best_val, flat_idx = score.flatten().max(dim=0)
@@ -913,10 +1053,17 @@ class Spec2Pep(pl.LightningModule):
             # tokens in the tokenizer's own order.
             tokens.reverse()
             confs.reverse()
-        # Verify the exact (non-discretized) mass before accepting.
-        if not tokens or not self._fits_precursor_mass(tokens, precursor_mass):
+        # Verify the exact (non-discretized) mass before accepting. The
+        # DP ran on one axis covering every candidate window, so this is
+        # also what decides which charge the path actually matched.
+        if not tokens:
             return None
-        return tokens, confs
+        window = self._matching_window(
+            tokens, precursor_mass, precursor_mz, precursor_charge
+        )
+        if window is None:
+            return None
+        return tokens, confs, window[0]
 
     def predict_step(
         self, batch: Dict[str, torch.Tensor], *args
@@ -943,19 +1090,33 @@ class Spec2Pep(pl.LightningModule):
         # Precise mass control: when the greedy peptide does not match
         # the precursor mass, search for the best CTC path that does.
         _, _, precursors, _ = self._process_batch(batch)
+        # The charge each peptide was finally accepted under. With
+        # `charge_range` unset this is always the annotated charge; with
+        # a range set it is the charge whose window the peptide matched,
+        # which is what `calc_mz` has to be computed from downstream.
+        charges = [int(z) for z in precursors[:, 1].tolist()]
         for i, tokens in enumerate(sequences):
             precursor_mass = precursors[i, 0].item()
-            if tokens and self._fits_precursor_mass(tokens, precursor_mass):
-                continue
-            pmc = self._pmc_decode(logits[i], precursor_mass)
+            precursor_mz = precursors[i, 2].item()
+            annotated = charges[i]
+            if tokens:
+                window = self._matching_window(
+                    tokens, precursor_mass, precursor_mz, annotated
+                )
+                if window is not None:
+                    charges[i] = window[0]
+                    continue
+            pmc = self._pmc_decode(
+                logits[i], precursor_mass, precursor_mz, annotated
+            )
             if pmc is not None:
-                sequences[i], scores[i] = pmc
+                sequences[i], scores[i], charges[i] = pmc
 
         predictions = []
         for filename, scan, charge, prec_mz, tokens, confs in zip(
             batch["peak_file"],
             batch["scan_id"],
-            batch["precursor_charge"],
+            charges,
             batch["precursor_mz"],
             sequences,
             scores,

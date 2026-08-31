@@ -264,6 +264,7 @@ def _get_config_file(file_path, file_name, additional_cfg=None):
     cfg = {
         "precursor_mass_tol": 50,
         "isotope_error_range": [0, 1],
+        "charge_range": None,
         "min_peptide_len": 6,
         "max_peptide_len": 100,
         "predict_batch_size": 1024,

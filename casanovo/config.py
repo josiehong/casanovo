@@ -31,6 +31,7 @@ _config_deprecated = dict(
 # user config to list every key).
 _config_optional = frozenset(
     {
+        "charge_range",
         "muon_lr",
         "muon_momentum",
         "resume_training",
@@ -65,6 +66,7 @@ class Config:
     _config_types = dict(
         precursor_mass_tol=float,
         isotope_error_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
+        charge_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
         min_peptide_len=int,
         max_peptide_len=int,
         predict_batch_size=int,

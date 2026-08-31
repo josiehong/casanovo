@@ -474,6 +474,7 @@ class ModelRunner:
         model_params = dict(
             precursor_mass_tol=self.config.precursor_mass_tol,
             isotope_error_range=self.config.isotope_error_range,
+            charge_range=self.config.charge_range,
             min_peptide_len=self.config.min_peptide_len,
             max_peptide_len=self.config.max_peptide_len,
             top_match=self.config.top_match,
@@ -504,6 +505,7 @@ class ModelRunner:
         loaded_model_params = dict(
             precursor_mass_tol=self.config.precursor_mass_tol,
             isotope_error_range=self.config.isotope_error_range,
+            charge_range=self.config.charge_range,
             min_peptide_len=self.config.min_peptide_len,
             max_peptide_len=self.config.max_peptide_len,
             top_match=self.config.top_match,

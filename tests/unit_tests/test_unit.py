@@ -1878,18 +1878,81 @@ def test_pmc_decode():
         masses[aa_k] + masses[aa_a] + masses[aa_e]
     ).item() + 18.010565
 
-    tokens, confs = model._pmc_decode(logits, precursor_mass)
+    tokens, confs, _ = model._pmc_decode(logits, precursor_mass)
     assert tokens == [aa_k, aa_a, aa_e]
     assert len(confs) == len(tokens)
     assert model._fits_precursor_mass(tokens, precursor_mass)
     assert not model._fits_precursor_mass(greedy, precursor_mass)
 
     # An observed precursor mass off by one isotope is still matched.
-    tokens, _ = model._pmc_decode(logits, precursor_mass + 1.00335)
+    tokens, _, _ = model._pmc_decode(logits, precursor_mass + 1.00335)
     assert tokens == [aa_k, aa_a, aa_e]
 
     # No path can reach an infeasible precursor mass.
     assert model._pmc_decode(logits, 5_000.0) is None
+
+
+def test_pmc_decode_charge_range():
+    """A wrong annotated charge is recoverable via ``charge_range``."""
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=1,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    )
+    idx = tokenizer.index
+    aa_k, aa_g, aa_a, aa_e = idx["K"], idx["G"], idx["A"], idx["E"]
+
+    logits = torch.full((4, model.vocab_size), -10.0)
+    logits[0, aa_k] = 5.0
+    logits[1, aa_g] = 5.0
+    logits[1, aa_a] = 4.9
+    logits[2, aa_e] = 5.0
+    logits[3, model.blank_token] = 5.0
+
+    masses = model.token_masses
+    true_mass = (masses[aa_k] + masses[aa_a] + masses[aa_e]).item() + 18.010565
+    # The spectrum is really 2+, but is annotated 3+. The m/z is the one
+    # the instrument observed; the neutral mass implied by the wrong
+    # charge is not the peptide's.
+    true_charge, annotated_charge = 2, 3
+    precursor_mz = true_mass / true_charge + 1.007276
+    wrong_mass = (precursor_mz - 1.007276) * annotated_charge
+    assert not model._fits_precursor_mass([aa_k, aa_a, aa_e], wrong_mass)
+
+    # Trusting the annotation (the default), the peptide is unreachable.
+    assert model.charge_range is None
+    assert (
+        model._pmc_decode(logits, wrong_mass, precursor_mz, annotated_charge)
+        is None
+    )
+
+    # Allowing 2-6 recovers it, and reports the charge it matched under
+    # rather than the annotated one.
+    model.charge_range = (2, 6)
+    tokens, confs, charge = model._pmc_decode(
+        logits, wrong_mass, precursor_mz, annotated_charge
+    )
+    assert tokens == [aa_k, aa_a, aa_e]
+    assert len(confs) == len(tokens)
+    assert charge == true_charge
+
+    # A range that excludes the true charge does not.
+    model.charge_range = (4, 6)
+    assert (
+        model._pmc_decode(logits, wrong_mass, precursor_mz, annotated_charge)
+        is None
+    )
+
+    # Without an m/z there is nothing to recompute the mass from, so the
+    # range is inert and the annotated charge stands.
+    model.charge_range = (2, 6)
+    assert model._pmc_decode(logits, wrong_mass) is None
 
 
 def _pmc_model():
@@ -1929,7 +1992,7 @@ def test_pmc_decode_nterm_mod():
         masses[aa_k] + masses[aa_g] + masses[nterm]
     ).item() + 18.010565
 
-    tokens, confs = model._pmc_decode(logits, precursor_mass)
+    tokens, confs, _ = model._pmc_decode(logits, precursor_mass)
     assert tokens == [aa_k, aa_g, nterm]
     assert len(confs) == len(tokens)
     assert model._fits_precursor_mass(tokens, precursor_mass)
@@ -1961,7 +2024,7 @@ def test_pmc_decode_all_nterm_mods():
             masses[aa_k] + masses[aa_g] + masses[nterm]
         ).item() + 18.010565
 
-        tokens, _ = model._pmc_decode(logits, precursor_mass)
+        tokens, _, _ = model._pmc_decode(logits, precursor_mass)
         assert tokens == [aa_k, aa_g, nterm], label
         assert model._fits_precursor_mass(tokens, precursor_mass), label
         # Still rejected at the wrong end, negative mass or not.
@@ -1991,7 +2054,7 @@ def test_pmc_decode_coarse_resolution(monkeypatch):
     # A budget this small cannot hold the 0.01 Da grid; decoding should
     # coarsen the grid instead of giving up on mass control.
     monkeypatch.setattr(denovo.model, "PMC_MAX_POINTER_BYTES", 50_000)
-    tokens, _ = model._pmc_decode(logits, precursor_mass)
+    tokens, _, _ = model._pmc_decode(logits, precursor_mass)
     assert tokens == [aa_k, aa_a, aa_e]
     assert model._fits_precursor_mass(tokens, precursor_mass)
 

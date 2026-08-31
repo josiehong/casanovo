@@ -15,6 +15,11 @@
 # database search: Select candidate peptides within the specified precursor m/z
 # tolerance.
 # Set to "inf" (with quotation marks) to disable the filter entirely.
+# That is also how precise mass control (PMC) is turned off: an infinite
+# tolerance makes every peptide satisfy the mass check, so predict_step
+# short-circuits and never calls the knapsack DP. There is deliberately no
+# separate PMC switch -- a run either constrains the precursor mass or it
+# does not, and this is the one setting that says which.
 precursor_mass_tol: 50  # ppm
 # Isotopes to consider when comparing predicted and observed precursor m/z's.
 isotope_error_range: [0, 1]

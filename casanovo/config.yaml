@@ -22,7 +22,14 @@
 # does not, and this is the one setting that says which.
 precursor_mass_tol: 50  # ppm
 # Isotopes to consider when comparing predicted and observed precursor m/z's.
-isotope_error_range: [0, 1]
+# [0, 3] rather than the upstream [0, 1]. On the 2026-08-18 multienzyme eval,
+# 217 of the 245 peptides PMC turned from correct to wrong had their precursor
+# picked at the +2 isotope peak, and a further 1.6% of test spectra sit exactly
+# +3 neutrons above their ground truth (large peptides, median 3.6 kDa). Under
+# a narrower range the true peptide falls outside every mass window the search
+# can reach. Widening costs almost nothing: the DP table is sized by the iso=0
+# window, so only the readout scans the extra bands.
+isotope_error_range: [0, 3]
 # The minimum length of considered peptides.
 min_peptide_len: 6
 # The maximum length of considered peptides.
@@ -88,9 +95,9 @@ random_seed: 454
 # Logging frequency in training steps.
 n_log: 1
 # Whether to create Tensorboard directory.
-tb_summarywriter: false
+tb_summarywriter: true
 # Whether to create csv_logs directory.
-log_metrics: false
+log_metrics: true
 # How often to log optimizer parameters in steps.
 log_every_n_steps: 50
 # Path to save Lance instances.
@@ -131,7 +138,7 @@ dim_intensity:
 # The number of iterations for the linear warm-up of the learning rate.
 warmup_iters: 100_000
 # The number of iterations for the cosine half period of the learning rate.
-cosine_schedule_period_iters: 600_000
+cosine_schedule_period_iters: 1_800_000
 # Learning rate for the auxiliary AdamW parameter group (embeddings, output
 # head, biases, and normalization parameters).
 learning_rate: 5e-4
@@ -139,14 +146,16 @@ learning_rate: 5e-4
 weight_decay: 1e-5
 # Learning rate for the Muon parameter group (hidden weight matrices). Muon
 # updates have unit RMS, so this is on a different scale than learning_rate.
-muon_lr: 0.02
+muon_lr: 0.002
 # Momentum for the Muon parameter group.
 muon_momentum: 0.95
 # Self-conditioned CTC: decoder layers (1-based) after which the model scores
 # its own hidden states and feeds that prediction into the next layer, so
 # positions are no longer predicted independently. Empty disables it and the
-# decoder is then identical to plain CTC. E.g. [2, 4] on a 9-layer decoder.
-self_cond_layers: []
+# decoder is then identical to plain CTC. Placement follows the paper's
+# spacing rule floor(k*L/(K+1)), which for L=9 layers and K=4 points gives
+# [1, 3, 5, 7].
+self_cond_layers: [1, 3, 5, 7]
 # Share of the training loss carried by those intermediate predictions; the
 # final layer carries the rest. Ignored when self_cond_layers is empty.
 self_cond_weight: 0.5
@@ -157,7 +166,7 @@ train_label_smoothing: 0.01
 # Number of spectra in one training batch.
 train_batch_size: 32
 # Max number of training epochs.
-max_epochs: 30
+max_epochs: 22
 # Continue the run a checkpoint came from instead of loading only its
 # weights: optimizer and scheduler state, the step count, and the training
 # hyperparameters (learning rates, schedule, loss weights, ...) all come from
@@ -178,10 +187,10 @@ calculate_precision: false
 # Accumulates gradients over `k` batches before stepping the optimizer.
 accumulate_grad_batches: 1
 # The value at which to clip gradients. `None` disables gradient clipping.
-gradient_clip_val:
+gradient_clip_val: 2.0
 # The gradient clipping algorithm to use.
 # Must be one of: "value", "norm", or `None`.
-gradient_clip_algorithm:
+gradient_clip_algorithm: "norm"
 # Floating point precision.
 # Must be one of: "16-true", "16-mixed", "bf16-true", "bf16-mixed", "32-true",
 # "64-true", "64", "32", "16", or "bf16".
@@ -190,7 +199,7 @@ precision: "32-true"
 # Replace I by L in peptide sequences.
 replace_isoleucine_with_leucine: true
 # MassIVE-KB style tokenizer, otherwise ProForma syntax.
-massivekb_tokenizer: false
+massivekb_tokenizer: true
 
 # AMINO ACID AND MODIFICATION VOCABULARY
 residues:

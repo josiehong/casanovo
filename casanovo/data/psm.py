@@ -1,9 +1,13 @@
 """Peptide spectrum match dataclass."""
 
 import dataclasses
+import logging
 from typing import Iterable, Optional, Tuple
 
 import spectrum_utils.proforma
+
+
+logger = logging.getLogger("casanovo")
 
 
 @dataclasses.dataclass
@@ -98,10 +102,23 @@ class PepSpecMatch:
             The parsed ProForma object representing the current peptide sequence
         """
         if self._proteoform_sequence != self.sequence:
+            try:
+                self._cache_proteoform = spectrum_utils.proforma.parse(
+                    self.sequence
+                )[0]
+            except Exception as e:
+                logger.error(
+                    "ProForma parse failed for sequence %r "
+                    "(spectrum_id=%s): %s",
+                    self.sequence,
+                    self.spectrum_id,
+                    e,
+                )
+                raise
+            # Only update the cache key after a successful parse so that a
+            # parse exception cannot leave _cache_proteoform as None while
+            # _proteoform_sequence already equals self.sequence.
             self._proteoform_sequence = self.sequence
-            self._cache_proteoform = spectrum_utils.proforma.parse(
-                self.sequence
-            )[0]
 
         return self._cache_proteoform
 

@@ -38,11 +38,21 @@ isotope_error_range: [0, 3]
 # and the charge it matched is the one reported for the PSM. A wide range
 # costs decoding time and memory, and can force a coarser mass grid on heavy
 # precursors, so keep it near the charges the instrument actually produces.
-charge_range:
+charge_range: [1, 4]
 # The minimum length of considered peptides.
 min_peptide_len: 6
-# The maximum length of considered peptides.
+# The maximum length of considered peptides. This is also the number of
+# decoder frames the CTC objective aligns one peptide to. Chimeric mode gives
+# each of its two peptides this many frames, so the decoder runs twice as wide
+# rather than each peptide getting half as much room.
 max_peptide_len: 100
+# Sequence the two co-fragmented peptides of a chimeric spectrum, one in each
+# half of the decoder frames, instead of a single peptide across all of them.
+# Training annotations are then written "PEP1:PEP2", and a spectrum annotated
+# with one peptide trains the second half to stay empty. Needs charge_range
+# set: the two co-isolated precursors rarely share the annotated charge, so
+# each half has to find its own.
+chimera: true
 # Number of spectra in one inference batch.
 predict_batch_size: 1024
 # Number of PSMs for each spectrum.

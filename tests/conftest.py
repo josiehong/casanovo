@@ -16,6 +16,74 @@ def mgf_small(tmp_path):
 
 
 @pytest.fixture
+def mgf_chimera(tmp_path):
+    """An MGF file with two chimeric spectra and one single-peptide one.
+
+    A chimeric entry carries both peptides in its SEQ line, separated by
+    ":", and the peaks of both. Its precursor is the first peptide's, as
+    the instrument would have recorded whichever it isolated on.
+    """
+    pairs = [
+        ("LESLIEK", "PEPTIDEK"),
+        ("EDITHR", "SAMPLERK"),
+        ("LESLIEK", None),
+    ]
+    mgf_file = tmp_path / "chimera.mgf"
+    entries = [
+        _create_chimeric_mgf_entry(first, second, i)
+        for i, (first, second) in enumerate(pairs)
+    ]
+    with mgf_file.open("w+") as mgf_ref:
+        mgf_ref.write("\n".join(entries))
+    return mgf_file
+
+
+def _create_chimeric_mgf_entry(first, second, title, charge=2):
+    """
+    Create an MGF entry holding one or two co-fragmented peptides.
+
+    Parameters
+    ----------
+    first : str
+        The peptide the precursor was recorded for.
+    second : str or None
+        The co-isolated peptide, or None for an ordinary spectrum.
+    title : int
+        The spectrum title.
+    charge : int, optional
+        The precursor charge state.
+
+    Returns
+    -------
+    str
+        The entry in MGF format.
+    """
+    mzs, intensities = _peptide_to_peaks(first, charge)
+    mzs, intensities = list(mzs), list(intensities)
+    if second is not None:
+        other_mzs, other_intensities = _peptide_to_peaks(second, charge)
+        mzs += list(other_mzs)
+        intensities += list(other_intensities)
+        order = np.argsort(mzs)
+        mzs = [mzs[i] for i in order]
+        intensities = [intensities[i] for i in order]
+
+    frags = "\n".join(f"{m} {i}" for m, i in zip(mzs, intensities))
+    sequence = first if second is None else f"{first}:{second}"
+    return "\n".join(
+        [
+            "BEGIN IONS",
+            f"TITLE={title}",
+            f"SEQ={sequence}",
+            f"PEPMASS={fast_mass(first, charge=int(charge))}",
+            f"CHARGE={charge}+",
+            frags,
+            "END IONS",
+        ]
+    )
+
+
+@pytest.fixture
 def tiny_fasta_file(tmp_path):
     fasta_file = tmp_path / "tiny_fasta.fasta"
     with fasta_file.open("w+") as fasta_ref:
@@ -267,6 +335,9 @@ def _get_config_file(file_path, file_name, additional_cfg=None):
         "charge_range": None,
         "min_peptide_len": 6,
         "max_peptide_len": 100,
+        # Off by default so these tests keep covering the single-peptide
+        # model. The chimeric path has its own config and tests.
+        "chimera": False,
         "predict_batch_size": 1024,
         "top_match": 1,
         "accelerator": "cpu",
@@ -366,6 +437,20 @@ def _get_config_file(file_path, file_name, additional_cfg=None):
 def tiny_config(tmp_path):
     """A config file for a tiny model."""
     return _get_config_file(tmp_path, "config.yml")
+
+
+@pytest.fixture
+def tiny_config_chimera(tmp_path):
+    """A config file for a tiny chimeric model.
+
+    Chimeric decoding needs a charge range: the two co-isolated precursors
+    rarely share the annotated charge, so each slot has to find its own.
+    """
+    return _get_config_file(
+        tmp_path,
+        "config_chimera.yml",
+        additional_cfg={"chimera": True, "charge_range": [1, 4]},
+    )
 
 
 @pytest.fixture

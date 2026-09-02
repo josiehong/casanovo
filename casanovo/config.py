@@ -32,6 +32,7 @@ _config_deprecated = dict(
 _config_optional = frozenset(
     {
         "charge_range",
+        "chimera",
         "muon_lr",
         "muon_momentum",
         "resume_training",
@@ -69,6 +70,7 @@ class Config:
         charge_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
         min_peptide_len=int,
         max_peptide_len=int,
+        chimera=bool,
         predict_batch_size=int,
         top_match=int,
         accelerator=str,

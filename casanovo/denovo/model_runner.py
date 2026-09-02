@@ -21,9 +21,11 @@ from torch.utils.data import DataLoader
 from .. import utils
 from ..config import Config
 from ..data import db_utils, ms_io
+from ..denovo.chimera import ChimeraTokenizer, MskbChimeraTokenizer
 from ..denovo.dataloaders import DeNovoDataModule
 from ..denovo.evaluate import aa_match_batch, aa_match_metrics
 from ..denovo.model import DbSpec2Pep, Spec2Pep
+
 
 logger = logging.getLogger("casanovo")
 
@@ -431,7 +433,16 @@ class ModelRunner:
 
     def initialize_tokenizer(self) -> None:
         """Initialize the peptide tokenizer."""
-        if self.config.massivekb_tokenizer:
+        # The chimera tokenizers differ only in splitting a "PEP1:PEP2"
+        # annotation into its two peptides. They add no residue, so the
+        # alphabet and the vocabulary are the same either way.
+        if self.config.chimera:
+            tokenizer_clss = (
+                MskbChimeraTokenizer
+                if self.config.massivekb_tokenizer
+                else ChimeraTokenizer
+            )
+        elif self.config.massivekb_tokenizer:
             tokenizer_clss = MskbPeptideTokenizer
         else:
             tokenizer_clss = PeptideTokenizer
@@ -477,6 +488,7 @@ class ModelRunner:
             charge_range=self.config.charge_range,
             min_peptide_len=self.config.min_peptide_len,
             max_peptide_len=self.config.max_peptide_len,
+            chimera=self.config.chimera,
             top_match=self.config.top_match,
             n_beams=self.config.n_beams,
             n_log=self.config.n_log,
@@ -508,6 +520,7 @@ class ModelRunner:
             charge_range=self.config.charge_range,
             min_peptide_len=self.config.min_peptide_len,
             max_peptide_len=self.config.max_peptide_len,
+            chimera=self.config.chimera,
             top_match=self.config.top_match,
             n_beams=self.config.n_beams,
             n_log=self.config.n_log,

@@ -215,8 +215,16 @@ class DeNovoDataModule(pl.LightningDataModule):
             annotations="seq",
         )
 
+        # Imported here rather than at module scope because `chimera` imports
+        # `AnnotatedSpectrumDataset` from this module.
+        from .chimera import ChimeraAnnotatedSpectrumDataset, ChimeraTokenizer
+
         if annotated:
-            Dataset, params = AnnotatedSpectrumDataset, anno_dataset_params
+            params = anno_dataset_params
+            if isinstance(self.tokenizer, ChimeraTokenizer):
+                Dataset = ChimeraAnnotatedSpectrumDataset
+            else:
+                Dataset = AnnotatedSpectrumDataset
         else:
             Dataset, params = SpectrumDataset, dataset_params
 

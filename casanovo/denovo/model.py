@@ -128,6 +128,10 @@ class Spec2Pep(pl.LightningModule):
         This is expensive.
     tokenizer: PeptideTokenizer | None
         Tokenizer object to process peptide sequences.
+    chimera : bool
+        Sequence two co-fragmented peptides per spectrum, one in each half
+        of the decoder frames, instead of a single peptide across all of
+        them.
     **kwargs : Dict
         Additional keyword arguments for the optimizer: ``muon_lr`` and
         ``muon_momentum`` configure the Muon parameter group; the rest
@@ -157,6 +161,7 @@ class Spec2Pep(pl.LightningModule):
         out_writer: Optional[ms_io.MztabWriter] = None,
         calculate_precision: bool = False,
         tokenizer: PeptideTokenizer | None = None,
+        chimera: bool = False,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -195,6 +200,12 @@ class Spec2Pep(pl.LightningModule):
         self.ctc_loss = torch.nn.CTCLoss(
             blank=self.blank_token, zero_infinity=True
         )
+        # Chimeric training needs the loss of each spectrum on its own, to
+        # pick the better of the two ways to assign the peptides to the
+        # slots before reducing over the batch.
+        self.ctc_loss_per_seq = torch.nn.CTCLoss(
+            blank=self.blank_token, zero_infinity=True, reduction="none"
+        )
         self._ctc_infeasible_warned = False
         self._pmc_size_warned = False
         # Optimizer settings.
@@ -225,6 +236,22 @@ class Spec2Pep(pl.LightningModule):
         self.n_beams = n_beams
         self.top_match = top_match
         self.stop_token = self.tokenizer.stop_int
+
+        # Chimeric sequencing: the decoder frames are split into two slots,
+        # one peptide each, instead of carrying a single peptide. Each slot
+        # gets a full `max_peptide_len` frames, so that setting keeps meaning
+        # the longest peptide the model can emit and the decoder simply runs
+        # twice as wide. The decoder prepends a global precursor token, so
+        # slot A is everything before `chimera_split`, one frame longer than
+        # slot B, which is everything from it on.
+        #
+        # Splitting the frames rather than marking the boundary with a
+        # separator residue keeps the alphabet, and so the mass axis PMC
+        # searches, identical to single-peptide sequencing, and lets PMC run
+        # per slot with no changes.
+        self.chimera = chimera
+        self.n_decoder_frames = self.max_peptide_len * (2 if chimera else 1)
+        self.chimera_split = 1 + self.max_peptide_len
 
         # Logging.
         self.calculate_precision = calculate_precision
@@ -361,9 +388,10 @@ class Spec2Pep(pl.LightningModule):
         memories, mem_masks = self.encoder(mzs, ints)
 
         # Decode a fixed number of frames; the CTC loss aligns them to
-        # the (shorter) ground truth peptide.
+        # the (shorter) ground truth peptide. Chimeric sequencing decodes
+        # two peptides, so it needs twice the frames.
         zero_tokens = torch.zeros(
-            (mzs.shape[0], self.max_peptide_len),
+            (mzs.shape[0], self.n_decoder_frames),
             dtype=torch.long,
             device=self.device,
         )
@@ -417,31 +445,11 @@ class Spec2Pep(pl.LightningModule):
             batch, return_intermediates=True
         )
 
-        log_probs = pred.log_softmax(-1).transpose(0, 1)  # (T, B, V)
-        input_lengths = torch.full(
-            (truth.shape[0],),
-            log_probs.shape[0],
-            dtype=torch.long,
-            device=truth.device,
-        )
-        target_lengths = (truth != 0).sum(dim=1)
-        # CTC needs one frame per token plus a blank between repeated
-        # tokens; longer peptides are unalignable and get zero loss
-        # (zero_infinity), so warn that they do not contribute.
-        repeats = ((truth[:, 1:] == truth[:, :-1]) & (truth[:, 1:] != 0)).sum(
-            dim=1
-        )
-        infeasible = target_lengths + repeats > input_lengths
-        if infeasible.any() and not self._ctc_infeasible_warned:
-            self._ctc_infeasible_warned = True
-            logger.warning(
-                "%d peptide(s) in this batch need more CTC frames than "
-                "max_peptide_len + 1 = %d and will contribute zero loss. "
-                "Increase max_peptide_len to include them in training.",
-                infeasible.sum().item(),
-                self.max_peptide_len + 1,
-            )
-        loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
+        if self.chimera:
+            loss, aux = self._chimera_loss(pred, intermediates, batch)
+        else:
+            loss, aux = self._single_loss(pred, intermediates, truth)
+
         # The final layer's CTC loss is what gets logged as `*_CTCLoss`, so it
         # stays comparable with runs that predate self-conditioning and keeps
         # driving best-checkpoint selection. The combined objective below is
@@ -456,21 +464,7 @@ class Spec2Pep(pl.LightningModule):
             sync_dist=True,
             batch_size=truth.shape[0],
         )
-        if intermediates:
-            # Self-conditioned CTC: the same objective on each conditioning
-            # layer's own prediction, so those layers are trained to say
-            # something worth feeding forward.
-            aux = torch.stack(
-                [
-                    self.ctc_loss(
-                        scores.log_softmax(-1).transpose(0, 1),
-                        truth,
-                        input_lengths,
-                        target_lengths,
-                    )
-                    for scores in intermediates
-                ]
-            ).mean()
+        if aux is not None:
             loss = (1 - self.self_cond_weight) * loss + (
                 self.self_cond_weight * aux
             )
@@ -487,6 +481,195 @@ class Spec2Pep(pl.LightningModule):
                     batch_size=truth.shape[0],
                 )
         return loss
+
+    def _ctc_per_spectrum(
+        self,
+        scores: torch.Tensor,
+        truth: torch.Tensor,
+        target_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        The unnormalized CTC loss of each spectrum.
+
+        Parameters
+        ----------
+        scores : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The frame-level scores to align against the targets.
+        truth : torch.Tensor of shape (n_spectra, max_len)
+            The padded target token indices.
+        target_lengths : torch.Tensor of shape (n_spectra,)
+            The number of real tokens in each target.
+
+        Returns
+        -------
+        torch.Tensor of shape (n_spectra,)
+            The loss of each spectrum, not divided by its target length.
+        """
+        log_probs = scores.log_softmax(-1).transpose(0, 1)  # (T, B, V)
+        input_lengths = torch.full(
+            (truth.shape[0],),
+            log_probs.shape[0],
+            dtype=torch.long,
+            device=truth.device,
+        )
+        return self.ctc_loss_per_seq(
+            log_probs, truth, input_lengths, target_lengths
+        )
+
+    def _warn_if_infeasible(
+        self,
+        truth: torch.Tensor,
+        target_lengths: torch.Tensor,
+        n_frames: int,
+    ) -> None:
+        """
+        Warn once if any target needs more frames than it is given.
+
+        CTC needs one frame per token plus a blank between repeated tokens.
+        A longer peptide is unalignable and gets zero loss (``zero_infinity``),
+        so it silently drops out of training.
+
+        Parameters
+        ----------
+        truth : torch.Tensor of shape (n_spectra, max_len)
+            The padded target token indices.
+        target_lengths : torch.Tensor of shape (n_spectra,)
+            The number of real tokens in each target.
+        n_frames : int
+            The frames available to align them to.
+        """
+        if self._ctc_infeasible_warned or truth.shape[1] < 2:
+            return
+        repeats = ((truth[:, 1:] == truth[:, :-1]) & (truth[:, 1:] != 0)).sum(
+            dim=1
+        )
+        infeasible = target_lengths + repeats > n_frames
+        if infeasible.any():
+            self._ctc_infeasible_warned = True
+            logger.warning(
+                "%d peptide(s) in this batch need more CTC frames than the "
+                "%d available and will contribute zero loss. Increase "
+                "max_peptide_len to include them in training.",
+                infeasible.sum().item(),
+                n_frames,
+            )
+
+    def _single_loss(
+        self,
+        pred: torch.Tensor,
+        intermediates: List[torch.Tensor],
+        truth: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        The CTC loss of one peptide spanning all of the decoder frames.
+
+        Parameters
+        ----------
+        pred : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The final layer's frame-level scores.
+        intermediates : List[torch.Tensor]
+            The self-conditioning layers' own scores, if any.
+        truth : torch.Tensor of shape (n_spectra, max_len)
+            The padded target token indices.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, Optional[torch.Tensor]]
+            The final layer's loss, and the mean loss over the
+            self-conditioning layers or None when there are none.
+        """
+        target_lengths = (truth != 0).sum(dim=1)
+        self._warn_if_infeasible(truth, target_lengths, pred.shape[1])
+
+        def reduce(scores):
+            per_spectrum = self._ctc_per_spectrum(
+                scores, truth, target_lengths
+            )
+            # Reproduces CTCLoss(reduction="mean"), which divides each
+            # spectrum by its target length before averaging.
+            return (per_spectrum / target_lengths.clamp(min=1)).mean()
+
+        loss = reduce(pred)
+        if not intermediates:
+            return loss, None
+        # Self-conditioned CTC: the same objective on each conditioning
+        # layer's own prediction, so those layers are trained to say
+        # something worth feeding forward.
+        aux = torch.stack([reduce(scores) for scores in intermediates]).mean()
+        return loss, aux
+
+    def _chimera_loss(
+        self,
+        pred: torch.Tensor,
+        intermediates: List[torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        The CTC loss of two peptides, one per slot of decoder frames.
+
+        Nothing says which peptide belongs in which slot, so both
+        assignments are scored and the cheaper one is kept. Only that
+        assignment contributes gradient. The choice is made once, from the
+        final layer, and reused for every self-conditioning layer: letting
+        each layer pick its own would train them toward conflicting
+        assignments, and a prediction fed forward under one assignment
+        would be read by the next layer under another.
+
+        Parameters
+        ----------
+        pred : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The final layer's frame-level scores.
+        intermediates : List[torch.Tensor]
+            The self-conditioning layers' own scores, if any.
+        batch : Dict[str, torch.Tensor]
+            The batch, holding both targets under ``seq`` and ``seq_2``.
+
+        Returns
+        -------
+        Tuple[torch.Tensor, Optional[torch.Tensor]]
+            The final layer's loss, and the mean loss over the
+            self-conditioning layers or None when there are none.
+        """
+        truth_a = batch["seq"]
+        truth_b = batch["seq_2"].to(truth_a.device)
+        len_a = (truth_a != 0).sum(dim=1)
+        len_b = (truth_b != 0).sum(dim=1)
+
+        slots = (
+            slice(None, self.chimera_split),
+            slice(self.chimera_split, None),
+        )
+        # Either peptide may land in either slot, so both have to fit the
+        # smaller one. Slot A is the longer, by the global precursor frame.
+        narrowest = pred.shape[1] - self.chimera_split
+        for truth, lengths in ((truth_a, len_a), (truth_b, len_b)):
+            self._warn_if_infeasible(truth, lengths, narrowest)
+
+        # Both assignments share the same two targets, so they share this
+        # denominator and it cannot affect which one wins.
+        total_len = (len_a + len_b).clamp(min=1)
+
+        def assignments(scores):
+            slot_a, slot_b = (scores[:, frames] for frames in slots)
+            direct = self._ctc_per_spectrum(
+                slot_a, truth_a, len_a
+            ) + self._ctc_per_spectrum(slot_b, truth_b, len_b)
+            swapped = self._ctc_per_spectrum(
+                slot_a, truth_b, len_b
+            ) + self._ctc_per_spectrum(slot_b, truth_a, len_a)
+            return direct, swapped
+
+        direct, swapped = assignments(pred)
+        swap = swapped < direct
+        loss = (torch.where(swap, swapped, direct) / total_len).mean()
+        if not intermediates:
+            return loss, None
+
+        aux = []
+        for scores in intermediates:
+            direct, swapped = assignments(scores)
+            aux.append((torch.where(swap, swapped, direct) / total_len).mean())
+        return loss, torch.stack(aux).mean()
 
     def validation_step(
         self, batch: Dict[str, torch.Tensor], *args
@@ -519,12 +702,74 @@ class Spec2Pep(pl.LightningModule):
         # FIXME: Remove work around when depthcharge reverse detokenization
         # bug is fixed.
         # peptides_true = self.tokenizer.detokenize(batch["seq"])
-        peptides_true = [
-            "".join(pep)
-            for pep in self.tokenizer.detokenize(batch["seq"], join=False)
-        ]
         logits, _ = self.forward(batch)
-        peptides_pred = [
+        # A chimeric spectrum contributes two pairs, so weight the logged
+        # metrics by the number of spectra rather than the number of pairs.
+        batch_size = batch["seq"].shape[0]
+        if self.chimera:
+            peptides_true, peptides_pred = self._chimera_eval_pairs(
+                batch, logits
+            )
+        else:
+            peptides_true = self._detokenize_targets(batch["seq"])
+            peptides_pred = self._detokenize_decoded(logits)
+        aa_precision, _, pep_precision = evaluate.aa_match_metrics(
+            *evaluate.aa_match_batch(
+                peptides_true, peptides_pred, self.tokenizer.residues
+            )
+        )
+
+        log_args = dict(on_step=False, on_epoch=True, sync_dist=True)
+        self.log(
+            "pep_precision", pep_precision, **log_args, batch_size=batch_size
+        )
+        self.log(
+            "aa_precision", aa_precision, **log_args, batch_size=batch_size
+        )
+        return loss
+
+    def _detokenize_targets(self, truth: torch.Tensor) -> List[str]:
+        """
+        Turn padded target tokens back into peptide strings.
+
+        Parameters
+        ----------
+        truth : torch.Tensor of shape (n_spectra, max_len)
+            The padded target token indices. An all-padding row, which is
+            how an absent second peptide is stored, gives ``""``.
+
+        Returns
+        -------
+        List[str]
+            One peptide string per spectrum.
+        """
+        # An all-padding row has to be held out: depthcharge cannot
+        # detokenize one, just as it cannot tokenize an empty sequence.
+        filled = [i for i, row in enumerate(truth) if (row != 0).any()]
+        peptides = [""] * truth.shape[0]
+        if not filled:
+            return peptides
+        decoded = self.tokenizer.detokenize(truth[filled], join=False)
+        for i, peptide in zip(filled, decoded):
+            peptides[i] = "".join(peptide)
+        return peptides
+
+    def _detokenize_decoded(self, logits: torch.Tensor) -> List[str]:
+        """
+        Greedily decode frames into peptide strings.
+
+        Parameters
+        ----------
+        logits : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The frame-level scores to decode.
+
+        Returns
+        -------
+        List[str]
+            One peptide string per spectrum, ``""`` where nothing was
+            decoded.
+        """
+        return [
             (
                 "".join(
                     self.tokenizer.detokenize(
@@ -536,21 +781,55 @@ class Spec2Pep(pl.LightningModule):
             )
             for tokens in self._ctc_decode(logits)[0]
         ]
-        aa_precision, _, pep_precision = evaluate.aa_match_metrics(
-            *evaluate.aa_match_batch(
-                peptides_true, peptides_pred, self.tokenizer.residues
-            )
-        )
 
-        batch_size = len(peptides_true)
-        log_args = dict(on_step=False, on_epoch=True, sync_dist=True)
-        self.log(
-            "pep_precision", pep_precision, **log_args, batch_size=batch_size
-        )
-        self.log(
-            "aa_precision", aa_precision, **log_args, batch_size=batch_size
-        )
-        return loss
+    def _chimera_eval_pairs(
+        self, batch: Dict[str, torch.Tensor], logits: torch.Tensor
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Pair each spectrum's two truths with its two decoded slots.
+
+        Nothing ties a slot to a particular peptide, so a spectrum whose
+        slots came out in the other order is still correct. Both pairings
+        are tried and the one matching more peptides exactly is kept.
+
+        A spectrum annotated with one peptide has an empty second truth.
+        Those pairs are left out rather than scored against the empty
+        string, which is not a peptide and which the matcher cannot parse.
+
+        Parameters
+        ----------
+        batch : Dict[str, torch.Tensor]
+            The batch, holding both targets under ``seq`` and ``seq_2``.
+        logits : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The frame-level scores for every slot.
+
+        Returns
+        -------
+        Tuple[List[str], List[str]]
+            The true and predicted peptides, aligned pairwise.
+        """
+        truths = [
+            self._detokenize_targets(batch["seq"]),
+            self._detokenize_targets(batch["seq_2"]),
+        ]
+        preds = [
+            self._detokenize_decoded(logits[:, : self.chimera_split]),
+            self._detokenize_decoded(logits[:, self.chimera_split :]),
+        ]
+
+        peptides_true, peptides_pred = [], []
+        for i in range(len(truths[0])):
+            true_pair = [truths[0][i], truths[1][i]]
+            pred_pair = [preds[0][i], preds[1][i]]
+            direct = sum(t == p for t, p in zip(true_pair, pred_pair))
+            swapped = sum(t == p for t, p in zip(true_pair, pred_pair[::-1]))
+            if swapped > direct:
+                pred_pair = pred_pair[::-1]
+            for true_pep, pred_pep in zip(true_pair, pred_pair):
+                if true_pep:
+                    peptides_true.append(true_pep)
+                    peptides_pred.append(pred_pep)
+        return peptides_true, peptides_pred
 
     def _ctc_decode(
         self, logits: torch.Tensor
@@ -1150,15 +1429,69 @@ class Spec2Pep(pl.LightningModule):
             Predicted PSMs for the given batch of spectra.
         """
         logits, _ = self._forward_step(batch)
-        sequences, scores = self._ctc_decode(logits)
-
-        # Precise mass control: when the greedy peptide does not match
-        # the precursor mass, search for the best CTC path that does.
         _, _, precursors, _ = self._process_batch(batch)
-        # The charge each peptide was finally accepted under. With
-        # `charge_range` unset this is always the annotated charge; with
-        # a range set it is the charge whose window the peptide matched,
-        # which is what `calc_mz` has to be computed from downstream.
+
+        if self.chimera:
+            # One peptide per slot of frames. Each slot is a self-contained
+            # single-peptide problem over its own frames, so the mass
+            # constraint applies to it unchanged, and each slot finds its
+            # own charge: two co-isolated precursors rarely share one.
+            slots = [
+                self._decode_frames(
+                    logits[:, : self.chimera_split], precursors
+                ),
+                self._decode_frames(
+                    logits[:, self.chimera_split :], precursors
+                ),
+            ]
+        else:
+            slots = [self._decode_frames(logits, precursors)]
+
+        predictions = []
+        for i, prec_mz in enumerate(batch["precursor_mz"]):
+            spectrum_id = (batch["peak_file"][i], batch["scan_id"][i])
+            exp_mz = float(prec_mz.item())
+            matches = []
+            for sequences, scores, charges in slots:
+                match = self._build_psm(
+                    sequences[i], scores[i], charges[i], spectrum_id, exp_mz
+                )
+                if match is not None:
+                    matches.append(match)
+            if self.chimera:
+                matches = self._select_chimera(matches)
+            predictions.extend(matches)
+
+        return predictions
+
+    def _decode_frames(
+        self, logits: torch.Tensor, precursors: torch.Tensor
+    ) -> Tuple[List[List[int]], List[List[float]], List[int]]:
+        """
+        Decode one peptide per spectrum from a range of frames.
+
+        Greedy CTC decoding, then precise mass control: when the greedy
+        peptide does not match the precursor mass, search for the best CTC
+        path that does.
+
+        Parameters
+        ----------
+        logits : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The frame-level scores to decode. This is every frame for
+            single-peptide sequencing, and one slot's frames for chimeric.
+        precursors : torch.Tensor of shape (n_spectra, 3)
+            The precursor neutral mass, charge, and m/z.
+
+        Returns
+        -------
+        Tuple[List[List[int]], List[List[float]], List[int]]
+            The decoded tokens, their confidences, and the charge each
+            peptide was accepted under. With ``charge_range`` unset that
+            charge is always the annotated one; with a range set it is the
+            charge whose window the peptide matched, which is what
+            ``calc_mz`` has to be computed from downstream.
+        """
+        sequences, scores = self._ctc_decode(logits)
         charges = [int(z) for z in precursors[:, 1].tolist()]
         for i, tokens in enumerate(sequences):
             precursor_mass = precursors[i, 0].item()
@@ -1176,41 +1509,207 @@ class Spec2Pep(pl.LightningModule):
             )
             if pmc is not None:
                 sequences[i], scores[i], charges[i] = pmc
-
-        predictions = []
-        for filename, scan, charge, prec_mz, tokens, confs in zip(
-            batch["peak_file"],
-            batch["scan_id"],
-            charges,
-            batch["precursor_mz"],
-            sequences,
-            scores,
-        ):
-            if not tokens:
-                continue
-
-            peptide = "".join(
-                self.tokenizer.detokenize(torch.tensor([tokens]), join=False)[
-                    0
-                ]
-            )
-            aa_scores = np.array(confs)
-            if self.tokenizer.reverse:
-                aa_scores = aa_scores[::-1]
-
-            predictions.append(
-                psm.PepSpecMatch(
-                    sequence=peptide,
-                    spectrum_id=(filename, scan),
-                    peptide_score=float(aa_scores.mean()),
-                    charge=int(charge),
-                    calc_mz=np.nan,
-                    exp_mz=float(prec_mz.item()),
-                    aa_scores=aa_scores,
+            elif self.chimera and tokens:
+                # No window accepted this peptide, so no charge was chosen
+                # for it. Reporting the annotated charge would be wrong
+                # more often than not: it belongs to whichever precursor
+                # the instrument picked, and this is the other one.
+                charges[i] = self._best_effort_charge(
+                    tokens, precursor_mass, precursor_mz, annotated
                 )
-            )
+        return sequences, scores, charges
 
-        return predictions
+    def _best_effort_charge(
+        self,
+        tokens: List[int],
+        precursor_mass: float,
+        precursor_mz: Optional[float],
+        precursor_charge: Optional[int],
+    ) -> int:
+        """
+        The charge that comes closest to explaining a peptide's mass.
+
+        Used only when no candidate window accepted the peptide, so that a
+        chimeric sub-peptide still gets the most plausible charge rather
+        than the annotated one. Unlike ``_matching_window`` this always
+        returns a charge, however poor the match.
+
+        The candidates and the mass centers are the same ones
+        ``_matching_window`` tests, so this picks the window the peptide
+        came nearest to missing. With ``charge_range`` unset there is only
+        one candidate and the annotated charge comes straight back.
+
+        Parameters
+        ----------
+        tokens : List[int]
+            The decoded token indices.
+        precursor_mass : float
+            The neutral mass implied by the annotated charge.
+        precursor_mz : Optional[float]
+            The observed precursor m/z, needed to consider other charges.
+        precursor_charge : Optional[int]
+            The annotated precursor charge, returned when there is nothing
+            to choose between.
+
+        Returns
+        -------
+        int
+            The best-matching charge.
+        """
+        residue_mass = (
+            self.token_masses[torch.tensor(tokens, dtype=torch.long)]
+            .sum()
+            .item()
+        )
+        best_charge, best_error = precursor_charge, float("inf")
+        for charge, mass in self._precursor_candidates(
+            precursor_mass, precursor_mz, precursor_charge
+        ):
+            for iso in range(
+                self.isotope_error_range[0], self.isotope_error_range[1] + 1
+            ):
+                center = mass - iso * ISOTOPE_SPACING - H2O_MASS
+                # Relative to the candidate's own mass, which is how
+                # `_residue_mass_windows` scales its ppm tolerance.
+                error = abs(residue_mass - center) / max(abs(mass), 1e-9)
+                if error < best_error:
+                    best_charge, best_error = charge, error
+        return int(best_charge if best_charge is not None else 1)
+
+    def _build_psm(
+        self,
+        tokens: List[int],
+        confs: List[float],
+        charge: int,
+        spectrum_id: Tuple[str, str],
+        exp_mz: float,
+    ) -> Optional[psm.PepSpecMatch]:
+        """
+        Assemble one PSM from decoded tokens.
+
+        Parameters
+        ----------
+        tokens : List[int]
+            The decoded token indices.
+        confs : List[float]
+            The confidence of each decoded token.
+        charge : int
+            The charge the peptide was accepted under.
+        spectrum_id : Tuple[str, str]
+            The peak file and scan identifier.
+        exp_mz : float
+            The observed precursor m/z.
+
+        Returns
+        -------
+        Optional[psm.PepSpecMatch]
+            The PSM, or None if nothing was decoded.
+        """
+        if not tokens:
+            return None
+
+        peptide = "".join(
+            self.tokenizer.detokenize(torch.tensor([tokens]), join=False)[0]
+        )
+        aa_scores = np.array(confs)
+        if self.tokenizer.reverse:
+            aa_scores = aa_scores[::-1]
+
+        return psm.PepSpecMatch(
+            sequence=peptide,
+            spectrum_id=spectrum_id,
+            peptide_score=float(aa_scores.mean()),
+            charge=int(charge),
+            calc_mz=np.nan,
+            exp_mz=exp_mz,
+            aa_scores=aa_scores,
+        )
+
+    def _select_chimera(
+        self, matches: List[psm.PepSpecMatch]
+    ) -> List[psm.PepSpecMatch]:
+        """
+        Choose which of a spectrum's slots to report.
+
+        A slot that decoded nothing has already been dropped. Of the rest,
+        discard peptides too short to report and those whose N-terminal
+        modification sits past the start, which is not valid ProForma.
+        Both slots can converge on the same peptide, so keep the
+        higher-scoring copy of any duplicate.
+
+        Parameters
+        ----------
+        matches : List[psm.PepSpecMatch]
+            The PSMs decoded from one spectrum, at most one per slot.
+
+        Returns
+        -------
+        List[psm.PepSpecMatch]
+            The PSMs to report, at most one per slot.
+        """
+        kept, seen = [], set()
+        for match in sorted(
+            matches, key=lambda m: m.peptide_score, reverse=True
+        ):
+            # Checked before the length, which parses the sequence: a
+            # misplaced N-terminal modification is not valid ProForma and
+            # the parser raises on it.
+            if self._has_internal_nterm_mod(match.sequence):
+                continue
+            if self._residue_len(match.sequence) < self.min_peptide_len:
+                continue
+            if match.sequence in seen:
+                continue
+            seen.add(match.sequence)
+            kept.append(match)
+        return kept
+
+    def _residue_len(self, sequence: str) -> int:
+        """
+        The number of amino acid residues in a ProForma sequence.
+
+        Counts residue tokens only; N-terminal modification tokens, which
+        end in ``-``, are excluded.
+
+        Parameters
+        ----------
+        sequence : str
+            The peptide sequence.
+
+        Returns
+        -------
+        int
+            The residue count.
+        """
+        return sum(
+            1
+            for tok in self.tokenizer.split(sequence)
+            if not tok.endswith("-")
+        )
+
+    def _has_internal_nterm_mod(self, sequence: str) -> bool:
+        """
+        Whether an N-terminal modification appears past the start.
+
+        A single leading N-terminal modification is valid; any further
+        occurrence makes the ProForma invalid, as in ``PEP[Acetyl]-TIDE``.
+
+        Parameters
+        ----------
+        sequence : str
+            The peptide sequence.
+
+        Returns
+        -------
+        bool
+            True if a modification sits somewhere it cannot be.
+        """
+        rest = sequence
+        for mod in self.n_term:
+            if rest.startswith(mod):
+                rest = rest[len(mod) :]
+                break
+        return any(mod in rest for mod in self.n_term)
 
     def on_train_epoch_end(self) -> None:
         """

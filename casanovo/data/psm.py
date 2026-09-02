@@ -35,6 +35,12 @@ class PepSpecMatch:
         sequence, where len(aa_scores) == len(sequence).
     protein : str
         Protein associated with the peptide sequence (for db mode).
+    pmc_fallback : Optional[bool]
+        The mass-control verdict for decoders that apply one: False
+        when the decoder accepted this peptide as matching the
+        precursor mass, True when the mass-constrained search found no
+        candidate and the unconstrained answer was passed through, and
+        None for decoders without mass control.
     """
 
     sequence: str
@@ -45,6 +51,7 @@ class PepSpecMatch:
     exp_mz: float
     aa_scores: Iterable[float]
     protein: str = "null"
+    pmc_fallback: Optional[bool] = None
 
     # Private properties to handle proteoform caching
     _proteoform_sequence: Optional[str] = dataclasses.field(

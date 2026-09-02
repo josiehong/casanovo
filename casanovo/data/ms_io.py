@@ -177,6 +177,7 @@ class MztabWriter:
                     "end",
                     "opt_ms_run[1]_aa_scores",
                     "opt_ms_run[1]_proforma",
+                    "opt_ms_run[1]_pmc_fallback",
                 ]
             )
             by_id = operator.attrgetter("spectrum_id")
@@ -216,5 +217,12 @@ class MztabWriter:
                         # opt_ms_run[1]_aa_scores
                         ",".join(list(map("{:.5f}".format, psm.aa_scores))),
                         psm.sequence,  # op_ms_run[1]_proforma
+                        # opt_ms_run[1]_pmc_fallback: the decoder's own
+                        # mass-control verdict; "null" without one.
+                        (
+                            "null"
+                            if psm.pmc_fallback is None
+                            else str(psm.pmc_fallback).lower()
+                        ),
                     ]
                 )

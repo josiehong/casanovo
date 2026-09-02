@@ -1775,12 +1775,16 @@ def test_spectrum_id_mgf(mgf_small, tmp_path):
         data_module.valid_dataset,
         data_module.test_dataset,
     ]:
+        # depthcharge's MgfParser labels spectra "index=<n>", not "<n>"
+        # (parsers.py, MgfParser._parse_spectrum). mzTab output is
+        # unaffected either way: ms_io adds the "index=" prefix itself
+        # when the id is bare, and leaves it alone when it is not.
         for i, (filename, scan_id) in enumerate(
             [
-                (mgf_small, "0"),
-                (mgf_small, "1"),
-                (mgf_small2, "0"),
-                (mgf_small2, "1"),
+                (mgf_small, "index=0"),
+                (mgf_small, "index=1"),
+                (mgf_small2, "index=0"),
+                (mgf_small2, "index=1"),
             ]
         ):
             assert dataset[i]["peak_file"][0] == filename.name
@@ -2089,6 +2093,51 @@ def test_pmc_decode_coarse_resolution(monkeypatch):
     # coarsen the grid instead of giving up on mass control.
     monkeypatch.setattr(denovo.model, "PMC_MAX_POINTER_BYTES", 50_000)
     tokens, _, _ = model._pmc_decode(logits, precursor_mass)
+    assert tokens == [aa_k, aa_a, aa_e]
+    assert model._fits_precursor_mass(tokens, precursor_mass)
+
+
+def test_pmc_decode_near_miss_does_not_shadow_a_match():
+    """A near-isobaric decoy must not cost the spectrum its match.
+
+    The DP rounds each residue onto the mass grid, so the axis is
+    widened by PMC_MASS_GUARD to leave room for the accumulated error.
+    That guard is far wider than the 50 ppm tolerance, so a decoy inside
+    the guard but outside the tolerance also sits in the readout's
+    window. Selecting on the bin alone would take the decoy on score,
+    then reject it on the exact mass and return nothing at all, losing a
+    spectrum that had a perfectly good match one bin over. The states
+    carry their exact masses, so the decoy is never a candidate.
+    """
+    model = _pmc_model()
+    idx = model.tokenizer.index
+    aa_k, aa_q, aa_a, aa_e = idx["K"], idx["Q"], idx["A"], idx["E"]
+
+    masses = model.token_masses
+    # K and Q are 0.0364 Da apart: inside PMC_MASS_GUARD (0.1 Da), well
+    # outside 50 ppm of this precursor (0.017 Da).
+    gap = abs((masses[aa_k] - masses[aa_q]).item())
+    precursor_mass = (
+        masses[aa_k] + masses[aa_a] + masses[aa_e]
+    ).item() + 18.010565
+    tol = 50 * precursor_mass / 1e6
+    assert tol < gap < denovo.model.PMC_MASS_GUARD
+
+    # Q outscores K, so the decoy is the highest-probability path.
+    logits = torch.full((4, model.vocab_size), -10.0)
+    logits[0, aa_q] = 5.0
+    logits[0, aa_k] = 4.9
+    logits[1, aa_a] = 5.0
+    logits[2, aa_e] = 5.0
+    logits[3, model.blank_token] = 5.0
+
+    greedy = model._ctc_decode(logits.unsqueeze(0))[0][0]
+    assert greedy == [aa_q, aa_a, aa_e]
+    assert not model._fits_precursor_mass(greedy, precursor_mass)
+
+    result = model._pmc_decode(logits, precursor_mass)
+    assert result is not None, "the decoy shadowed a real match"
+    tokens, _, _ = result
     assert tokens == [aa_k, aa_a, aa_e]
     assert model._fits_precursor_mass(tokens, precursor_mass)
 

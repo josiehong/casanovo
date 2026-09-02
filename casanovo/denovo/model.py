@@ -35,11 +35,12 @@ H2O_MASS = 18.010565
 ISOTOPE_SPACING = 1.00335
 PROTON_MASS = 1.007276
 # Precise mass control (PMC) decoding settings: the mass discretization
-# step, the widening of the readout windows to absorb accumulated
-# rounding error, a cap on the backtracking table size, and the minimum
-# frame probability for a token to take part in a frame at all (see
-# `_pmc_decode`: it buys roughly 11x, since CTC output is blank-dominated
-# and only a handful of frames per spectrum carry a plausible residue).
+# step, the headroom added to the mass axis so that rounding cannot carry
+# a valid path off the end of it, a cap on the backtracking table size,
+# and the minimum frame probability for a token to take part in a frame
+# at all (see `_pmc_decode`: it buys roughly 11x, since CTC output is
+# blank-dominated and only a handful of frames per spectrum carry a
+# plausible residue).
 PMC_RESOLUTION = 0.01
 PMC_MASS_GUARD = 0.1
 PMC_MAX_POINTER_BYTES = 1_000_000_000
@@ -792,6 +793,16 @@ class Spec2Pep(pl.LightningModule):
         the last symbol is needed to apply the CTC collapse rules
         (a repeated symbol without an intervening blank does not emit).
 
+        Each state also carries the EXACT residue mass of the best path
+        reaching it, and that is what the readout tests. The bins only
+        partition the states. Rounding each residue onto the grid and
+        testing the bin instead would let error accumulate over the
+        emissions until the path the search commits to is one the exact
+        check at the end rejects, losing the spectrum even though a
+        slightly less probable path would have matched. Carrying the
+        mass makes the search and the acceptance the same predicate, so
+        that cannot happen (PrimeNovo's `mass_con.py` does the same).
+
         Stop and padding are excluded from the search, as is any
         non-terminal residue of zero or negative mass (it could repeat
         without bound, which a fixed axis cannot hold). N-terminal
@@ -807,12 +818,15 @@ class Spec2Pep(pl.LightningModule):
 
         The mass grid is discretized at ``PMC_RESOLUTION``, coarsened
         for heavy precursors so that the backtracking table stays under
-        ``PMC_MAX_POINTER_BYTES``. Bin ``zero_bin`` holds zero mass, with
-        the bins below it reserved for the negative excursion. One axis
-        spans every candidate window, so a ``charge_range`` whose upper
-        end is well above the annotated charge stretches the axis in
-        proportion and can trip that coarsening on spectra where the
-        annotated charge alone would not have.
+        ``PMC_MAX_POINTER_BYTES``. Since the bins only separate states, a
+        coarser grid costs recall rather than correctness: near-equal
+        masses come to share a state, and only the more probable of them
+        survives. Bin ``zero_bin`` holds zero mass, with the bins below
+        it reserved for the negative excursion. One axis spans every
+        candidate window, so a ``charge_range`` whose upper end is well
+        above the annotated charge stretches the axis in proportion and
+        can trip that coarsening on spectra where the annotated charge
+        alone would not have.
 
         Parameters
         ----------
@@ -847,11 +861,12 @@ class Spec2Pep(pl.LightningModule):
         # Mass discretization. The pointer table is the memory
         # bottleneck, so pick the finest resolution whose table fits in
         # PMC_MAX_POINTER_BYTES rather than giving up on mass control
-        # for heavy precursors. A coarser grid only widens the candidate
-        # set: the exact, non-discretized mass is verified before a path
-        # is accepted. The readout guard absorbs accumulated rounding
-        # error, which grows with the resolution and with the number of
-        # emissions, and reduces to PMC_MASS_GUARD at the default.
+        # for heavy precursors. The guard widens the AXIS, not the
+        # acceptance test: a path whose exact mass is in tolerance can
+        # still have its bin carried off the window edge by accumulated
+        # rounding, and needs somewhere to live when it is. That error
+        # grows with the resolution and the number of emissions, and the
+        # guard reduces to PMC_MASS_GUARD at the default resolution.
         candidates = self._precursor_candidates(
             precursor_mass, precursor_mz, precursor_charge
         )
@@ -870,8 +885,12 @@ class Spec2Pep(pl.LightningModule):
         max_bins = max(4, PMC_MAX_POINTER_BYTES // (n_frames * vocab))
         resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
         guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
-        windows = self._residue_mass_windows(candidates, guard)
-        hi_max = max(hi for _, _, hi in windows)
+        axis_windows = self._residue_mass_windows(candidates, guard)
+        hi_max = max(hi for _, _, hi in axis_windows)
+        # What the readout accepts: the true windows, unguarded. The
+        # states carry exact masses, so this is the same predicate
+        # `_matching_window` applies to the finished peptide.
+        accept_windows = self._residue_mass_windows(candidates)
         # Negative-mass tokens (the ammonia-loss N-terminal modification)
         # push the running total below zero, so the axis starts below it.
         # Only N-terminal modifications may be negative and only one may be
@@ -924,6 +943,9 @@ class Spec2Pep(pl.LightningModule):
         emit_idx = torch.tensor(emit_tokens, device=device)
         emit_i8 = emit_idx.unsqueeze(1).to(torch.int8)
         delta_idx = torch.tensor(emit_deltas, device=device)
+        # The unrounded masses, added to the running total alongside the
+        # rounded ones that move the state along the axis.
+        emit_exact = self.token_masses[emit_idx]
 
         # Per-token mass shifts as gather indices over the mass axis:
         # src_bins[e, m] = m - delta_e. A negative delta moves the source
@@ -947,6 +969,14 @@ class Spec2Pep(pl.LightningModule):
         # discretized emitted mass m and last symbol c.
         score = torch.full((n_bins, vocab), neg_inf, device=device)
         score[zero_bin, blank] = 0.0
+        # state_mass[m, c]: the exact residue mass of that same best
+        # prefix, accumulated from the unrounded token masses. NaN marks
+        # a state no path has reached; it compares false against every
+        # window, so an unreachable state can never be read out.
+        state_mass = torch.full(
+            (n_bins, vocab), float("nan"), dtype=torch.float64, device=device
+        )
+        state_mass[zero_bin, blank] = 0.0
         # pointers[t, m, c]: last symbol of the predecessor state; a
         # pointer equal to c itself encodes a repeat (no new emission).
         # Kept on the model device; backtracking reads single entries.
@@ -978,17 +1008,27 @@ class Spec2Pep(pl.LightningModule):
             new_ptr = torch.full(
                 (n_bins, vocab), -1, dtype=torch.int8, device=device
             )
+            new_mass = torch.full_like(state_mass, float("nan"))
             if sel.numel() == 0:
                 # Blank-only frame: every state transitions to blank.
                 best, best_arg = score.max(dim=1)
                 new_score[:, blank] = best + lp[blank]
                 new_ptr[:, blank] = best_arg.to(torch.int8)
+                # A blank emits nothing, so the mass rides along.
+                new_mass[:, blank] = state_mass.gather(
+                    1, best_arg.unsqueeze(1)
+                ).squeeze(1)
                 score = new_score
+                state_mass = new_mass
                 pointers[t] = new_ptr
                 continue
             top2 = score.topk(2, dim=1)
             best, best_arg = top2.values[:, 0], top2.indices[:, 0]
             second, second_arg = top2.values[:, 1], top2.indices[:, 1]
+            # The blank column's predecessor mass; the emission columns
+            # read theirs off `emit_arg` below, which already names the
+            # predecessor the score chose.
+            mass_best = state_mass.gather(1, best_arg.unsqueeze(1)).squeeze(1)
             sel_tokens = emit_idx[sel]
             # Best predecessor excluding each candidate token itself,
             # shifted by that token's mass: a new emission of token e at
@@ -1006,10 +1046,18 @@ class Spec2Pep(pl.LightningModule):
             ].unsqueeze(1)
             emit_val = emit_val.masked_fill(~valid[sel], neg_inf)
             emit_arg = excl_arg.gather(1, src_bins[sel])
+            # The exact mass follows the same predecessor the score does
+            # -- state (src_bins, emit_arg) -- gaining the unrounded
+            # residue mass rather than its bin.
+            emit_mass = state_mass.view(-1)[
+                src_bins[sel] * vocab + emit_arg
+            ] + emit_exact[sel].unsqueeze(1)
             # Continue the current run: no new emission.
             repeat = score[:, sel_tokens].T + lp[sel_tokens].unsqueeze(1)
+            repeat_mass = state_mass[:, sel_tokens].T
             use_emit = emit_val > repeat
             emit_score = torch.where(use_emit, emit_val, repeat)
+            emit_state_mass = torch.where(use_emit, emit_mass, repeat_mass)
             emit_ptr = torch.where(
                 use_emit,
                 emit_arg.to(torch.int8),
@@ -1018,19 +1066,26 @@ class Spec2Pep(pl.LightningModule):
             # Blank keeps the mass and may follow any symbol.
             new_score[:, blank] = best + lp[blank]
             new_ptr[:, blank] = best_arg.to(torch.int8)
+            new_mass[:, blank] = mass_best
             new_score[:, sel_tokens] = emit_score.T
             new_ptr[:, sel_tokens] = emit_ptr.T
+            new_mass[:, sel_tokens] = emit_state_mass.T
             score = new_score
+            state_mass = new_mass
             pointers[t] = new_ptr
 
-        # Read out the best final state within any mass window.
-        mass_axis = (
-            torch.arange(n_bins, device=device) - zero_bin
-        ) * resolution
-        allowed = torch.zeros(n_bins, dtype=torch.bool, device=device)
-        for _, lo, hi in windows:
-            allowed |= (mass_axis >= lo) & (mass_axis <= hi)
-        score[~allowed] = neg_inf
+        # Read out the best final state whose EXACT mass is in tolerance.
+        # Testing the carried mass rather than the bin the state sits in
+        # is what keeps accumulated rounding out of the decision: a state
+        # is a candidate only if the peptide it stands for really does
+        # match the precursor. The search can no longer commit to a path
+        # that the check below then throws away, which used to lose the
+        # spectrum outright even when a slightly less probable path in a
+        # neighbouring bin would have matched.
+        allowed = torch.zeros_like(score, dtype=torch.bool)
+        for _, lo, hi in accept_windows:
+            allowed |= (state_mass >= lo) & (state_mass <= hi)
+        score = score.masked_fill(~allowed, neg_inf)
         best_val, flat_idx = score.flatten().max(dim=0)
         if not torch.isfinite(best_val):
             return None
@@ -1061,9 +1116,11 @@ class Spec2Pep(pl.LightningModule):
             # tokens in the tokenizer's own order.
             tokens.reverse()
             confs.reverse()
-        # Verify the exact (non-discretized) mass before accepting. The
-        # DP ran on one axis covering every candidate window, so this is
-        # also what decides which charge the path actually matched.
+        # Which charge the path matched. The DP ran on one axis covering
+        # every candidate window, so the window has to be recovered here.
+        # This re-checks the mass, but on a path already selected for
+        # having an exact mass in tolerance it now agrees by
+        # construction, up to the last bit of the summation order.
         if not tokens:
             return None
         window = self._matching_window(

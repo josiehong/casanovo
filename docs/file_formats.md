@@ -282,6 +282,21 @@ END IONS
 In case the peptide sequence includes PTMs, ensure that these are formatted correctly and match the amino acid and modification vocabulary in the Casanovo configuration.
 ```
 
+### Chimeric spectra
+
+When the `chimera` configuration option is enabled, a spectrum may be annotated with the two peptides that were co-isolated into it, written in the `SEQ` line and separated by a colon:
+
+```
+SEQ=LESLIEK:PEPTIDEK
+```
+
+A spectrum annotated with a single peptide is written as usual, with no colon, and trains the model to leave the second peptide empty.
+The colon is not part of the amino acid vocabulary and is never predicted; it only ever appears in the annotation file.
+A colon inside a modification, as in `M[UNIMOD:35]`, is not treated as a separator.
+
+Predictions for a chimeric spectrum are written to the mzTab as two rows sharing one `spectra_ref`.
+The two peptides generally carry different charges, so each is assigned its own, which is why chimeric mode requires the `charge_range` option to be set.
+
 mzML or mzXML files are not supported as input during training, as these formats do not provide a mechanism to annotate their spectra with peptide sequences.
 Similarly, in Casanovo evaluation mode only annotated MGF files are supported.
 

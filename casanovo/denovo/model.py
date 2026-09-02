@@ -1003,23 +1003,34 @@ class Spec2Pep(pl.LightningModule):
 
         # Precise mass control: when the greedy peptide does not match
         # the precursor mass, search for the best CTC path that does.
+        # The verdict is recorded per spectrum and written to the
+        # opt_ms_run[1]_pmc_fallback column, so analyses read the
+        # decoder's own accept/fallback decision instead of recomputing
+        # the window test and disagreeing with it at the boundary by a
+        # float32 rounding hair.
         _, _, precursors, _ = self._process_batch(batch)
+        fits = []
         for i, tokens in enumerate(sequences):
             precursor_mass = precursors[i, 0].item()
             if tokens and self._fits_precursor_mass(tokens, precursor_mass):
+                fits.append(True)
                 continue
             pmc = self._pmc_decode(logits[i], precursor_mass)
             if pmc is not None:
                 sequences[i], scores[i] = pmc
+                fits.append(True)
+            else:
+                fits.append(False)
 
         predictions = []
-        for filename, scan, charge, prec_mz, tokens, confs in zip(
+        for filename, scan, charge, prec_mz, tokens, confs, fit in zip(
             batch["peak_file"],
             batch["scan_id"],
             batch["precursor_charge"],
             batch["precursor_mz"],
             sequences,
             scores,
+            fits,
         ):
             if not tokens:
                 continue
@@ -1042,6 +1053,7 @@ class Spec2Pep(pl.LightningModule):
                     calc_mz=np.nan,
                     exp_mz=float(prec_mz.item()),
                     aa_scores=aa_scores,
+                    pmc_fallback=not fit,
                 )
             )
 

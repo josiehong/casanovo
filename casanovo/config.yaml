@@ -45,7 +45,7 @@ min_peptide_len: 6
 # decoder frames the CTC objective aligns one peptide to. Chimeric mode gives
 # each of its two peptides this many frames, so the decoder runs twice as wide
 # rather than each peptide getting half as much room.
-max_peptide_len: 100
+max_peptide_len: 60
 # Sequence the two co-fragmented peptides of a chimeric spectrum, one in each
 # half of the decoder frames, instead of a single peptide across all of them.
 # Training annotations are then written "PEP1:PEP2", and a spectrum annotated

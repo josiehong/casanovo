@@ -615,6 +615,10 @@ class Spec2Pep(pl.LightningModule):
         assignments, and a prediction fed forward under one assignment
         would be read by the next layer under another.
 
+        A slot the annotation leaves empty contributes nothing, so the
+        model is never trained to stay silent in it. See the comment on
+        ``present_a`` below for why.
+
         Parameters
         ----------
         pred : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
@@ -649,14 +653,34 @@ class Spec2Pep(pl.LightningModule):
         # denominator and it cannot affect which one wins.
         total_len = (len_a + len_b).clamp(min=1)
 
+        # A slot whose target is empty contributes nothing. CTC scores an
+        # empty target as the cost of emitting blanks across that slot,
+        # which trains it silent, and an annotation naming one peptide is
+        # not evidence that the spectrum held one: co-isolation is common
+        # and the annotation records only what was identified. Penalising
+        # the slot teaches the model to suppress the second peptides this
+        # branch exists to find. Zeroing the term zeroes its gradient too,
+        # so the slot is simply free.
+        #
+        # The minimum stays permutation-invariant. A single-peptide
+        # spectrum scores min(ctc(slot A, pep), ctc(slot B, pep)), so the
+        # labelled peptide goes to whichever slot explains it better and
+        # the free prediction takes the other; neither slot is privileged.
+        # Leaving the empty terms in would let them tip that choice, and
+        # they are not even symmetric, since slot A carries one more frame.
+        present_a = (len_a > 0).to(pred.dtype)
+        present_b = (len_b > 0).to(pred.dtype)
+
         def assignments(scores):
             slot_a, slot_b = (scores[:, frames] for frames in slots)
-            direct = self._ctc_per_spectrum(
-                slot_a, truth_a, len_a
-            ) + self._ctc_per_spectrum(slot_b, truth_b, len_b)
-            swapped = self._ctc_per_spectrum(
-                slot_a, truth_b, len_b
-            ) + self._ctc_per_spectrum(slot_b, truth_a, len_a)
+            direct = (
+                self._ctc_per_spectrum(slot_a, truth_a, len_a) * present_a
+                + self._ctc_per_spectrum(slot_b, truth_b, len_b) * present_b
+            )
+            swapped = (
+                self._ctc_per_spectrum(slot_a, truth_b, len_b) * present_b
+                + self._ctc_per_spectrum(slot_b, truth_a, len_a) * present_a
+            )
             return direct, swapped
 
         direct, swapped = assignments(pred)

@@ -206,16 +206,71 @@ def test_chimera_loss_takes_the_better_assignment():
     assert loss <= (swapped / denominator).mean()
 
 
-def test_chimera_loss_with_an_empty_slot():
-    """A spectrum with one peptide trains the other slot to stay empty."""
-    model = _model()
-    truth_a = model.tokenizer.tokenize(["PEPTIDEK"], add_stop=True)
-    empty = torch.zeros((1, 1), dtype=torch.long)
+def _one_labelled_peptide(model):
+    """A batch of one spectrum whose annotation names a single peptide."""
     torch.manual_seed(0)
-    pred = torch.randn(1, model.n_decoder_frames + 1, model.vocab_size)
+    return (
+        model.tokenizer.tokenize(["PEPTIDEK"], add_stop=True),
+        torch.zeros((1, 1), dtype=torch.long),
+        torch.randn(1, model.n_decoder_frames + 1, model.vocab_size),
+    )
 
-    loss, _ = model._chimera_loss(pred, [], {"seq": truth_a, "seq_2": empty})
-    assert torch.isfinite(loss)
+
+def test_an_unlabelled_slot_is_free():
+    """A slot the annotation leaves empty costs nothing.
+
+    An annotation naming one peptide is not evidence that the spectrum
+    held one, so charging the model for speaking in the other slot would
+    train it to suppress the second peptides this model exists to find.
+    """
+    model = _model()
+    peptide, empty, pred = _one_labelled_peptide(model)
+
+    loss, _ = model._chimera_loss(pred, [], {"seq": peptide, "seq_2": empty})
+
+    # The loss is the labelled peptide alone, in whichever slot fits it
+    # better; the empty slot adds nothing.
+    length = (peptide != 0).sum(dim=1)
+    slots = [
+        model._ctc_per_spectrum(pred[:, sl], peptide, length) / length
+        for sl in (
+            slice(None, model.chimera_split),
+            slice(model.chimera_split, None),
+        )
+    ]
+    assert torch.allclose(loss, torch.minimum(*slots).mean())
+
+
+def test_the_free_slot_gets_no_gradient():
+    """Nothing propagates back through the unlabelled slot."""
+    model = _model()
+    peptide, empty, pred = _one_labelled_peptide(model)
+    pred.requires_grad_(True)
+
+    loss, _ = model._chimera_loss(pred, [], {"seq": peptide, "seq_2": empty})
+    loss.backward()
+
+    frames = (
+        pred.grad[:, : model.chimera_split],
+        pred.grad[:, model.chimera_split :],
+    )
+    # One slot carries the labelled peptide, the other is free.
+    assert sum(g.abs().sum().item() == 0 for g in frames) == 1
+
+
+def test_an_unlabelled_slot_keeps_the_loss_symmetric():
+    """Either slot may hold the labelled peptide.
+
+    Leaving the empty terms in would let them tip that choice, and they
+    are not symmetric: slot A carries the extra global precursor frame.
+    """
+    model = _model()
+    peptide, empty, pred = _one_labelled_peptide(model)
+
+    first, _ = model._chimera_loss(pred, [], {"seq": peptide, "seq_2": empty})
+    second, _ = model._chimera_loss(pred, [], {"seq": empty, "seq_2": peptide})
+
+    assert torch.allclose(first, second)
 
 
 def test_intermediates_reuse_the_final_assignment():

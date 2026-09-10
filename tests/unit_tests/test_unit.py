@@ -38,6 +38,10 @@ from casanovo.denovo.model import (
     _calc_match_score,
     _peptide_score,
 )
+from casanovo.denovo.transformers import (
+    PeptideDecoder,
+    fold_self_attention,
+)
 
 
 def test_forward_reverse():
@@ -2719,3 +2723,119 @@ def test_db_spec2pep_forward_no_cache(tiny_config):
 
     # Assert that the non-cached path was taken
     db_model._forward_step.assert_called_once()
+
+
+
+@pytest.mark.parametrize("self_cond_layers", [(), (1, 3)])
+def test_broadcast_matches_masked_attention(self_cond_layers):
+    """The broadcast Linear reproduces the attention it replaces.
+
+    Under the key padding mask depthcharge infers for a NAR decoder every
+    query sees only the global token, so self-attention returns
+    ``out_proj(v_proj(x_0))`` everywhere. Checked against
+    `nn.MultiheadAttention` under that mask, so neither form can drift
+    from the other unnoticed.
+    """
+    torch.manual_seed(0)
+    dim, heads, layers, frames, batch, peaks = 64, 8, 4, 12, 3, 7
+    states = torch.randn(batch, frames + 1, dim)
+
+    # The mask embed() infers: every frame hidden, the global token kept.
+    key_padding_mask = torch.ones(batch, frames + 1, dtype=torch.bool)
+    key_padding_mask[:, 0] = False
+
+    attention = torch.nn.MultiheadAttention(dim, heads, batch_first=True)
+    attention.eval()
+    with torch.no_grad():
+        attended, _ = attention(
+            states,
+            states,
+            states,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+    folded = fold_self_attention(
+        {f"l.self_attn.{k}": v for k, v in attention.state_dict().items()}
+    )
+    broadcast = torch.nn.Linear(dim, dim)
+    broadcast.load_state_dict(
+        {
+            "weight": folded["l.broadcast.weight"],
+            "bias": folded["l.broadcast.bias"],
+        }
+    )
+    with torch.no_grad():
+        assert torch.allclose(
+            attended, broadcast(states[:, :1]).expand_as(attended), atol=1e-5
+        )
+
+    decoder = PeptideDecoder(
+        n_tokens=10,
+        d_model=dim,
+        n_head=heads,
+        n_layers=layers,
+        dim_feedforward=64,
+        dropout=0.0,
+        padding_int=0,
+        self_cond_layers=self_cond_layers,
+    ).eval()
+    memory = torch.randn(batch, peaks, dim)
+    memory_mask = torch.zeros(batch, peaks, dtype=torch.bool)
+    precursors = torch.tensor(
+        [[500.0, 2.0, 251.0], [800.0, 3.0, 268.0], [1200.0, 4.0, 301.0]]
+    )
+
+    def decode(n_frames):
+        tokens = torch.zeros((batch, n_frames), dtype=torch.long)
+        with torch.no_grad():
+            if self_cond_layers:
+                return decoder.forward_self_conditioned(
+                    tokens,
+                    precursors,
+                    memory=memory,
+                    memory_key_padding_mask=memory_mask,
+                )[0]
+            return decoder(
+                tokens,
+                precursors,
+                memory=memory,
+                memory_key_padding_mask=memory_mask,
+            )
+
+    # Frames still cannot read one another, so lengthening the budget
+    # leaves the positions that were already there alone.
+    short = decode(frames)
+    long = decode(frames * 2)
+    assert torch.allclose(short, long[:, : short.shape[1]], atol=1e-6)
+
+
+def test_folded_checkpoint_loads():
+    """A state dict from the attention form loads after folding."""
+    torch.manual_seed(0)
+    shape = dict(
+        n_tokens=10,
+        d_model=64,
+        n_head=8,
+        n_layers=3,
+        dim_feedforward=64,
+        dropout=0.0,
+        padding_int=0,
+    )
+    decoder = PeptideDecoder(**shape)
+    saved = {
+        key: value
+        for key, value in decoder.state_dict().items()
+        if ".broadcast." not in key
+    }
+    # Stand in for a checkpoint predating this layer.
+    attention = torch.nn.MultiheadAttention(64, 8, batch_first=True)
+    for depth in range(shape["n_layers"]):
+        prefix = f"transformer_decoder.layers.{depth}.self_attn"
+        for key, value in attention.state_dict().items():
+            saved[f"{prefix}.{key}"] = value.clone()
+
+    loaded = PeptideDecoder(**shape)
+    loaded.load_state_dict(fold_self_attention(saved), strict=True)
+    assert not any(
+        ".self_attn." in key for key in loaded.state_dict()
+    ), "self_attn should be gone from the broadcast form"

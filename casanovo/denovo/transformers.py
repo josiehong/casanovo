@@ -11,6 +11,106 @@ from depthcharge.transformers import (
 )
 
 
+class PrecursorBroadcastDecoderLayer(torch.nn.Module):
+    """A decoder layer whose self-attention is a precursor broadcast.
+
+    The NAR decoder feeds token id 0 at every frame and `padding_idx` is
+    0, so every frame embeds to zero and depthcharge's `embed` infers a
+    key padding mask hiding all of them, sparing only the global token at
+    position 0. One visible key makes the softmax exactly one-hot, so the
+    self-attention block returns ``out_proj(v_proj(x_0))`` at every
+    position, whatever the scores are.
+
+    Two affine maps in a row are one affine map, so that whole sublayer
+    is a single Linear applied to position 0 and broadcast. The query and
+    key projections are gone: a saturated softmax ignores their output
+    and hands them no gradient.
+
+    `fold_self_attention` converts a checkpoint from the attention form.
+    """
+
+    def __init__(self, d_model, n_head, dim_feedforward, dropout):
+        super().__init__()
+        self.broadcast = torch.nn.Linear(d_model, d_model)
+        self.cross_attn = torch.nn.MultiheadAttention(
+            d_model, n_head, dropout=dropout, batch_first=True
+        )
+        self.feed_forward = torch.nn.Sequential(
+            torch.nn.Linear(d_model, dim_feedforward),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(dim_feedforward, d_model),
+        )
+        self.norms = torch.nn.ModuleList(
+            torch.nn.LayerNorm(d_model) for _ in range(3)
+        )
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x, memory, memory_key_padding_mask=None):
+        """Broadcast, cross-attend, feed forward; post-norm throughout."""
+        x = self.norms[0](x + self.dropout(self.broadcast(x[:, :1])))
+        attended = self.cross_attn(
+            x,
+            memory,
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )[0]
+        x = self.norms[1](x + self.dropout(attended))
+        return self.norms[2](x + self.dropout(self.feed_forward(x)))
+
+
+def fold_self_attention(state_dict):
+    """Rewrite attention-form decoder weights into broadcast form.
+
+    ``out_proj(v_proj(x))`` folds into one Linear; the query and key
+    projections are dropped, having only ever fed a saturated softmax.
+    The rest of the layer is renamed to match this module.
+
+    Parameters
+    ----------
+    state_dict : dict
+        A state dict saved before this layer existed.
+
+    Returns
+    -------
+    dict
+        The same weights under this module's names.
+    """
+    renames = {
+        # A ModuleList has no `.layers` level.
+        "transformer_decoder.layers.": "transformer_decoder.",
+        ".multihead_attn.": ".cross_attn.",
+        ".linear1.": ".feed_forward.0.",
+        ".linear2.": ".feed_forward.3.",
+        ".norm1.": ".norms.0.",
+        ".norm2.": ".norms.1.",
+        ".norm3.": ".norms.2.",
+    }
+
+    def rename(key):
+        for old, new in renames.items():
+            key = key.replace(old, new)
+        return key
+
+    folded = {}
+    for key, value in state_dict.items():
+        if ".self_attn." not in key:
+            folded[rename(key)] = value
+        elif key.endswith(".self_attn.out_proj.weight"):
+            attn = key[: -len(".out_proj.weight")]
+            layer = rename(attn[: -len(".self_attn")])
+            dim = value.shape[0]
+            folded[f"{layer}.broadcast.weight"] = (
+                value @ state_dict[f"{attn}.in_proj_weight"][2 * dim:]
+            )
+            folded[f"{layer}.broadcast.bias"] = (
+                value @ state_dict[f"{attn}.in_proj_bias"][2 * dim:]
+                + state_dict[f"{attn}.out_proj.bias"]
+            )
+    return folded
+
+
 class PeptideDecoder(AnalyteTransformerDecoder):
     """
     A transformer decoder for peptide sequences.
@@ -70,6 +170,15 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             padding_int=padding_int,
         )
 
+        # Replaces the base class's stack. `fold_self_attention` converts
+        # a checkpoint saved before this layer existed.
+        self.transformer_decoder = torch.nn.ModuleList(
+            PrecursorBroadcastDecoderLayer(
+                d_model, n_head, dim_feedforward, dropout
+            )
+            for _ in range(n_layers)
+        )
+
         self.charge_encoder = torch.nn.Embedding(max_charge, d_model)
         self.mass_encoder = FloatEncoder(d_model)
 
@@ -97,6 +206,40 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         else:
             self.cond_proj = None
 
+    def _input_sequence(self, tokens, *args, **kwargs):
+        """Frame embeddings, the global token prepended, positions added."""
+        if tokens is None:
+            tokens = torch.tensor([[]]).to(self.device)
+        encoded = self.token_encoder(tokens)
+        global_token = self.global_token_hook(tokens, *args, **kwargs)
+        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
+        return self.positional_encoder(encoded)
+
+    def embed(
+        self,
+        tokens: torch.Tensor | None,
+        *args: torch.Tensor,
+        memory: torch.Tensor | None,
+        memory_key_padding_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        tgt_mask: torch.Tensor | None = None,
+        **kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        Run the stack and return the hidden states.
+
+        Overrides the base class, which infers a target key padding mask
+        from the embedding values. That heuristic is written for
+        autoregressive decoding, where a zero row really is padding; here
+        every frame is one by construction. No target mask is built,
+        because none can change a broadcast, and `tgt_mask` is accepted
+        only to keep the base class's signature.
+        """
+        encoded = self._input_sequence(tokens, *args, **kwargs)
+        for layer in self.transformer_decoder:
+            encoded = layer(encoded, memory, memory_key_padding_mask)
+        return encoded
+
     def forward_self_conditioned(
         self,
         tokens: torch.Tensor | None,
@@ -113,16 +256,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         after each layer in ``self_cond_layers`` the hidden states are
         scored with the same output layer the model already has, and that
         prediction is projected back to model space and added to the
-        states before the next layer runs. Positions are therefore no
-        longer predicted independently of one another, at the cost of one
-        auxiliary loss per conditioning layer during training and nothing
-        at inference.
-
-        This has to open up the layer stack rather than call
-        ``transformer_decoder`` in one shot, so it repeats the input
-        preparation from ``embed``. The masks are built the same way,
-        including the all-False target mask that makes attention
-        non-causal.
+        states before the next layer runs.
 
         Returns
         -------
@@ -133,41 +267,14 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             CTC losses. Empty when self-conditioning is off, in which
             case the scores match ``forward`` exactly.
         """
-        if tokens is None:
-            tokens = torch.tensor([[]]).to(self.device)
-
-        encoded = self.token_encoder(tokens)
-        global_token = self.global_token_hook(tokens, *args, **kwargs)
-        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-
-        tgt_key_padding_mask = encoded.sum(axis=2) == 0
-        tgt_key_padding_mask[:, 0] = False
-        encoded = self.positional_encoder(encoded)
-
-        # Non-causal attention, as in `embed` above: every frame sees
-        # every other frame.
-        length = encoded.shape[1]
-        tgt_mask = torch.zeros(
-            (length, length), dtype=torch.bool, device=encoded.device
-        )
-
+        encoded = self._input_sequence(tokens, *args, **kwargs)
         intermediates = []
-        for depth, layer in enumerate(self.transformer_decoder.layers, 1):
-            encoded = layer(
-                encoded,
-                memory,
-                tgt_mask=tgt_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_mask=memory_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )
+        for depth, layer in enumerate(self.transformer_decoder, 1):
+            encoded = layer(encoded, memory, memory_key_padding_mask)
             if depth in self.self_cond_layers:
                 scores = self.final(encoded)
                 intermediates.append(scores)
                 encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
-
-        if self.transformer_decoder.norm is not None:
-            encoded = self.transformer_decoder.norm(encoded)
         return self.final(encoded), intermediates
 
     def global_token_hook(
@@ -202,41 +309,6 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         charges = self.charge_encoder(precursors[:, 1].int() - 1)
         precursors = masses + charges
         return precursors
-
-    def embed(
-        self,
-        tokens: torch.Tensor | None,
-        *args: torch.Tensor,
-        memory: torch.Tensor | None,
-        memory_key_padding_mask: torch.Tensor | None = None,
-        memory_mask: torch.Tensor | None = None,
-        tgt_mask: torch.Tensor | None = None,
-        **kwargs: dict,
-    ) -> torch.Tensor:
-        """
-        Force full (non-causal) target attention by supplying an all-False
-        tgt_mask to the superclass, unless a tgt_mask was explicitly passed.
-        """
-
-        # Handle tokens==None like the base class
-        if tokens is None:
-            tokens = torch.tensor([[]]).to(self.device)
-
-        # length after adding global token
-        L = tokens.shape[1] + 1
-
-        # all-False bool mask (full attention)
-        tgt_mask = torch.zeros((L, L), dtype=torch.bool, device=tokens.device)
-
-        return super().embed(
-            tokens,
-            *args,
-            memory=memory,
-            memory_key_padding_mask=memory_key_padding_mask,
-            memory_mask=memory_mask,
-            tgt_mask=tgt_mask,
-            **kwargs,
-        )
 
 
 class SpectrumEncoder(SpectrumTransformerEncoder):

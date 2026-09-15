@@ -224,6 +224,27 @@ def test_frames_attend_to_each_other(self_cond_layers):
     )
 
 
+def test_decoder_input_is_blank():
+    """Every decoder frame is fed the CTC blank, from a row of its own."""
+    model = _model(max_peptide_len=8, n_layers=2).eval()
+    token_encoder = model.decoder.token_encoder
+    # Input and output number the blank alike.
+    assert token_encoder.num_embeddings == model.vocab_size
+    assert model.decoder.final.out_features == model.vocab_size
+
+    fed = []
+    token_encoder.register_forward_hook(
+        lambda module, args, output: fed.append(args[0])
+    )
+    with torch.no_grad():
+        model._forward_step(_spectrum_batch())
+
+    assert fed[0].shape[1] == model.n_decoder_frames
+    assert (fed[0] == model.blank_token).all()
+    # A learned vector, not the frozen zero row of padding.
+    assert token_encoder.weight[model.blank_token].abs().sum() > 0
+
+
 def test_frames_scale_with_chimera():
     """Each slot gets a full max_peptide_len frames."""
     single = _model(chimera=False)

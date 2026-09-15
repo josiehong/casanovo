@@ -387,24 +387,25 @@ class Spec2Pep(pl.LightningModule):
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
 
-        # Decode a fixed number of frames; the CTC loss aligns them to
-        # the (shorter) ground truth peptide. Chimeric sequencing decodes
-        # two peptides, so it needs twice the frames.
-        zero_tokens = torch.zeros(
+        # Decode a fixed number of frames, each fed the CTC blank; the CTC
+        # loss aligns them to the (shorter) ground truth peptide. Chimeric
+        # sequencing decodes two peptides, so it needs twice the frames.
+        blank_tokens = torch.full(
             (mzs.shape[0], self.n_decoder_frames),
+            self.blank_token,
             dtype=torch.long,
             device=self.device,
         )
         if self.self_cond_layers or return_intermediates:
             scores, intermediates = self.decoder.forward_self_conditioned(
-                tokens=zero_tokens,
+                tokens=blank_tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
                 precursors=precursors,
             )
         else:
             scores = self.decoder(
-                tokens=zero_tokens,
+                tokens=blank_tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
                 precursors=precursors,

@@ -73,11 +73,17 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         self.charge_encoder = torch.nn.Embedding(max_charge, d_model)
         self.mass_encoder = FloatEncoder(d_model)
 
-        # Override the output layer with one class beyond the token
-        # embeddings (which include padding at index 0): the last index
-        # serves as the dedicated CTC blank class.
+        # One embedding row and one output class beyond the tokenizer's
+        # (which include padding at index 0), at the same index: the
+        # dedicated CTC blank. Every frame is fed the blank, and a frame
+        # predicts it wherever it emits nothing.
+        self.token_encoder = torch.nn.Embedding(
+            self.token_encoder.num_embeddings + 1,
+            d_model,
+            padding_idx=self._padding_int,
+        )
         self.final = torch.nn.Linear(
-            d_model, self.token_encoder.num_embeddings + 1
+            d_model, self.token_encoder.num_embeddings
         )
 
         # Self-conditioning: the layers after which this decoder scores its
@@ -218,10 +224,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         ``tgt_mask`` is all False, so every frame sees every other frame.
         ``tgt_key_padding_mask`` is None, which is why this reimplements
         the superclass rather than delegating to it: the superclass infers
-        padding as ``encoded.sum(axis=2) == 0``, and every frame here is
-        fed token id 0, ``padding_idx``, whose embedding is zero. That
-        marked every frame as padding, so no frame could attend to
-        another. No frame is padding.
+        padding as ``encoded.sum(axis=2) == 0``, which marked every frame
+        as padding when frames were fed token id 0, ``padding_idx``. Every
+        frame is now fed the CTC blank, and no frame is padding.
         """
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)

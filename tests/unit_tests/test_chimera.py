@@ -583,3 +583,34 @@ def test_chimeric_data_and_prediction(
     runner.model.on_predict_batch_end(psms)
     assert len(runner.model.out_writer.psms) == len(psms)
     assert all(np.isfinite(p.calc_mz) for p in runner.model.out_writer.psms)
+
+
+def test_chimera_curriculum(
+    tmp_path, mgf_chimera_curriculum, tiny_config_chimera
+):
+    """Epoch k puts k chimeric spectra in every batch, up to the cap."""
+    config = Config(tiny_config_chimera)
+    config.n_layers = 1
+    config.dim_model = 32
+    config.dim_feedforward = 32
+    config.train_batch_size = 4
+    config.chimera_curriculum = 2
+    config.lance_dir = str(tmp_path / "lance")
+
+    runner = ModelRunner(config=config, output_dir=tmp_path)
+    runner.initialize_trainer(train=True)
+    runner.initialize_tokenizer()
+    runner.initialize_model(train=True)
+    mgf = str(mgf_chimera_curriculum)
+    runner.initialize_data_module([mgf], [mgf])
+    runner.loaders.setup()
+
+    for epoch, expected in ((0, 1), (1, 2), (5, 2)):
+        runner.loaders.train_dataset.epoch_fn = lambda epoch=epoch: epoch
+        batches = list(runner.loaders.train_dataloader())
+        n_chimeric = [int((b["seq_2"] != 0).any(dim=1).sum()) for b in batches]
+        assert n_chimeric == [expected] * len(batches)
+        # Every single-peptide spectrum once per epoch; chimeric ones cycle.
+        assert sum(len(b["seq"]) for b in batches) - sum(n_chimeric) == 6
+
+    assert torch.isfinite(runner.model.training_step(batches[0]))

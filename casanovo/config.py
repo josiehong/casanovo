@@ -33,6 +33,7 @@ _config_optional = frozenset(
     {
         "charge_range",
         "chimera",
+        "chimera_curriculum",
         "muon_lr",
         "muon_momentum",
         "resume_training",
@@ -71,6 +72,7 @@ class Config:
         min_peptide_len=int,
         max_peptide_len=int,
         chimera=bool,
+        chimera_curriculum=int,
         predict_batch_size=int,
         top_match=int,
         accelerator=str,

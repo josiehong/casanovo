@@ -679,6 +679,8 @@ class ModelRunner:
             shuffle_buffer_size=self.config.shuffle_buffer_size,
             n_workers=self.config.n_workers,
             lance_dir=lance_dir,
+            chimera_curriculum=self.config.chimera_curriculum,
+            epoch_fn=lambda: self.trainer.current_epoch,
         )
 
     @staticmethod

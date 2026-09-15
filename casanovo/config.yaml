@@ -53,6 +53,10 @@ max_peptide_len: 60
 # set: the two co-isolated precursors rarely share the annotated charge, so
 # each half has to find its own.
 chimera: true
+# Chimeric curriculum for training: epoch k puts k chimeric spectra in every
+# training batch, up to this many, and fills the rest with single-peptide
+# spectra. Empty trains on the data as it comes.
+chimera_curriculum:
 # Number of spectra in one inference batch.
 predict_batch_size: 1024
 # Number of PSMs for each spectrum.

@@ -4,8 +4,9 @@ import functools
 import logging
 import os
 import pathlib
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
+import lance
 import lightning.pytorch as pl
 import numpy as np
 import pyarrow as pa
@@ -72,6 +73,12 @@ class DeNovoDataModule(pl.LightningDataModule):
     n_workers : int, optional
         The number of workers to use for data loading. By default, the
         number of available CPU cores on the current machine is used.
+    chimera_curriculum : int, optional
+        If set, train with a chimeric curriculum (see
+        ``CurriculumDataset``) holding at most this many chimeric spectra
+        per batch.
+    epoch_fn : Callable[[], int], optional
+        Returns the current 0-based training epoch, for the curriculum.
     """
 
     def __init__(
@@ -93,10 +100,14 @@ class DeNovoDataModule(pl.LightningDataModule):
         shuffle: Optional[bool] = True,
         shuffle_buffer_size: Optional[int] = 10_000,
         n_workers: Optional[int] = None,
+        chimera_curriculum: Optional[int] = None,
+        epoch_fn: Optional[Callable[[], int]] = None,
     ):
         super().__init__()
 
         self.lance_dir = lance_dir
+        self.chimera_curriculum = chimera_curriculum
+        self.epoch_fn = epoch_fn
 
         self.train_paths = train_paths
         self.valid_paths = valid_paths
@@ -148,7 +159,9 @@ class DeNovoDataModule(pl.LightningDataModule):
             test data.
         """
         if stage in (None, "fit", "validate"):
-            if self.train_paths is not None:
+            if self.train_paths is not None and self.chimera_curriculum:
+                self.train_dataset = self._make_curriculum_dataset()
+            elif self.train_paths is not None:
                 self.train_dataset = self._make_dataset(
                     self.train_paths,
                     annotated=True,
@@ -248,6 +261,63 @@ class DeNovoDataModule(pl.LightningDataModule):
 
         return dataset
 
+    def _make_curriculum_dataset(self) -> "CurriculumDataset":
+        """
+        Make the training dataset for the chimeric curriculum.
+
+        The training spectra are parsed once, then read back as two
+        subsets, single-peptide and chimeric, by a filter on the
+        annotation separator.
+
+        Returns
+        -------
+        CurriculumDataset
+            The training dataset.
+        """
+        from .chimera import ChimeraAnnotatedSpectrumDataset
+
+        path = str(
+            self._make_dataset(
+                self.train_paths, annotated=True, mode="train", shuffle=False
+            ).path
+        )
+        separator = self.tokenizer.chimeric_separator_token
+        chimeric = f"seq LIKE '%{separator}%'"
+        # The filter also matches a separator inside a modification such as
+        # "[UNIMOD:35]", so check it against the tokenizer's own split.
+        seqs = lance.dataset(path).to_table(columns=["seq"])["seq"]
+        n_chimeric = sum(
+            bool(self.tokenizer.split_annotation(seq)[1])
+            for seq in seqs.to_pylist()
+        )
+        if lance.dataset(path).count_rows(filter=chimeric) != n_chimeric:
+            raise ValueError(
+                f"Some annotations contain '{separator}' inside a "
+                "modification, so the chimeric curriculum cannot tell "
+                "chimeric spectra apart by filter."
+            )
+
+        def make_subset(is_chimeric, batch_size):
+            subset = ChimeraAnnotatedSpectrumDataset.from_lance(
+                path,
+                annotations="seq",
+                tokenizer=self.tokenizer,
+                batch_size=batch_size,
+                filter=chimeric if is_chimeric else f"NOT ({chimeric})",
+            )
+            if self.shuffle:
+                subset = ShufflerIterDataPipe(
+                    subset, buffer_size=self.shuffle_buffer_size
+                )
+            return subset
+
+        return CurriculumDataset(
+            make_subset,
+            self.train_batch_size,
+            self.chimera_curriculum,
+            self.epoch_fn,
+        )
+
     def _make_loader(
         self, dataset: torch.utils.data.Dataset, shuffle: bool = False
     ) -> torch.utils.data.DataLoader:
@@ -276,7 +346,9 @@ class DeNovoDataModule(pl.LightningDataModule):
 
     def train_dataloader(self) -> torch.utils.data.DataLoader:
         """Get the training DataLoader."""
-        return self._make_loader(self.train_dataset, shuffle=self.shuffle)
+        # The curriculum shuffles inside its subsets.
+        shuffle = None if self.chimera_curriculum else self.shuffle
+        return self._make_loader(self.train_dataset, shuffle=shuffle)
 
     def val_dataloader(self) -> torch.utils.data.DataLoader:
         """Get the validation DataLoader."""
@@ -293,6 +365,103 @@ class DeNovoDataModule(pl.LightningDataModule):
     def db_dataloader(self) -> torch.utils.data.DataLoader:
         """Get a special dataloader for DB search."""
         return self._make_loader(self.test_dataset)
+
+
+class CurriculumDataset(torch.utils.data.IterableDataset):
+    """
+    Training batches whose chimeric share grows by one spectrum per epoch.
+
+    Epoch ``e`` (0-based) puts ``min(e + 1, max_chimeric)`` chimeric
+    spectra in every batch and fills the rest with single-peptide ones.
+    An epoch is one pass over the single-peptide spectra; the chimeric
+    ones are cycled.
+
+    Parameters
+    ----------
+    make_subset : Callable[[bool, int], Iterable[dict]]
+        Builds the chimeric (True) or single-peptide (False) spectra, in
+        batches of the given size.
+    batch_size : int
+        The number of spectra per batch.
+    max_chimeric : int
+        The most chimeric spectra per batch.
+    epoch_fn : Callable[[], int], optional
+        Returns the current 0-based epoch. By default, the passes over
+        this dataset are counted.
+    """
+
+    def __init__(
+        self,
+        make_subset: Callable,
+        batch_size: int,
+        max_chimeric: int,
+        epoch_fn: Optional[Callable[[], int]] = None,
+    ):
+        super().__init__()
+        self.make_subset = make_subset
+        self.batch_size = batch_size
+        self.max_chimeric = max_chimeric
+        self.epoch_fn = epoch_fn
+        self._passes = 0
+
+    def __iter__(self):
+        epoch = self.epoch_fn() if self.epoch_fn is not None else self._passes
+        self._passes += 1
+        n_chimeric = min(epoch + 1, self.max_chimeric, self.batch_size - 1)
+        logger.info(
+            "Epoch %d: %d of %d spectra per batch are chimeric",
+            epoch,
+            n_chimeric,
+            self.batch_size,
+        )
+        chimeric = self._cycle_chimeric(n_chimeric)
+        singles = self.make_subset(False, self.batch_size - n_chimeric)
+        for batch in singles:
+            yield _concat_batches(batch, next(chimeric))
+
+    def _cycle_chimeric(self, batch_size: int):
+        """Yield full batches of chimeric spectra, pass after pass."""
+        while True:
+            full = False
+            for batch in self.make_subset(True, batch_size):
+                # A pass ends in a short batch; skip it to keep the count.
+                if len(batch["seq"]) == batch_size:
+                    full = True
+                    yield batch
+            if not full:
+                raise ValueError(
+                    f"Fewer than {batch_size} chimeric training spectra."
+                )
+
+
+def _concat_batches(first: dict, second: dict) -> dict:
+    """
+    Join two batches, padding 2-D tensors to a common width.
+
+    Parameters
+    ----------
+    first, second : dict
+        Batches with the same keys.
+
+    Returns
+    -------
+    dict
+        The spectra of ``first`` followed by those of ``second``.
+    """
+    batch = {}
+    for key, value in first.items():
+        other = second[key]
+        if not isinstance(value, torch.Tensor):
+            batch[key] = value + other
+            continue
+        if value.dim() > 1:
+            width = max(value.shape[1], other.shape[1])
+            value, other = (
+                torch.nn.functional.pad(t, (0, width - t.shape[1]))
+                for t in (value, other)
+            )
+        batch[key] = torch.cat([value, other])
+    return batch
 
 
 def _discard_low_quality(

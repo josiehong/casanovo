@@ -38,6 +38,22 @@ def mgf_chimera(tmp_path):
     return mgf_file
 
 
+@pytest.fixture
+def mgf_chimera_curriculum(tmp_path):
+    """An MGF file with six single-peptide and three chimeric spectra."""
+    peptides = ["LESLIEK", "PEPTIDEK", "EDITHR", "SAMPLERK"]
+    pairs = [(peptide, None) for peptide in peptides + peptides[:2]]
+    pairs += [(a, b) for a, b in zip(peptides[:3], peptides[1:])]
+    mgf_file = tmp_path / "curriculum.mgf"
+    entries = [
+        _create_chimeric_mgf_entry(first, second, i)
+        for i, (first, second) in enumerate(pairs)
+    ]
+    with mgf_file.open("w+") as mgf_ref:
+        mgf_ref.write("\n".join(entries))
+    return mgf_file
+
+
 def _create_chimeric_mgf_entry(first, second, title, charge=2):
     """
     Create an MGF entry holding one or two co-fragmented peptides.

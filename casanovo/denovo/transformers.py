@@ -56,6 +56,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         padding_int: int | None = None,
         max_charge: int = 4,
         self_cond_layers: Sequence[int] = (),
+        self_cond_feedback: bool = True,
     ) -> None:
         """Initialize a PeptideDecoder."""
 
@@ -87,7 +88,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         self.self_cond_layers = tuple(
             k for k in sorted(set(self_cond_layers)) if 1 <= k < n_layers
         )
-        if self.self_cond_layers:
+        # Without feedback the layers are still scored, for the auxiliary
+        # losses, but nothing is added back: intermediate CTC.
+        if self.self_cond_layers and self_cond_feedback:
             # Maps a distribution over the vocabulary back to model space.
             # No bias: a constant offset would be the same at every frame
             # and could be absorbed by the layer that follows.
@@ -116,7 +119,8 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         states before the next layer runs. Positions are therefore no
         longer predicted independently of one another, at the cost of one
         auxiliary loss per conditioning layer during training and nothing
-        at inference.
+        at inference. With ``self_cond_feedback`` off the prediction is
+        scored but not added back (intermediate CTC).
 
         This has to open up the layer stack rather than call
         ``transformer_decoder`` in one shot, so it prepares the frames
@@ -145,7 +149,8 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             if depth in self.self_cond_layers:
                 scores = self.final(encoded)
                 intermediates.append(scores)
-                encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
+                if self.cond_proj is not None:
+                    encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
 
         if self.transformer_decoder.norm is not None:
             encoded = self.transformer_decoder.norm(encoded)

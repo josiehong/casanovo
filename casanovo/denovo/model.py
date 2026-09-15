@@ -158,6 +158,7 @@ class Spec2Pep(pl.LightningModule):
         # model is then identical to the plain CTC decoder.
         self.self_cond_layers = tuple(kwargs.pop("self_cond_layers", ()) or ())
         self.self_cond_weight = float(kwargs.pop("self_cond_weight", 0.5))
+        self_cond_feedback = bool(kwargs.pop("self_cond_feedback", True))
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
             d_model=dim_model,
@@ -167,6 +168,7 @@ class Spec2Pep(pl.LightningModule):
             dropout=dropout,
             max_charge=max_charge,
             self_cond_layers=self.self_cond_layers,
+            self_cond_feedback=self_cond_feedback,
         )
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(

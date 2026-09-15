@@ -1894,6 +1894,46 @@ def test_frames_attend_to_each_other(self_cond_layers):
     )
 
 
+def test_intermediate_ctc_without_feedback():
+    """Without feedback the layers are scored but nothing is added back."""
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    kwargs = dict(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=3,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        self_cond_layers=(1, 2),
+    )
+    torch.manual_seed(0)
+    fed = Spec2Pep(**kwargs).eval()
+    unfed = Spec2Pep(**kwargs, self_cond_feedback=False).eval()
+    assert fed.decoder.cond_proj is not None
+    assert unfed.decoder.cond_proj is None
+    # Same weights apart from cond_proj, so only the feedback differs.
+    unfed.load_state_dict(fed.state_dict(), strict=False)
+
+    batch = {
+        "mz_array": torch.linspace(100.0, 1000.0, 12).repeat(2, 1),
+        "intensity_array": torch.rand(2, 12),
+        "precursor_mz": torch.full((2,), 600.0),
+        "precursor_charge": torch.full((2,), 2.0),
+        "seq": tokenizer.tokenize(["PEPK", "PEPK"]),
+    }
+    with torch.no_grad():
+        final, _, intermediates = unfed._forward_step(
+            batch, return_intermediates=True
+        )
+        fed_final, _ = fed._forward_step(batch)
+    assert len(intermediates) == 2
+    assert not torch.allclose(final, fed_final)
+    assert unfed.training_step(batch) > 0
+
+
 def test_pmc_decode():
     """Test precise mass control CTC decoding."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(

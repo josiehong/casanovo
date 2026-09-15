@@ -137,6 +137,93 @@ def test_terminal_modification_repair():
     assert "[+0.000000]-" not in _tokenizer().split("PEPTIDEK")
 
 
+def test_plain_checkpoint_loads_into_chimeric():
+    """A single-peptide model's weights load into a chimeric one.
+
+    This is what makes warm-starting chimeric training from a plain NAR
+    checkpoint possible. It holds because chimeric mode changes an
+    activation shape and not a parameter shape: the positional encoding is
+    sinusoidal and computed per forward pass, there is no learned
+    per-position query, and `chimera`, `n_decoder_frames` and
+    `chimera_split` are plain ints set after the encoder and decoder are
+    built. `max_peptide_len` is deliberately changed here too, since the
+    pretrained single-peptide runs used a different frame budget.
+
+    Guarded by a test rather than left to the training job, which would
+    otherwise report it as "Weights file incompatible" after claiming a GPU.
+    """
+    single = _model(chimera=False, max_peptide_len=100)
+    chimeric = _model(chimera=True, max_peptide_len=60)
+    assert single.n_decoder_frames != chimeric.n_decoder_frames
+
+    state = single.state_dict()
+    # strict=True is what Lightning's load_from_checkpoint uses.
+    chimeric.load_state_dict(state, strict=True)
+    assert torch.equal(
+        chimeric.state_dict()["decoder.token_encoder.weight"],
+        state["decoder.token_encoder.weight"],
+    )
+
+
+def _spectrum_batch(n_spectra=2, n_peaks=12):
+    """A minimal batch with real peaks, for a forward pass."""
+    torch.manual_seed(0)
+    return {
+        "mz_array": torch.linspace(100.0, 1000.0, n_peaks).repeat(
+            n_spectra, 1
+        ),
+        "intensity_array": torch.rand(n_spectra, n_peaks),
+        "precursor_mz": torch.full((n_spectra,), 600.0),
+        "precursor_charge": torch.full((n_spectra,), 2.0),
+        "peak_file": ["one.mgf"] * n_spectra,
+        "scan_id": list(range(n_spectra)),
+    }
+
+
+@pytest.mark.parametrize("self_cond_layers", [(), (1,)])
+def test_frames_attend_to_each_other(self_cond_layers):
+    """Adding decoder frames changes the logits of the earlier ones.
+
+    The decoder is non-autoregressive, so its frames are meant to attend
+    to one another. They did not. ``AnalyteTransformerDecoder.embed``
+    infers its key padding mask from the input values, and this decoder
+    feeds token id 0 at every frame, which is ``padding_idx`` and embeds
+    to zero, so every frame was marked padding and only the global
+    precursor token stayed visible.
+
+    Nothing about that is visible in the output: the frames still produce
+    logits and the model still trains. The symptom is here instead. If no
+    frame reads any other, a position's logits cannot depend on how many
+    frames follow it, so lengthening the budget leaves the earlier
+    positions bit-identical. That is what
+    ``2026-09-08nar_chim_free_slot_warmstart`` measured on a trained
+    checkpoint, over 101 shared positions, at a maximum absolute
+    difference of exactly zero.
+
+    Both decode paths are covered, since ``forward_self_conditioned``
+    repeats the input preparation instead of calling ``embed``.
+    """
+    model = _model(
+        chimera=False,
+        max_peptide_len=8,
+        n_layers=2,
+        self_cond_layers=self_cond_layers,
+    ).eval()
+    batch = _spectrum_batch()
+
+    with torch.no_grad():
+        short, _ = model._forward_step(batch)
+        model.n_decoder_frames = 2 * model.max_peptide_len
+        long, _ = model._forward_step(batch)
+
+    shared = short.shape[1]
+    assert long.shape[1] > shared, "the second run must be longer"
+    assert not torch.allclose(long[:, :shared], short), (
+        "the added frames left the earlier positions untouched, so the "
+        "decoder frames are not attending to one another"
+    )
+
+
 def test_frames_scale_with_chimera():
     """Each slot gets a full max_peptide_len frames."""
     single = _model(chimera=False)

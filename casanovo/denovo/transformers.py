@@ -120,9 +120,10 @@ class PeptideDecoder(AnalyteTransformerDecoder):
 
         This has to open up the layer stack rather than call
         ``transformer_decoder`` in one shot, so it repeats the input
-        preparation from ``embed``. The masks are built the same way,
-        including the all-False target mask that makes attention
-        non-causal.
+        preparation from ``embed``: the all-False target mask that makes
+        attention non-causal, and no key padding mask, since every frame
+        is a real decoding slot. See ``embed`` for why the superclass's
+        inferred padding mask is wrong here.
 
         Returns
         -------
@@ -139,13 +140,11 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         encoded = self.token_encoder(tokens)
         global_token = self.global_token_hook(tokens, *args, **kwargs)
         encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-
-        tgt_key_padding_mask = encoded.sum(axis=2) == 0
-        tgt_key_padding_mask[:, 0] = False
         encoded = self.positional_encoder(encoded)
 
         # Non-causal attention, as in `embed` above: every frame sees
-        # every other frame.
+        # every other frame. No key padding mask for the same reason
+        # given there.
         length = encoded.shape[1]
         tgt_mask = torch.zeros(
             (length, length), dtype=torch.bool, device=encoded.device
@@ -157,7 +156,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
                 encoded,
                 memory,
                 tgt_mask=tgt_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
+                tgt_key_padding_mask=None,
                 memory_mask=memory_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
             )
@@ -214,28 +213,37 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         **kwargs: dict,
     ) -> torch.Tensor:
         """
-        Force full (non-causal) target attention by supplying an all-False
-        tgt_mask to the superclass, unless a tgt_mask was explicitly passed.
-        """
+        Embed the decoder frames with full, non-causal attention.
 
-        # Handle tokens==None like the base class
+        ``tgt_mask`` is all False, so every frame sees every other frame.
+        ``tgt_key_padding_mask`` is None, which is why this reimplements
+        the superclass rather than delegating to it: the superclass infers
+        padding as ``encoded.sum(axis=2) == 0``, and every frame here is
+        fed token id 0, ``padding_idx``, whose embedding is zero. That
+        marked every frame as padding, so no frame could attend to
+        another, when none of them is padding.
+        """
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)
 
-        # length after adding global token
-        L = tokens.shape[1] + 1
+        encoded = self.token_encoder(tokens)
+        global_token = self.global_token_hook(tokens, *args, **kwargs)
+        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
+        encoded = self.positional_encoder(encoded)
 
-        # all-False bool mask (full attention)
-        tgt_mask = torch.zeros((L, L), dtype=torch.bool, device=tokens.device)
+        if tgt_mask is None:
+            length = encoded.shape[1]
+            tgt_mask = torch.zeros(
+                (length, length), dtype=torch.bool, device=encoded.device
+            )
 
-        return super().embed(
-            tokens,
-            *args,
+        return self.transformer_decoder(
+            tgt=encoded,
             memory=memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=None,
             memory_key_padding_mask=memory_key_padding_mask,
             memory_mask=memory_mask,
-            tgt_mask=tgt_mask,
-            **kwargs,
         )
 
 

@@ -1849,6 +1849,51 @@ def test_train_val_step_functions():
     assert torch.isclose(val_step_loss, train_step_loss)
 
 
+@pytest.mark.parametrize("self_cond_layers", [(), (1,)])
+def test_frames_attend_to_each_other(self_cond_layers):
+    """Adding decoder frames changes the logits of the earlier ones.
+
+    If no frame attends to any other, as when every frame was inferred to
+    be padding, a position's logits cannot depend on how many frames
+    follow it. Both decode paths are covered, since each passes its own
+    masks to the layers.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=2,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        self_cond_layers=self_cond_layers,
+    ).eval()
+
+    torch.manual_seed(0)
+    batch = {
+        "mz_array": torch.linspace(100.0, 1000.0, 12).repeat(2, 1),
+        "intensity_array": torch.rand(2, 12),
+        "precursor_mz": torch.full((2,), 600.0),
+        "precursor_charge": torch.full((2,), 2.0),
+    }
+
+    with torch.no_grad():
+        short, _ = model._forward_step(batch)
+        # `max_peptide_len` sets the frame count, so raising it adds frames.
+        model.max_peptide_len += 8
+        long, _ = model._forward_step(batch)
+
+    shared = short.shape[1]
+    assert long.shape[1] > shared, "the second run must be longer"
+    assert not torch.allclose(long[:, :shared], short), (
+        "the added frames left the earlier positions untouched, so the "
+        "decoder frames are not attending to one another"
+    )
+
+
 def test_pmc_decode():
     """Test precise mass control CTC decoding."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(

@@ -434,7 +434,7 @@ class Spec2Pep(pl.LightningModule):
             # Self-conditioned CTC: the same objective on each conditioning
             # layer's own prediction, so those layers are trained to say
             # something worth feeding forward.
-            aux = torch.stack(
+            layer_losses = torch.stack(
                 [
                     self.ctc_loss(
                         scores.log_softmax(-1).transpose(0, 1),
@@ -444,13 +444,18 @@ class Spec2Pep(pl.LightningModule):
                     )
                     for scores in intermediates
                 ]
-            ).mean()
+            )
+            aux = layer_losses.mean()
             loss = (1 - self.self_cond_weight) * loss + (
                 self.self_cond_weight * aux
             )
+            # Each layer's own loss is logged too, to show where in the
+            # stack the prediction sharpens.
+            per_layer = zip(self.decoder.self_cond_layers, layer_losses)
             for key, value in (
                 (f"{mode}_CTCLoss_intermediate", aux),
                 (f"{mode}_CTCLoss_total", loss),
+                *((f"{mode}_CTCLoss_layer{d}", v) for d, v in per_layer),
             ):
                 self.log(
                     key,

@@ -1849,6 +1849,39 @@ def test_train_val_step_functions():
     assert torch.isclose(val_step_loss, train_step_loss)
 
 
+def test_intermediate_ctc_loss_logged_per_layer():
+    """Each self-conditioning layer's CTC loss is logged on its own."""
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer()
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=3,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        self_cond_layers=(1, 2),
+    )
+    batch = {
+        "mz_array": torch.zeros(1, 5),
+        "intensity_array": torch.zeros(1, 5),
+        "precursor_mz": torch.tensor(235.63410),
+        "precursor_charge": torch.tensor(2),
+        "seq": tokenizer.tokenize(["PEPK"]),
+    }
+
+    logged = {}
+    model.log = lambda key, value, **kwargs: logged.__setitem__(key, value)
+    model.training_step(batch)
+
+    assert {"train_CTCLoss_layer1", "train_CTCLoss_layer2"} <= logged.keys()
+    per_layer = torch.stack(
+        [logged["train_CTCLoss_layer1"], logged["train_CTCLoss_layer2"]]
+    )
+    assert torch.isclose(
+        per_layer.mean(), logged["train_CTCLoss_intermediate"]
+    )
+
+
 @pytest.mark.parametrize("self_cond_layers", [(), (1,)])
 def test_frames_attend_to_each_other(self_cond_layers):
     """Adding decoder frames changes the logits of the earlier ones.

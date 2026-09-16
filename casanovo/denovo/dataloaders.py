@@ -297,12 +297,15 @@ class DeNovoDataModule(pl.LightningDataModule):
                 "chimeric spectra apart by filter."
             )
 
-        def make_subset(is_chimeric, batch_size):
+        def make_subset(is_chimeric):
+            # Read whole training batches whatever the curriculum needs
+            # per step, so the shuffle buffer spans as many spectra as it
+            # does without the curriculum. CurriculumDataset re-cuts them.
             subset = ChimeraAnnotatedSpectrumDataset.from_lance(
                 path,
                 annotations="seq",
                 tokenizer=self.tokenizer,
-                batch_size=batch_size,
+                batch_size=self.train_batch_size,
                 filter=chimeric if is_chimeric else f"NOT ({chimeric})",
             )
             if self.shuffle:
@@ -373,14 +376,21 @@ class CurriculumDataset(torch.utils.data.IterableDataset):
 
     Epoch ``e`` (0-based) puts ``min(e + 1, max_chimeric)`` chimeric
     spectra in every batch and fills the rest with single-peptide ones.
-    An epoch is one pass over the single-peptide spectra; the chimeric
-    ones are cycled.
+    An epoch is one pass over the single-peptide spectra. One endless
+    iterator reads the chimeric spectra and keeps its place from epoch
+    to epoch, so each epoch carries on where the last one stopped rather
+    than replaying the start of the file.
+
+    Both subsets are read in whole training batches and re-cut here, so
+    every batch holds exactly ``batch_size`` spectra. A filtered read
+    returns a short batch wherever the filter rejects rows, and taking
+    those as they come would leave the batch size drifting with the
+    curriculum and drop every spectrum that landed in one.
 
     Parameters
     ----------
-    make_subset : Callable[[bool, int], Iterable[dict]]
-        Builds the chimeric (True) or single-peptide (False) spectra, in
-        batches of the given size.
+    make_subset : Callable[[bool], Iterable[dict]]
+        Builds the chimeric (True) or single-peptide (False) spectra.
     batch_size : int
         The number of spectra per batch.
     max_chimeric : int
@@ -403,6 +413,9 @@ class CurriculumDataset(torch.utils.data.IterableDataset):
         self.max_chimeric = max_chimeric
         self.epoch_fn = epoch_fn
         self._passes = 0
+        # One spectrum at a time, so an epoch boundary leaves nothing
+        # buffered and every chimeric spectrum is eventually trained on.
+        self._chimeric = _exact_batches(_cycle(make_subset, True), 1)
 
     def __iter__(self):
         epoch = self.epoch_fn() if self.epoch_fn is not None else self._passes
@@ -414,24 +427,13 @@ class CurriculumDataset(torch.utils.data.IterableDataset):
             n_chimeric,
             self.batch_size,
         )
-        chimeric = self._cycle_chimeric(n_chimeric)
-        singles = self.make_subset(False, self.batch_size - n_chimeric)
+        singles = _exact_batches(
+            self.make_subset(False), self.batch_size - n_chimeric
+        )
         for batch in singles:
-            yield _concat_batches(batch, next(chimeric))
-
-    def _cycle_chimeric(self, batch_size: int):
-        """Yield full batches of chimeric spectra, pass after pass."""
-        while True:
-            full = False
-            for batch in self.make_subset(True, batch_size):
-                # A pass ends in a short batch; skip it to keep the count.
-                if len(batch["seq"]) == batch_size:
-                    full = True
-                    yield batch
-            if not full:
-                raise ValueError(
-                    f"Fewer than {batch_size} chimeric training spectra."
-                )
+            for _ in range(n_chimeric):
+                batch = _concat_batches(batch, next(self._chimeric))
+            yield batch
 
 
 def _concat_batches(first: dict, second: dict) -> dict:
@@ -462,6 +464,72 @@ def _concat_batches(first: dict, second: dict) -> dict:
             )
         batch[key] = torch.cat([value, other])
     return batch
+
+
+def _cycle(make_subset: Callable, is_chimeric: bool):
+    """
+    Read a subset pass after pass, without end.
+
+    Parameters
+    ----------
+    make_subset : Callable[[bool], Iterable[dict]]
+        Builds the subset to read.
+    is_chimeric : bool
+        Which subset to build.
+
+    Yields
+    ------
+    dict
+        The batches of one pass, then those of the next.
+    """
+    while True:
+        empty = True
+        for batch in make_subset(is_chimeric):
+            empty = False
+            yield batch
+        if empty:
+            raise ValueError("A curriculum subset holds no spectra.")
+
+
+def _exact_batches(source, size: int):
+    """
+    Re-cut batches so each one holds exactly ``size`` spectra.
+
+    Parameters
+    ----------
+    source : Iterable[dict]
+        Batches of any size.
+    size : int
+        The number of spectra a batch should hold.
+
+    Yields
+    ------
+    dict
+        The spectra of ``source``, in order, ``size`` at a time. A
+        remainder smaller than ``size`` is carried to the next batch,
+        and is only lost if ``source`` ends.
+    """
+    pending = None
+    for batch in source:
+        if pending is None:
+            pending = batch
+        else:
+            pending = _concat_batches(pending, batch)
+        rows = _batch_rows(pending)
+        while rows >= size:
+            yield _slice_batch(pending, 0, size)
+            pending = _slice_batch(pending, size, rows)
+            rows -= size
+
+
+def _batch_rows(batch: dict) -> int:
+    """The number of spectra in a batch."""
+    return len(next(iter(batch.values())))
+
+
+def _slice_batch(batch: dict, start: int, stop: int) -> dict:
+    """The spectra of a batch from ``start`` up to ``stop``."""
+    return {key: value[start:stop] for key, value in batch.items()}
 
 
 def _discard_low_quality(

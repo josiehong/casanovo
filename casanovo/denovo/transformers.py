@@ -11,6 +11,22 @@ from depthcharge.transformers import (
 )
 
 
+def _peak_summary(
+    memory: torch.Tensor, memory_key_padding_mask: torch.Tensor | None
+) -> torch.Tensor:
+    """
+    The mean embedding of each spectrum's real peaks.
+
+    Row 0 of the encoder output is its learned global token and is left
+    out; padded peaks are excluded, and a mask marks padding with True.
+    """
+    peaks = memory[:, 1:]
+    if memory_key_padding_mask is None:
+        return peaks.mean(dim=1)
+    keep = (~memory_key_padding_mask[:, 1:]).unsqueeze(-1).to(peaks.dtype)
+    return (peaks * keep).sum(dim=1) / keep.sum(dim=1).clamp_min(1)
+
+
 class PeptideDecoder(AnalyteTransformerDecoder):
     """
     A transformer decoder for peptide sequences.
@@ -97,6 +113,43 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         else:
             self.cond_proj = None
 
+        # FiLM on the positional encoding (Perez et al., AAAI 2018): each
+        # frame's input is PE(t), since its token embedding is zero, and
+        # this rescales and shifts it per channel by amounts computed from
+        # the mean peak embedding. PE is the only thing that tells frames
+        # apart, so the scale is 1 + tanh(.), which stays positive and
+        # cannot erase it. Zero-init makes the scale 1 and the shift 0, so
+        # an untrained decoder is fed exactly the positional encoding, as
+        # the decoder without FiLM is.
+        self.pe_film = torch.nn.Linear(d_model, 2 * d_model)
+        torch.nn.init.zeros_(self.pe_film.weight)
+        torch.nn.init.zeros_(self.pe_film.bias)
+
+    def _decoder_input(
+        self,
+        tokens: torch.Tensor,
+        memory: torch.Tensor | None,
+        memory_key_padding_mask: torch.Tensor | None,
+        *args: torch.Tensor,
+        **kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        The decoder input: the precursor token, then one row per frame.
+
+        ``embed`` and ``forward_self_conditioned`` both build their input
+        here so the two decode paths cannot drift apart.
+        """
+        encoded = self.token_encoder(tokens)
+        global_token = self.global_token_hook(tokens, *args, **kwargs)
+        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
+        encoded = self.positional_encoder(encoded)
+
+        summary = _peak_summary(memory, memory_key_padding_mask)
+        scale, shift = self.pe_film(summary).chunk(2, dim=-1)
+        frames = (1 + torch.tanh(scale))[:, None, :] * encoded[:, 1:]
+        frames = frames + shift[:, None, :]
+        return torch.cat([encoded[:, :1], frames], dim=1)
+
     def forward_self_conditioned(
         self,
         tokens: torch.Tensor | None,
@@ -119,7 +172,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         at inference.
 
         This has to open up the layer stack rather than call
-        ``transformer_decoder`` in one shot, so it repeats the input
+        ``transformer_decoder`` in one shot, so it repeats the mask
         preparation from ``embed``: the all-False target mask that makes
         attention non-causal, and no key padding mask, since every frame
         is a real decoding slot. See ``embed`` for why the superclass's
@@ -137,10 +190,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)
 
-        encoded = self.token_encoder(tokens)
-        global_token = self.global_token_hook(tokens, *args, **kwargs)
-        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-        encoded = self.positional_encoder(encoded)
+        encoded = self._decoder_input(
+            tokens, memory, memory_key_padding_mask, *args, **kwargs
+        )
 
         # Non-causal attention, as in `embed` above: every frame sees
         # every other frame. No key padding mask for the same reason
@@ -226,10 +278,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)
 
-        encoded = self.token_encoder(tokens)
-        global_token = self.global_token_hook(tokens, *args, **kwargs)
-        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-        encoded = self.positional_encoder(encoded)
+        encoded = self._decoder_input(
+            tokens, memory, memory_key_padding_mask, *args, **kwargs
+        )
 
         if tgt_mask is None:
             length = encoded.shape[1]

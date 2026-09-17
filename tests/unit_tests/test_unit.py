@@ -1894,6 +1894,91 @@ def test_frames_attend_to_each_other(self_cond_layers):
     )
 
 
+def _pe_film_batch():
+    torch.manual_seed(0)
+    return {
+        "mz_array": torch.linspace(100.0, 1000.0, 12).repeat(2, 1),
+        "intensity_array": torch.rand(2, 12),
+        "precursor_mz": torch.full((2,), 600.0),
+        "precursor_charge": torch.full((2,), 2.0),
+    }
+
+
+def test_pe_film_starts_as_the_identity():
+    """An untrained FiLM layer feeds the frames exactly their PE.
+
+    The scale starts at 1 and the shift at 0, so before any training the
+    decoder input is what it would be without FiLM. Both decode paths
+    build their input through `_decoder_input`, so one check covers both.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer()
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=2,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    ).eval()
+    mzs, ints, precursors, _ = model._process_batch(_pe_film_batch())
+
+    with torch.no_grad():
+        memory, mask = model.encoder(mzs, ints)
+        tokens = torch.zeros((2, 8), dtype=torch.long)
+        inputs = model.decoder._decoder_input(
+            tokens, memory, mask, precursors=precursors
+        )
+        encoding = model.decoder.positional_encoder(torch.zeros_like(inputs))
+
+    assert torch.allclose(inputs[:, 1:], encoding[:, 1:]), (
+        "the untrained FiLM layer changed the frame inputs, so training "
+        "does not start from the decoder it is meant to be compared with"
+    )
+
+
+def test_pe_film_trains():
+    """Both the scale and the shift receive gradient from the first step.
+
+    The scale multiplies PE, which is never zero, so unlike a layer that
+    multiplies a zero-initialized table it does not start stuck.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer()
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=2,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        self_cond_layers=(1,),
+    )
+    batch = _pe_film_batch()
+    batch["seq"] = tokenizer.tokenize(["PEPK", "PEPK"])
+
+    model.training_step(batch).backward()
+
+    grad = model.decoder.pe_film.weight.grad
+    assert grad is not None
+    assert grad[:8].abs().sum() > 0, "the scale is not learning"
+    assert grad[8:].abs().sum() > 0, "the shift is not learning"
+
+
+def test_peak_summary_ignores_padding():
+    """Padded peaks and the encoder's global token do not enter the mean."""
+    from casanovo.denovo.transformers import _peak_summary
+
+    memory = torch.tensor(
+        [[[9.0, 9.0], [1.0, 2.0], [3.0, 4.0], [100.0, 100.0]]]
+    )
+    mask = torch.tensor([[False, False, False, True]])
+
+    summary = _peak_summary(memory, mask)
+
+    assert torch.allclose(summary, torch.tensor([[2.0, 3.0]]))
+
+
 def test_pmc_decode():
     """Test precise mass control CTC decoding."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(

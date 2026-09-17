@@ -167,6 +167,7 @@ class Spec2Pep(pl.LightningModule):
             dropout=dropout,
             max_charge=max_charge,
             self_cond_layers=self.self_cond_layers,
+            n_frames=max_peptide_len,
         )
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(

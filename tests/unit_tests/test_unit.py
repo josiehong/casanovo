@@ -1856,7 +1856,9 @@ def test_frames_attend_to_each_other(self_cond_layers):
     If no frame attends to any other, as when every frame was inferred to
     be padding, a position's logits cannot depend on how many frames
     follow it. Both decode paths are covered, since each passes its own
-    masks to the layers.
+    masks to the layers. The short run drops frames rather than the long
+    one adding them, since the learned query table is sized for
+    `max_peptide_len` frames.
     """
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
         reverse=True, start_token=None, stop_token="$"
@@ -1881,9 +1883,10 @@ def test_frames_attend_to_each_other(self_cond_layers):
     }
 
     with torch.no_grad():
+        # `max_peptide_len` sets the frame count.
+        model.max_peptide_len = 4
         short, _ = model._forward_step(batch)
-        # `max_peptide_len` sets the frame count, so raising it adds frames.
-        model.max_peptide_len += 8
+        model.max_peptide_len = 8
         long, _ = model._forward_step(batch)
 
     shared = short.shape[1]
@@ -1892,6 +1895,71 @@ def test_frames_attend_to_each_other(self_cond_layers):
         "the added frames left the earlier positions untouched, so the "
         "decoder frames are not attending to one another"
     )
+
+
+def test_frame_query_starts_at_zero():
+    """An untrained query table adds nothing to the frame input.
+
+    The queries are added to the zero embedding of ``padding_idx``, so
+    before any training every frame is fed exactly its positional
+    encoding, as the decoder without queries is. Both decode paths build
+    their input through `_frame_inputs`, so one check covers both.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer()
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=2,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    )
+    assert model.decoder.frame_queries.num_embeddings == 8
+
+    tokens = torch.zeros((2, 8), dtype=torch.long)
+    with torch.no_grad():
+        inputs = model.decoder._frame_inputs(tokens)
+
+    assert torch.count_nonzero(inputs) == 0, (
+        "the untrained query table changed the frame inputs, so training "
+        "does not start from the decoder it is meant to be compared with"
+    )
+
+
+def test_frame_queries_train():
+    """The query rows receive gradient, unlike the ``padding_idx`` row.
+
+    Token id 0 is ``padding_idx``, whose embedding is zero and frozen, so
+    the input it contributes can never change. The point of the table is
+    that these rows do move.
+    """
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer()
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=2,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+        self_cond_layers=(1,),
+    )
+    batch = {
+        "mz_array": torch.zeros(1, 5),
+        "intensity_array": torch.zeros(1, 5),
+        "precursor_mz": torch.tensor(235.63410),
+        "precursor_charge": torch.tensor(2),
+        "seq": tokenizer.tokenize(["PEPK"]),
+    }
+
+    model.training_step(batch).backward()
+
+    queries = model.decoder.frame_queries.weight.grad
+    assert queries is not None and queries.abs().sum() > 0
+
+    padding = model.decoder.token_encoder.weight.grad
+    assert padding is not None and padding[0].abs().sum() == 0
 
 
 def test_pmc_decode():

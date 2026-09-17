@@ -42,6 +42,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         Required only if ``n_tokens`` was provided as an ``int``.
     max_charge : int, optional
         The maximum charge state for peptide sequences.
+    n_frames : int
+        The number of decoder frames, which sizes the table of learned
+        per-frame queries. Decoding more frames than this is an error.
     """
 
     def __init__(
@@ -56,6 +59,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         padding_int: int | None = None,
         max_charge: int = 4,
         self_cond_layers: Sequence[int] = (),
+        n_frames: int = 0,
     ) -> None:
         """Initialize a PeptideDecoder."""
 
@@ -97,6 +101,34 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         else:
             self.cond_proj = None
 
+        # Learned per-frame queries. Without them the only thing telling
+        # one frame from another at the input is the fixed sinusoid of the
+        # positional encoder, which has no parameters: every frame is fed
+        # token id 0, `padding_idx`, whose embedding is zero and, being
+        # padding, never receives a gradient. Zero-init makes an untrained
+        # decoder see exactly that input, and unlike `padding_idx` these
+        # rows do train.
+        if n_frames < 1:
+            raise ValueError("`n_frames` must size the frame query table.")
+        self.frame_queries = torch.nn.Embedding(n_frames, d_model)
+        torch.nn.init.zeros_(self.frame_queries.weight)
+
+    def _frame_inputs(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        The decoder input for each frame, before the global token.
+
+        ``embed`` and ``forward_self_conditioned`` both build their input
+        through here, so the two decode paths cannot drift apart.
+        """
+        encoded = self.token_encoder(tokens)
+        n_frames = self.frame_queries.num_embeddings
+        if tokens.shape[1] > n_frames:
+            raise ValueError(
+                f"Decoding {tokens.shape[1]} frames, but the learned "
+                f"queries were sized for {n_frames}."
+            )
+        return encoded + self.frame_queries.weight[: tokens.shape[1]]
+
     def forward_self_conditioned(
         self,
         tokens: torch.Tensor | None,
@@ -137,7 +169,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)
 
-        encoded = self.token_encoder(tokens)
+        encoded = self._frame_inputs(tokens)
         global_token = self.global_token_hook(tokens, *args, **kwargs)
         encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
         encoded = self.positional_encoder(encoded)
@@ -226,7 +258,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)
 
-        encoded = self.token_encoder(tokens)
+        encoded = self._frame_inputs(tokens)
         global_token = self.global_token_hook(tokens, *args, **kwargs)
         encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
         encoded = self.positional_encoder(encoded)

@@ -447,9 +447,13 @@ class Spec2Pep(pl.LightningModule):
         )
 
         if self.chimera:
-            loss, aux = self._chimera_loss(pred, intermediates, batch)
+            loss, aux, per_spectrum = self._chimera_loss(
+                pred, intermediates, batch
+            )
         else:
-            loss, aux = self._single_loss(pred, intermediates, truth)
+            loss, aux, per_spectrum = self._single_loss(
+                pred, intermediates, truth
+            )
 
         # The final layer's CTC loss is what gets logged as `*_CTCLoss`, so it
         # stays comparable with runs that predate self-conditioning and keeps
@@ -465,6 +469,7 @@ class Spec2Pep(pl.LightningModule):
             sync_dist=True,
             batch_size=truth.shape[0],
         )
+        self._log_chimeric_split(mode, per_spectrum, batch)
         if aux is not None:
             loss = (1 - self.self_cond_weight) * loss + (
                 self.self_cond_weight * aux
@@ -482,6 +487,50 @@ class Spec2Pep(pl.LightningModule):
                     batch_size=truth.shape[0],
                 )
         return loss
+
+    def _log_chimeric_split(
+        self,
+        mode: str,
+        per_spectrum: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> None:
+        """
+        Log the loss of chimeric and single-peptide spectra separately.
+
+        Both kinds sit in every batch and the curriculum changes the mix,
+        so the pooled loss moves with the mix as well as with the model.
+        Validation holds the mix fixed, but its single-peptide majority
+        still dilutes anything that happens only to chimeric spectra.
+
+        The two are told apart by the second annotation: ``seq_2`` is all
+        padding when only one peptide is named. An empty group is not
+        logged, so a batch of one kind cannot pull the epoch average
+        toward a value it never measured.
+
+        Parameters
+        ----------
+        mode : str
+            Logging key to describe the current stage.
+        per_spectrum : torch.Tensor of shape (n_spectra,)
+            The final layer's loss of each spectrum.
+        batch : Dict[str, torch.Tensor]
+            The batch, holding the second target under ``seq_2``.
+        """
+        if not self.chimera or "seq_2" not in batch:
+            return
+        chimeric = (batch["seq_2"].to(per_spectrum.device) != 0).any(dim=1)
+        for name, mask in (("chimeric", chimeric), ("single", ~chimeric)):
+            count = int(mask.sum())
+            if not count:
+                continue
+            self.log(
+                f"{mode}_CTCLoss_{name}",
+                per_spectrum[mask].mean().detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=count,
+            )
 
     def _ctc_per_spectrum(
         self,
@@ -575,9 +624,10 @@ class Spec2Pep(pl.LightningModule):
 
         Returns
         -------
-        Tuple[torch.Tensor, Optional[torch.Tensor]]
-            The final layer's loss, and the mean loss over the
-            self-conditioning layers or None when there are none.
+        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+            The final layer's loss, the mean loss over the
+            self-conditioning layers or None when there are none, and the
+            final layer's loss per spectrum, which averages to the first.
         """
         target_lengths = (truth != 0).sum(dim=1)
         self._warn_if_infeasible(truth, target_lengths, pred.shape[1])
@@ -588,16 +638,19 @@ class Spec2Pep(pl.LightningModule):
             )
             # Reproduces CTCLoss(reduction="mean"), which divides each
             # spectrum by its target length before averaging.
-            return (per_spectrum / target_lengths.clamp(min=1)).mean()
+            return per_spectrum / target_lengths.clamp(min=1)
 
-        loss = reduce(pred)
+        per_spectrum = reduce(pred)
+        loss = per_spectrum.mean()
         if not intermediates:
-            return loss, None
+            return loss, None, per_spectrum
         # Self-conditioned CTC: the same objective on each conditioning
         # layer's own prediction, so those layers are trained to say
         # something worth feeding forward.
-        aux = torch.stack([reduce(scores) for scores in intermediates]).mean()
-        return loss, aux
+        aux = torch.stack(
+            [reduce(scores).mean() for scores in intermediates]
+        ).mean()
+        return loss, aux, per_spectrum
 
     def _chimera_loss(
         self,
@@ -631,9 +684,10 @@ class Spec2Pep(pl.LightningModule):
 
         Returns
         -------
-        Tuple[torch.Tensor, Optional[torch.Tensor]]
-            The final layer's loss, and the mean loss over the
-            self-conditioning layers or None when there are none.
+        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
+            The final layer's loss, the mean loss over the
+            self-conditioning layers or None when there are none, and the
+            final layer's loss per spectrum, which averages to the first.
         """
         truth_a = batch["seq"]
         truth_b = batch["seq_2"].to(truth_a.device)
@@ -686,15 +740,16 @@ class Spec2Pep(pl.LightningModule):
 
         direct, swapped = assignments(pred)
         swap = swapped < direct
-        loss = (torch.where(swap, swapped, direct) / total_len).mean()
+        per_spectrum = torch.where(swap, swapped, direct) / total_len
+        loss = per_spectrum.mean()
         if not intermediates:
-            return loss, None
+            return loss, None, per_spectrum
 
         aux = []
         for scores in intermediates:
             direct, swapped = assignments(scores)
             aux.append((torch.where(swap, swapped, direct) / total_len).mean())
-        return loss, torch.stack(aux).mean()
+        return loss, torch.stack(aux).mean(), per_spectrum
 
     def validation_step(
         self, batch: Dict[str, torch.Tensor], *args
@@ -1759,6 +1814,12 @@ class Spec2Pep(pl.LightningModule):
             "step": self.trainer.global_step,
             "valid": callback_metrics["valid_CTCLoss"].detach().item(),
         }
+        # Chimeric runs also record the two kinds of spectrum on their own,
+        # since the pooled loss is mostly single-peptide spectra.
+        for kind in ("single", "chimeric"):
+            key = f"valid_CTCLoss_{kind}"
+            if key in callback_metrics:
+                metrics[key] = callback_metrics[key].detach().item()
 
         if self.calculate_precision:
             metrics["valid_aa_precision"] = (
@@ -1819,6 +1880,8 @@ class Spec2Pep(pl.LightningModule):
             return
         if len(self._history) == 1:
             header = "Step\tTrain loss\tValid loss\t"
+            if self.chimera:
+                header += "Valid single loss\tValid chimeric loss\t"
             if self.calculate_precision:
                 header += "Peptide precision\tAA precision"
 
@@ -1831,6 +1894,15 @@ class Spec2Pep(pl.LightningModule):
                 metrics.get("train", np.nan),
                 metrics.get("valid", np.nan),
             ]
+
+            # The columns stay in place on training rows, which have no
+            # validation loss to split, so every row has the same shape.
+            if self.chimera:
+                msg += "\t%.6f\t%.6f"
+                vals += [
+                    metrics.get("valid_CTCLoss_single", np.nan),
+                    metrics.get("valid_CTCLoss_chimeric", np.nan),
+                ]
 
             if self.calculate_precision:
                 msg += "\t%.6f\t%.6f"

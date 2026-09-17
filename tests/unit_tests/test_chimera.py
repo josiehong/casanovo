@@ -271,7 +271,7 @@ def test_single_loss_matches_builtin_reduction():
         truth.shape[0], model.n_decoder_frames + 1, model.vocab_size
     )
 
-    ours, aux = model._single_loss(pred, [], truth)
+    ours, aux, _ = model._single_loss(pred, [], truth)
     assert aux is None
 
     target_lengths = (truth != 0).sum(dim=1)
@@ -293,7 +293,9 @@ def test_chimera_loss_takes_the_better_assignment():
     torch.manual_seed(0)
     pred = torch.randn(2, model.n_decoder_frames + 1, model.vocab_size)
 
-    loss, _ = model._chimera_loss(pred, [], {"seq": truth_a, "seq_2": truth_b})
+    loss, _, _ = model._chimera_loss(
+        pred, [], {"seq": truth_a, "seq_2": truth_b}
+    )
 
     slot_a = pred[:, : model.chimera_split]
     slot_b = pred[:, model.chimera_split :]
@@ -334,7 +336,9 @@ def test_an_unlabelled_slot_is_free():
     model = _model()
     peptide, empty, pred = _one_labelled_peptide(model)
 
-    loss, _ = model._chimera_loss(pred, [], {"seq": peptide, "seq_2": empty})
+    loss, _, _ = model._chimera_loss(
+        pred, [], {"seq": peptide, "seq_2": empty}
+    )
 
     # The loss is the labelled peptide alone, in whichever slot fits it
     # better; the empty slot adds nothing.
@@ -355,7 +359,9 @@ def test_the_free_slot_gets_no_gradient():
     peptide, empty, pred = _one_labelled_peptide(model)
     pred.requires_grad_(True)
 
-    loss, _ = model._chimera_loss(pred, [], {"seq": peptide, "seq_2": empty})
+    loss, _, _ = model._chimera_loss(
+        pred, [], {"seq": peptide, "seq_2": empty}
+    )
     loss.backward()
 
     frames = (
@@ -375,8 +381,12 @@ def test_an_unlabelled_slot_keeps_the_loss_symmetric():
     model = _model()
     peptide, empty, pred = _one_labelled_peptide(model)
 
-    first, _ = model._chimera_loss(pred, [], {"seq": peptide, "seq_2": empty})
-    second, _ = model._chimera_loss(pred, [], {"seq": empty, "seq_2": peptide})
+    first, _, _ = model._chimera_loss(
+        pred, [], {"seq": peptide, "seq_2": empty}
+    )
+    second, _, _ = model._chimera_loss(
+        pred, [], {"seq": empty, "seq_2": peptide}
+    )
 
     assert torch.allclose(first, second)
 
@@ -400,8 +410,8 @@ def test_intermediates_reuse_the_final_assignment():
         for _ in range(2)
     ]
 
-    alone, no_aux = model._chimera_loss(pred, [], batch)
-    combined, aux = model._chimera_loss(pred, intermediates, batch)
+    alone, no_aux, _ = model._chimera_loss(pred, [], batch)
+    combined, aux, _ = model._chimera_loss(pred, intermediates, batch)
 
     assert no_aux is None
     assert aux is not None
@@ -614,3 +624,68 @@ def test_chimera_curriculum(
         assert sum(len(b["seq"]) for b in batches) - sum(n_chimeric) == 6
 
     assert torch.isfinite(runner.model.training_step(batches[0]))
+
+
+def _mixed_batch(model):
+    """One chimeric and one single-peptide spectrum, with their scores."""
+    torch.manual_seed(0)
+    truth_a = model.tokenizer.tokenize(["PEPTIDEK", "LESLIEK"], add_stop=True)
+    # The second peptide pads to its own length; only the first spectrum
+    # has one.
+    second = model.tokenizer.tokenize(["EDITHR"], add_stop=True)
+    truth_b = torch.zeros((2, second.shape[1]), dtype=truth_a.dtype)
+    truth_b[0] = second[0]
+    batch = {"seq": truth_a, "seq_2": truth_b}
+    pred = torch.randn(2, model.n_decoder_frames + 1, model.vocab_size)
+    return batch, pred
+
+
+def test_per_spectrum_loss_averages_to_the_logged_loss():
+    """The split is a partition of the loss, so it has to sum back to it."""
+    model = _model()
+    batch, pred = _mixed_batch(model)
+
+    loss, _, per_spectrum = model._chimera_loss(pred, [], batch)
+
+    assert per_spectrum.shape == (2,)
+    assert torch.allclose(per_spectrum.mean(), loss)
+
+
+def test_the_validation_split_separates_the_two_kinds(monkeypatch):
+    """Each kind is logged with its own mean and its own count."""
+    model = _model()
+    batch, pred = _mixed_batch(model)
+    _, _, per_spectrum = model._chimera_loss(pred, [], batch)
+
+    logged = {}
+
+    def fake_log(name, value, **kwargs):
+        logged[name] = (float(value), kwargs["batch_size"])
+
+    monkeypatch.setattr(model, "log", fake_log)
+    model._log_chimeric_split("valid", per_spectrum, batch)
+
+    assert logged["valid_CTCLoss_chimeric"] == (
+        pytest.approx(float(per_spectrum[0])),
+        1,
+    )
+    assert logged["valid_CTCLoss_single"] == (
+        pytest.approx(float(per_spectrum[1])),
+        1,
+    )
+
+
+def test_a_batch_of_one_kind_logs_only_that_kind(monkeypatch):
+    """An empty group would otherwise log a nan into the epoch average."""
+    model = _model()
+    peptide, empty, pred = _one_labelled_peptide(model)
+    batch = {"seq": peptide, "seq_2": empty}
+    _, _, per_spectrum = model._chimera_loss(pred, [], batch)
+
+    logged = []
+    monkeypatch.setattr(
+        model, "log", lambda name, value, **kwargs: logged.append(name)
+    )
+    model._log_chimeric_split("valid", per_spectrum, batch)
+
+    assert logged == ["valid_CTCLoss_single"]

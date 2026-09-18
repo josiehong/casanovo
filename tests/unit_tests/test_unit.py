@@ -1849,6 +1849,43 @@ def test_train_val_step_functions():
     assert torch.isclose(val_step_loss, train_step_loss)
 
 
+def test_intermediate_ctc_adds_no_parameters():
+    """Scoring intermediate layers supervises them without new weights."""
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=True, start_token=None, stop_token="$"
+    )
+    kwargs = dict(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=3,
+        max_peptide_len=8,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    )
+    torch.manual_seed(0)
+    plain = Spec2Pep(**kwargs).eval()
+    unfed = Spec2Pep(**kwargs, self_cond_layers=(1, 2)).eval()
+    # Scoring reuses the output layer the model already has, so the two
+    # are the same size and a checkpoint from either loads into the other.
+    assert plain.state_dict().keys() == unfed.state_dict().keys()
+    unfed.load_state_dict(plain.state_dict())
+
+    batch = {
+        "mz_array": torch.linspace(100.0, 1000.0, 12).repeat(2, 1),
+        "intensity_array": torch.rand(2, 12),
+        "precursor_mz": torch.full((2,), 600.0),
+        "precursor_charge": torch.full((2,), 2.0),
+        "seq": tokenizer.tokenize(["PEPK", "PEPK"]),
+    }
+    with torch.no_grad():
+        _, _, intermediates = unfed._forward_step(
+            batch, return_intermediates=True
+        )
+    assert len(intermediates) == 2
+    assert unfed.training_step(batch) > 0
+
+
 def test_pmc_decode():
     """Test precise mass control CTC decoding."""
     tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(

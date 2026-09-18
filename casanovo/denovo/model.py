@@ -182,9 +182,9 @@ class Spec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
         )
-        # Self-conditioning: which decoder layers score their own hidden
-        # states and feed the prediction forward, and how much of the loss
-        # those auxiliary predictions carry. Empty list disables it, and the
+        # Intermediate CTC: which decoder layers score their own hidden
+        # states for an auxiliary loss, and how much of the loss those
+        # auxiliary predictions carry. Empty list disables it, and the
         # model is then identical to the plain CTC decoder.
         self.self_cond_layers = tuple(kwargs.pop("self_cond_layers", ()) or ())
         self.self_cond_weight = float(kwargs.pop("self_cond_weight", 0.5))

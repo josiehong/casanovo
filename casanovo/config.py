@@ -35,7 +35,6 @@ _config_optional = frozenset(
         "muon_momentum",
         "self_cond_layers",
         "self_cond_weight",
-        "self_cond_feedback",
     }
 )
 
@@ -106,7 +105,6 @@ class Config:
         muon_momentum=float,
         self_cond_layers=list,
         self_cond_weight=float,
-        self_cond_feedback=bool,
         train_label_smoothing=float,
         train_batch_size=int,
         max_epochs=int,

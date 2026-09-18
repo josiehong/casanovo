@@ -56,7 +56,6 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         padding_int: int | None = None,
         max_charge: int = 4,
         self_cond_layers: Sequence[int] = (),
-        self_cond_feedback: bool = True,
     ) -> None:
         """Initialize a PeptideDecoder."""
 
@@ -81,24 +80,13 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             d_model, self.token_encoder.num_embeddings + 1
         )
 
-        # Self-conditioning: the layers after which this decoder scores its
-        # own hidden states and feeds the prediction back in. Empty means the
-        # decoder behaves exactly as it did before and grows no parameters,
-        # so a checkpoint trained without it still loads.
+        # The layers after which this decoder also scores its own hidden
+        # states, for an auxiliary CTC loss each. Scoring reuses the output
+        # layer, so no layer here grows the model, and a checkpoint trained
+        # without them still loads.
         self.self_cond_layers = tuple(
             k for k in sorted(set(self_cond_layers)) if 1 <= k < n_layers
         )
-        # Without feedback the layers are still scored, for the auxiliary
-        # losses, but nothing is added back: intermediate CTC.
-        if self.self_cond_layers and self_cond_feedback:
-            # Maps a distribution over the vocabulary back to model space.
-            # No bias: a constant offset would be the same at every frame
-            # and could be absorbed by the layer that follows.
-            self.cond_proj = torch.nn.Linear(
-                self.final.out_features, d_model, bias=False
-            )
-        else:
-            self.cond_proj = None
 
     def forward_self_conditioned(
         self,
@@ -112,15 +100,12 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         """
         Decode, scoring the stack's own hidden states along the way.
 
-        Self-conditioned CTC (Nozaki and Komatsu, Interspeech 2021):
-        after each layer in ``self_cond_layers`` the hidden states are
-        scored with the same output layer the model already has, and that
-        prediction is projected back to model space and added to the
-        states before the next layer runs. Positions are therefore no
-        longer predicted independently of one another, at the cost of one
-        auxiliary loss per conditioning layer during training and nothing
-        at inference. With ``self_cond_feedback`` off the prediction is
-        scored but not added back (intermediate CTC).
+        Intermediate CTC (Lee and Watanabe, ICASSP 2021): after each layer
+        in ``self_cond_layers`` the hidden states are scored with the same
+        output layer the model already has, and that prediction carries an
+        auxiliary CTC loss during training. The score is not fed back into
+        the stack, so the layers below are supervised without changing what
+        the layers above receive, and inference is unaffected.
 
         This has to open up the layer stack rather than call
         ``transformer_decoder`` in one shot, so it prepares the frames
@@ -147,10 +132,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
                 memory_key_padding_mask=memory_key_padding_mask,
             )
             if depth in self.self_cond_layers:
-                scores = self.final(encoded)
-                intermediates.append(scores)
-                if self.cond_proj is not None:
-                    encoded = encoded + self.cond_proj(scores.softmax(dim=-1))
+                intermediates.append(self.final(encoded))
 
         if self.transformer_decoder.norm is not None:
             encoded = self.transformer_decoder.norm(encoded)

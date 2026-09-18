@@ -157,8 +157,8 @@ class Spec2Pep(pl.LightningModule):
         # states for an auxiliary loss, and how much of the loss those
         # auxiliary predictions carry. Empty list disables it, and the
         # model is then identical to the plain CTC decoder.
-        self.self_cond_layers = tuple(kwargs.pop("self_cond_layers", ()) or ())
-        self.self_cond_weight = float(kwargs.pop("self_cond_weight", 0.5))
+        self.inter_ctc_layers = tuple(kwargs.pop("inter_ctc_layers", ()) or ())
+        self.inter_ctc_weight = float(kwargs.pop("inter_ctc_weight", 0.5))
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
             d_model=dim_model,
@@ -167,7 +167,7 @@ class Spec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
             max_charge=max_charge,
-            self_cond_layers=self.self_cond_layers,
+            inter_ctc_layers=self.inter_ctc_layers,
         )
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(
@@ -329,8 +329,8 @@ class Spec2Pep(pl.LightningModule):
             The ground truth tokens for training, or None for inference.
         intermediates : list of torch.Tensor
             Only when ``return_intermediates``: the scores from each
-            self-conditioning layer, for the auxiliary CTC losses. Empty
-            unless ``self_cond_layers`` is set.
+            intermediate layer, for the auxiliary CTC losses. Empty
+            unless ``inter_ctc_layers`` is set.
         """
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
@@ -342,8 +342,8 @@ class Spec2Pep(pl.LightningModule):
             dtype=torch.long,
             device=self.device,
         )
-        if self.self_cond_layers or return_intermediates:
-            scores, intermediates = self.decoder.forward_self_conditioned(
+        if self.inter_ctc_layers or return_intermediates:
+            scores, intermediates = self.decoder.forward_with_intermediates(
                 tokens=zero_tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
@@ -418,7 +418,7 @@ class Spec2Pep(pl.LightningModule):
             )
         loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
         # The final layer's CTC loss is what gets logged as `*_CTCLoss`, so it
-        # stays comparable with runs that predate self-conditioning and keeps
+        # stays comparable with runs that predate intermediate CTC and keeps
         # driving best-checkpoint selection. The combined objective below is
         # what the optimizer sees; logging that instead would mix in the
         # shallower layers' worse predictions and both compare wrongly against
@@ -432,9 +432,9 @@ class Spec2Pep(pl.LightningModule):
             batch_size=truth.shape[0],
         )
         if intermediates:
-            # Self-conditioned CTC: the same objective on each conditioning
-            # layer's own prediction, so those layers are trained to say
-            # something worth feeding forward.
+            # Intermediate CTC: the same objective on each intermediate
+            # layer's own prediction, so the layers below the last one are
+            # supervised directly rather than only through it.
             aux = torch.stack(
                 [
                     self.ctc_loss(
@@ -446,8 +446,8 @@ class Spec2Pep(pl.LightningModule):
                     for scores in intermediates
                 ]
             ).mean()
-            loss = (1 - self.self_cond_weight) * loss + (
-                self.self_cond_weight * aux
+            loss = (1 - self.inter_ctc_weight) * loss + (
+                self.inter_ctc_weight * aux
             )
             for key, value in (
                 (f"{mode}_CTCLoss_intermediate", aux),

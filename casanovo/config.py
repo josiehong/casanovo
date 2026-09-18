@@ -33,8 +33,8 @@ _config_optional = frozenset(
     {
         "muon_lr",
         "muon_momentum",
-        "self_cond_layers",
-        "self_cond_weight",
+        "inter_ctc_layers",
+        "inter_ctc_weight",
     }
 )
 
@@ -103,8 +103,8 @@ class Config:
         weight_decay=float,
         muon_lr=float,
         muon_momentum=float,
-        self_cond_layers=list,
-        self_cond_weight=float,
+        inter_ctc_layers=list,
+        inter_ctc_weight=float,
         train_label_smoothing=float,
         train_batch_size=int,
         max_epochs=int,

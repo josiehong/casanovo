@@ -1849,8 +1849,8 @@ def test_train_val_step_functions():
     assert torch.isclose(val_step_loss, train_step_loss)
 
 
-@pytest.mark.parametrize("self_cond_layers", [(), (1,)])
-def test_frames_attend_to_each_other(self_cond_layers):
+@pytest.mark.parametrize("inter_ctc_layers", [(), (1,)])
+def test_frames_attend_to_each_other(inter_ctc_layers):
     """Adding decoder frames changes the logits of the earlier ones.
 
     If no frame attends to any other, as when every frame was inferred to
@@ -1869,7 +1869,7 @@ def test_frames_attend_to_each_other(self_cond_layers):
         max_peptide_len=8,
         residues="massivekb",
         tokenizer=tokenizer,
-        self_cond_layers=self_cond_layers,
+        inter_ctc_layers=inter_ctc_layers,
     ).eval()
 
     torch.manual_seed(0)
@@ -1910,7 +1910,7 @@ def test_intermediate_ctc_adds_no_parameters():
     )
     torch.manual_seed(0)
     plain = Spec2Pep(**kwargs).eval()
-    unfed = Spec2Pep(**kwargs, self_cond_layers=(1, 2)).eval()
+    unfed = Spec2Pep(**kwargs, inter_ctc_layers=(1, 2)).eval()
     # Scoring reuses the output layer the model already has, so the two
     # are the same size and a checkpoint from either loads into the other.
     assert plain.state_dict().keys() == unfed.state_dict().keys()

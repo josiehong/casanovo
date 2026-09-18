@@ -33,6 +33,8 @@ _config_optional = frozenset(
     {
         "charge_range",
         "chimera",
+        "isolation_window_offset",
+        "isolation_window_width",
         "muon_lr",
         "muon_momentum",
         "resume_training",
@@ -68,6 +70,8 @@ class Config:
         precursor_mass_tol=float,
         isotope_error_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
         charge_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
+        isolation_window_width=float,
+        isolation_window_offset=float,
         min_peptide_len=int,
         max_peptide_len=int,
         chimera=bool,

@@ -95,9 +95,9 @@ random_seed: 454
 # Logging frequency in training steps.
 n_log: 1
 # Whether to create Tensorboard directory.
-tb_summarywriter: true
+tb_summarywriter: false
 # Whether to create csv_logs directory.
-log_metrics: true
+log_metrics: false
 # How often to log optimizer parameters in steps.
 log_every_n_steps: 50
 # Path to save Lance instances.
@@ -138,7 +138,7 @@ dim_intensity:
 # The number of iterations for the linear warm-up of the learning rate.
 warmup_iters: 100_000
 # The number of iterations for the cosine half period of the learning rate.
-cosine_schedule_period_iters: 1_800_000
+cosine_schedule_period_iters: 600_000
 # Learning rate for the auxiliary AdamW parameter group (embeddings, output
 # head, biases, and normalization parameters).
 learning_rate: 5e-4
@@ -149,12 +149,12 @@ weight_decay: 1e-5
 muon_lr: 0.002
 # Momentum for the Muon parameter group.
 muon_momentum: 0.95
-# Self-conditioned CTC: decoder layers (1-based) after which the model scores
-# its own hidden states and feeds that prediction into the next layer, so
-# positions are no longer predicted independently. Empty disables it and the
-# decoder is then identical to plain CTC. Placement follows the paper's
-# spacing rule floor(k*L/(K+1)), which for L=9 layers and K=4 points gives
-# [1, 3, 5, 7].
+# Intermediate CTC: decoder layers (1-based) that also score their own hidden
+# states, each carrying an auxiliary CTC loss. Scoring reuses the output layer
+# and is not fed back into the stack, so it adds no parameters and changes
+# nothing at inference. Empty disables it and the decoder is then identical to
+# plain CTC. Placement follows the paper's spacing rule floor(k*L/(K+1)), which
+# for L=9 layers and K=4 points gives [1, 3, 5, 7].
 self_cond_layers: [1, 3, 5, 7]
 # Share of the training loss carried by those intermediate predictions; the
 # final layer carries the rest. Ignored when self_cond_layers is empty.
@@ -166,7 +166,7 @@ train_label_smoothing: 0.01
 # Number of spectra in one training batch.
 train_batch_size: 32
 # Max number of training epochs.
-max_epochs: 22
+max_epochs: 30
 # Shuffle dataset during training.
 shuffle: true
 # Number of samples to buffer while randomly shuffling the training data.
@@ -180,10 +180,10 @@ calculate_precision: false
 # Accumulates gradients over `k` batches before stepping the optimizer.
 accumulate_grad_batches: 1
 # The value at which to clip gradients. `None` disables gradient clipping.
-gradient_clip_val: 2.0
+gradient_clip_val:
 # The gradient clipping algorithm to use.
 # Must be one of: "value", "norm", or `None`.
-gradient_clip_algorithm: "norm"
+gradient_clip_algorithm:
 # Floating point precision.
 # Must be one of: "16-true", "16-mixed", "bf16-true", "bf16-mixed", "32-true",
 # "64-true", "64", "32", "16", or "bf16".
@@ -192,7 +192,7 @@ precision: "32-true"
 # Replace I by L in peptide sequences.
 replace_isoleucine_with_leucine: true
 # MassIVE-KB style tokenizer, otherwise ProForma syntax.
-massivekb_tokenizer: true
+massivekb_tokenizer: false
 
 # AMINO ACID AND MODIFICATION VOCABULARY
 residues:

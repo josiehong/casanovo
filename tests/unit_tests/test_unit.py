@@ -2057,6 +2057,54 @@ def test_pmc_decode_all_nterm_mods():
     assert masses[idx["[Ammonia-loss]-"]].item() < 0
 
 
+def test_pmc_decode_keeps_predicted_nterm_mod():
+    """A mass correction leaves the modification where it was.
+
+    The tests above hand PMC evidence the greedy path already agrees
+    with, so it only confirms them. Here the precursor forces a residue
+    to change, which is the case PMC actually runs for.
+    """
+    model = _pmc_model()
+    idx = model.tokenizer.index
+    masses = model.token_masses
+    aa_k, aa_g, aa_a, aa_e = idx["K"], idx["G"], idx["A"], idx["E"]
+
+    for label in (
+        "[Ammonia-loss]-",
+        "[Acetyl]-",
+        "[+25.980265]-",
+        "[Carbamyl]-",
+    ):
+        nterm = idx[label]
+        # Reversed tokenizer, so frames run C-terminus first and the
+        # modification sits last, ahead of the blank tail.
+        logits = torch.full((12, model.vocab_size), -10.0)
+        logits[0, aa_k] = 5.0
+        logits[1, aa_g] = 5.0
+        logits[1, aa_a] = 4.9
+        logits[2, aa_e] = 5.0
+        logits[3, nterm] = 5.0
+        logits[4:, model.blank_token] = 5.0
+
+        precursor_mass = (
+            masses[aa_k] + masses[aa_a] + masses[aa_e] + masses[nterm]
+        ).item() + denovo.model.H2O_MASS
+        greedy = model._ctc_decode(logits.unsqueeze(0))[0][0]
+        assert greedy == [aa_k, aa_g, aa_e, nterm], label
+        assert not model._fits_precursor_mass(greedy, precursor_mass), label
+
+        tokens, _ = model._pmc_decode(logits, precursor_mass)
+        assert tokens == [aa_k, aa_a, aa_e, nterm], label
+        assert model._fits_precursor_mass(tokens, precursor_mass), label
+
+        # A precursor that accounts for no modification drops it.
+        bare = (
+            masses[aa_k] + masses[aa_a] + masses[aa_e]
+        ).item() + denovo.model.H2O_MASS
+        tokens, _ = model._pmc_decode(logits, bare)
+        assert tokens == [aa_k, aa_a, aa_e], label
+
+
 def test_pmc_decode_coarse_resolution(monkeypatch):
     """A precursor too heavy for the fine mass grid still decodes."""
     model = _pmc_model()

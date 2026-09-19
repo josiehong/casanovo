@@ -24,13 +24,12 @@ logger = logging.getLogger("casanovo")
 
 H2O_MASS = depthcharge.constants.H2O
 ISOTOPE_SPACING = depthcharge.constants.C13
-# Precise mass control (PMC) decoding settings: the mass discretization
-# step, the headroom added to the mass axis so that rounding cannot
-# carry a valid path off the end of it, a cap on the backtracking table
-# size, and the minimum frame probability for a token to take part in a
-# frame at all (see
-# `_pmc_decode`: it buys roughly 11x, since CTC output is blank-dominated
-# and only a handful of frames per spectrum carry a plausible residue).
+# Precise mass control (PMC) decoding: the mass discretization step, the
+# headroom that keeps rounding from carrying a valid path off the end of
+# the mass axis, a cap on the backtracking table, and the frame
+# probability below which a token is not considered at that frame. The
+# last prunes hard because CTC output is blank-dominated: only a handful
+# of frames per spectrum carry a plausible residue.
 PMC_RESOLUTION = 0.01
 PMC_MASS_GUARD = 0.1
 PMC_MAX_POINTER_BYTES = 1_000_000_000
@@ -110,10 +109,19 @@ class Spec2Pep(pl.LightningModule):
         This is expensive.
     tokenizer: PeptideTokenizer | None
         Tokenizer object to process peptide sequences.
+    inter_ctc_layers : Sequence[int]
+        Decoder layers (1-based) that also score their hidden states for
+        an auxiliary CTC loss. Scoring reuses the output layer, so this
+        adds no parameters and changes nothing at inference. Layers
+        outside the stack are dropped with a warning.
+    inter_ctc_weight : float
+        Share of the training loss carried by those auxiliary
+        predictions; the final layer carries the rest.
     **kwargs : Dict
         Additional keyword arguments for the optimizer: ``muon_lr`` and
         ``muon_momentum`` configure the Muon parameter group; the rest
-        are passed to the auxiliary AdamW group.
+        are passed to the auxiliary AdamW group. ``inter_ctc_layers`` and
+        ``inter_ctc_weight`` arrive here too and are documented above.
     """
 
     def __init__(
@@ -322,7 +330,7 @@ class Spec2Pep(pl.LightningModule):
         self,
         batch: Dict[str, torch.Tensor],
         return_intermediates: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         """
         The forward learning step for non-autoregressive decoding.
 
@@ -342,8 +350,8 @@ class Spec2Pep(pl.LightningModule):
             The ground truth tokens for training, or None for inference.
         intermediates : list of torch.Tensor
             Only when ``return_intermediates``: the scores from each
-            intermediate layer, for the auxiliary CTC losses. Empty
-            unless ``inter_ctc_layers`` is set.
+            layer in ``inter_ctc_layers``, for the auxiliary CTC losses.
+            Empty when that list is.
         """
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
@@ -759,7 +767,7 @@ class Spec2Pep(pl.LightningModule):
         # Only N-terminal modifications may be negative and only one may be
         # emitted, so one token's worth of headroom is enough.
         neg_mass = min(
-            (self.token_masses[c].item() for c in self.nterm_idx.tolist()),
+            (self.token_masses[c].item() for c in self.neg_mass_idx.tolist()),
             default=0.0,
         )
         zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1

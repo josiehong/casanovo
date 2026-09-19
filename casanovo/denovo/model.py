@@ -1250,11 +1250,17 @@ class DbSpec2Pep(Spec2Pep):
             memories, mem_masks = batch["memory"], batch["mem_masks"]
             precursors = batch["precursors"]
             tokens = batch["seq"]
+            # These are real peptides padded to the longest candidate in
+            # the batch, unlike the de novo frames, so the padding has to
+            # be masked or a candidate's score depends on what it was
+            # batched with.
             logits = self.decoder(
                 tokens=tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
                 precursors=precursors,
+                tgt_key_padding_mask=tokens
+                == self.decoder.token_encoder.padding_idx,
             )
             probs = self.softmax(logits)
             return probs, tokens

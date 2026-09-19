@@ -207,21 +207,42 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         memory_key_padding_mask: torch.Tensor | None = None,
         memory_mask: torch.Tensor | None = None,
         tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
         **kwargs: dict,
     ) -> torch.Tensor:
         """
         Embed the decoder frames with full, non-causal attention.
 
         Reimplements the superclass rather than delegating to it, so
-        that no key padding mask reaches the layers (see
-        ``_prepare_frames``).
+        that no key padding mask reaches the layers unless a caller asks
+        for one (see ``_prepare_frames``).
+
+        ``tgt_key_padding_mask`` marks padding in ``tokens``, and the
+        precursor token is prepended here so callers need not. Leave it
+        None to decode de novo, where every frame is a real slot; pass
+        ``tokens == padding_idx`` when the tokens are real sequences
+        padded to a common length, as in a database search. Nothing can
+        infer which case applies, since both pad with token 0.
         """
         encoded, full_mask = self._prepare_frames(tokens, *args, **kwargs)
+        if tgt_key_padding_mask is not None:
+            # Position 0 holds the precursor token, never padding.
+            tgt_key_padding_mask = torch.cat(
+                [
+                    torch.zeros(
+                        (tgt_key_padding_mask.shape[0], 1),
+                        dtype=torch.bool,
+                        device=tgt_key_padding_mask.device,
+                    ),
+                    tgt_key_padding_mask,
+                ],
+                dim=1,
+            )
         return self.transformer_decoder(
             tgt=encoded,
             memory=memory,
             tgt_mask=full_mask if tgt_mask is None else tgt_mask,
-            tgt_key_padding_mask=None,
+            tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask,
             memory_mask=memory_mask,
         )

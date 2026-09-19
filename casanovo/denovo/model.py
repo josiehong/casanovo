@@ -1078,22 +1078,29 @@ class Spec2Pep(pl.LightningModule):
         # Precise mass control: when the greedy peptide does not match
         # the precursor mass, search for the best CTC path that does.
         _, _, precursors, _ = self._process_batch(batch)
+        fits = []
         for i, tokens in enumerate(sequences):
             precursor_mass = precursors[i, 0].item()
-            if tokens and self._fits_precursor_mass(tokens, precursor_mass):
-                continue
-            pmc = self._pmc_decode(logits[i], precursor_mass)
-            if pmc is not None:
-                sequences[i], scores[i] = pmc
+            fit = bool(tokens) and self._fits_precursor_mass(
+                tokens, precursor_mass
+            )
+            if not fit:
+                pmc = self._pmc_decode(logits[i], precursor_mass)
+                if pmc is not None:
+                    # PMC only returns mass-matching paths.
+                    sequences[i], scores[i] = pmc
+                    fit = True
+            fits.append(fit)
 
         predictions = []
-        for filename, scan, charge, prec_mz, tokens, confs in zip(
+        for filename, scan, charge, prec_mz, tokens, confs, fit in zip(
             batch["peak_file"],
             batch["scan_id"],
             batch["precursor_charge"],
             batch["precursor_mz"],
             sequences,
             scores,
+            fits,
         ):
             # Beam search withheld these; CTC decoding replaced it
             # without replacing the rule.
@@ -1109,11 +1116,18 @@ class Spec2Pep(pl.LightningModule):
             if self.tokenizer.reverse:
                 aa_scores = aa_scores[::-1]
 
+            peptide_score = float(aa_scores.mean())
+            if not fit:
+                # PMC found no mass-matching path, so the greedy peptide
+                # survives. Beam search sorted these last; CTC decoding
+                # replaced it without replacing the rule.
+                peptide_score -= 1
+
             predictions.append(
                 psm.PepSpecMatch(
                     sequence=peptide,
                     spectrum_id=(filename, scan),
-                    peptide_score=float(aa_scores.mean()),
+                    peptide_score=peptide_score,
                     charge=int(charge),
                     calc_mz=np.nan,
                     exp_mz=float(prec_mz.item()),

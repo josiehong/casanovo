@@ -2124,6 +2124,42 @@ def test_pmc_decode_near_miss_does_not_shadow_a_match():
     assert model._fits_precursor_mass(tokens, precursor_mass)
 
 
+def test_predict_step_penalizes_mass_mismatch(monkeypatch):
+    """PMC may give up, and what it leaves behind must sort last."""
+    model = _pmc_model()
+    model.min_peptide_len = 0
+    idx = model.tokenizer.index
+    tokens = [idx["K"], idx["A"], idx["E"]]
+
+    logits = torch.full((2, 4, model.vocab_size), -10.0)
+    for frame, token in enumerate(tokens):
+        logits[:, frame, token] = 5.0
+    logits[:, 3, model.blank_token] = 5.0
+
+    mass = sum(model.token_masses[t].item() for t in tokens)
+    mass += denovo.model.H2O_MASS
+    # The second precursor is out of reach for any path, so PMC returns
+    # None and the unmatched greedy peptide survives.
+    precursors = torch.tensor([[mass], [5_000.0]])
+    monkeypatch.setattr(model, "_forward_step", lambda batch: (logits, None))
+    monkeypatch.setattr(
+        model, "_process_batch", lambda batch: (None, None, precursors, None)
+    )
+
+    matched, missed = model.predict_step(
+        {
+            "peak_file": ["a.mgf", "a.mgf"],
+            "scan_id": [1, 2],
+            "precursor_charge": torch.tensor([2, 2]),
+            "precursor_mz": torch.tensor([400.0, 400.0]),
+        }
+    )
+
+    assert matched.sequence == missed.sequence
+    assert missed.peptide_score < 0 <= matched.peptide_score
+    assert matched.peptide_score == pytest.approx(missed.peptide_score + 1)
+
+
 def test_run_map(mgf_small):
     out_writer = ms_io.MztabWriter("dummy.mztab")
     # Set peak file by base file name only.

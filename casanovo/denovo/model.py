@@ -790,7 +790,11 @@ class Spec2Pep(pl.LightningModule):
             )
 
         # Emittable tokens and their discretized masses. Padding, the
-        # blank, and the stop token do not emit. N-terminal modifications
+        # blank, and the stop token do not emit, and unlike the blank they
+        # are not traversable either: a path cannot pass through the frame
+        # where the model puts its stop, so PMC pays for that frame while
+        # the greedy path does not, and the two path probabilities are not
+        # on the same scale. N-terminal modifications
         # are emittable but only as the first residue (see `nterm_only`),
         # which is also what bounds the negative headroom: a negative mass
         # is allowed only for those, so at most one can be emitted.
@@ -990,7 +994,8 @@ class Spec2Pep(pl.LightningModule):
         self, batch: Dict[str, torch.Tensor], *args
     ) -> List[psm.PepSpecMatch]:
         """
-        A single prediction step (greedy CTC decoding).
+        A single prediction step: greedy CTC decoding, then precise mass
+        control when the greedy peptide misses the precursor window.
 
         Parameters
         ----------

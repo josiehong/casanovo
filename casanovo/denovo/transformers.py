@@ -115,7 +115,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         output layer the model already has, and that prediction carries an
         auxiliary CTC loss during training. The score is not fed back into
         the stack, so the layers below are supervised without changing what
-        the layers above receive, and inference is unaffected.
+        the layers above receive, and what a spectrum decodes to is
+        unaffected. Inference still runs this method and scores those
+        layers, for predictions nothing reads.
 
         This has to open up the layer stack rather than call
         ``transformer_decoder`` in one shot, so it prepares the frames

@@ -31,6 +31,7 @@ _config_deprecated = dict(
 # user config to list every key).
 _config_optional = frozenset(
     {
+        "decoder_frames",
         "muon_lr",
         "muon_momentum",
         "inter_ctc_layers",
@@ -66,6 +67,7 @@ class Config:
         isotope_error_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
         min_peptide_len=int,
         max_peptide_len=int,
+        decoder_frames=int,
         predict_batch_size=int,
         top_match=int,
         accelerator=str,
@@ -170,6 +172,16 @@ class Config:
         # Validate.
         for key, val in self._config_types.items():
             self.validate_param(key, val)
+
+        # CTC needs a frame per residue, so the budget has to cover the
+        # longest peptide considered. Repeats need one more each, which
+        # only the data knows; training warns about those.
+        if self._params["decoder_frames"] < self._params["max_peptide_len"]:
+            raise ValueError(
+                f"decoder_frames ({self._params['decoder_frames']}) is below "
+                f"max_peptide_len ({self._params['max_peptide_len']}); "
+                "peptides that long could not be decoded"
+            )
 
         self._params["n_workers"] = utils.n_workers()
 

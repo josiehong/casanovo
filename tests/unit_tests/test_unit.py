@@ -1866,7 +1866,7 @@ def test_frames_attend_to_each_other(inter_ctc_layers):
         n_head=2,
         dim_feedforward=8,
         n_layers=2,
-        max_peptide_len=8,
+        decoder_frames=8,
         residues="massivekb",
         tokenizer=tokenizer,
         inter_ctc_layers=inter_ctc_layers,
@@ -1882,8 +1882,8 @@ def test_frames_attend_to_each_other(inter_ctc_layers):
 
     with torch.no_grad():
         short, _ = model._forward_step(batch)
-        # `max_peptide_len` sets the frame count, so raising it adds frames.
-        model.max_peptide_len += 8
+        # `decoder_frames` is the frame count, so raising it adds frames.
+        model.decoder_frames += 8
         long, _ = model._forward_step(batch)
 
     shared = short.shape[1]
@@ -1904,7 +1904,7 @@ def test_intermediate_ctc_adds_no_parameters():
         n_head=2,
         dim_feedforward=8,
         n_layers=3,
-        max_peptide_len=8,
+        decoder_frames=8,
         residues="massivekb",
         tokenizer=tokenizer,
     )
@@ -2375,7 +2375,7 @@ def test_beam_search_decode(tiny_config):
     model.tokenizer.reverse = False
 
     batch = 1
-    length = model.max_peptide_len + 1
+    length = model.decoder_frames + 1
     beam = model.n_beams
     step = 3
     device = model.device
@@ -2602,7 +2602,7 @@ def test_get_topk_beams(tiny_config):
     model._beam_size = beam
     model._cumulative_masses = torch.zeros(batch * beam, device=device)
 
-    length = model.max_peptide_len + 1
+    length = model.decoder_frames + 1
     vocab = len(model.tokenizer) + 1
 
     scores = torch.zeros((batch * beam, length, vocab), device=device)
@@ -2639,7 +2639,7 @@ def test_finish_beams_negative_mods(tiny_config):
     model._beam_size = beam
     model._cumulative_masses = torch.zeros(batch * beam, device=device)
 
-    length = model.max_peptide_len + 1
+    length = model.decoder_frames + 1
     step = 1
     tokens = torch.zeros((beam, length), dtype=torch.int64, device=device)
     tokens[:, : step + 1] = model.tokenizer.tokenize(["GK", "AK"])
@@ -2664,7 +2664,7 @@ def test_beam_search_decode_early_termination(tiny_config):
         ),
     )
 
-    model.max_peptide_len = 0
+    model.decoder_frames = 0
     mzs = ints = torch.zeros(1, 5, device=model.device)
     precursors = torch.tensor(
         [[469.25364, 2.0, 235.63410]], device=model.device
@@ -2692,7 +2692,7 @@ def test_duplicate_peptide_scores(tiny_config):
     model._beam_size = beam
     model._cumulative_masses = torch.zeros(batch * beam, device=device)
 
-    length = model.max_peptide_len + 1
+    length = model.decoder_frames + 1
     vocab = len(model.tokenizer) + 1
     step = 4
 

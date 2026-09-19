@@ -63,8 +63,11 @@ class Spec2Pep(pl.LightningModule):
         encoding the m/z value. If ``None``, the intensity will be
         projected up to ``dim_model`` using a linear layer, then summed
         with the m/z encoding for each peak.
-    max_peptide_len : int
-        The maximum peptide length to decode.
+    decoder_frames : int
+        How many frames the decoder emits, which CTC aligns to the
+        shorter peptide. It has to exceed the longest peptide plus one
+        frame per repeated residue, and self-attention grows with its
+        square.
     residues : str | Dict[str, float]
         The amino acid dictionary and their masses. By default
         ("canonical") this is only the 20 canonical amino acids, with
@@ -120,7 +123,7 @@ class Spec2Pep(pl.LightningModule):
         dim_feedforward: int = 1024,
         n_layers: int = 9,
         dropout: float = 0.0,
-        max_peptide_len: int = 100,
+        decoder_frames: int = 100,
         residues: str | Dict[str, float] = "canonical",
         max_charge: int = 5,
         precursor_mass_tol: float = 50,
@@ -180,6 +183,9 @@ class Spec2Pep(pl.LightningModule):
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
         self.muon_lr = kwargs.pop("muon_lr", 0.002)
         self.muon_momentum = kwargs.pop("muon_momentum", 0.95)
+        # Only the database search filters on peptide length. Checkpoints
+        # saved before decoder_frames split off still carry this.
+        kwargs.pop("max_peptide_len", None)
         # `kwargs` will contain additional arguments as well as
         # unrecognized arguments, including deprecated ones. Remove the
         # deprecated ones.
@@ -192,7 +198,7 @@ class Spec2Pep(pl.LightningModule):
         self.opt_kwargs = kwargs
 
         # Data properties.
-        self.max_peptide_len = max_peptide_len
+        self.decoder_frames = decoder_frames
         self.residues = residues
         self.precursor_mass_tol = precursor_mass_tol
         self.isotope_error_range = isotope_error_range
@@ -323,8 +329,10 @@ class Spec2Pep(pl.LightningModule):
         Returns
         -------
         scores : torch.Tensor of shape
-                (n_spectra, max_peptide_len + 1, n_amino_acids)
-            The frame-level amino acid scores for each prediction.
+                (n_spectra, decoder_frames + 1, n_amino_acids)
+            The frame-level amino acid scores for each prediction. The
+            extra frame is the precursor token, which the decoder puts
+            at position 0 and the output layer scores like any other.
         seqs : torch.Tensor of shape (n_spectra, length) or None
             The ground truth tokens for training, or None for inference.
         intermediates : list of torch.Tensor
@@ -338,7 +346,7 @@ class Spec2Pep(pl.LightningModule):
         # Decode a fixed number of frames; the CTC loss aligns them to
         # the (shorter) ground truth peptide.
         zero_tokens = torch.zeros(
-            (mzs.shape[0], self.max_peptide_len),
+            (mzs.shape[0], self.decoder_frames),
             dtype=torch.long,
             device=self.device,
         )
@@ -411,10 +419,10 @@ class Spec2Pep(pl.LightningModule):
             self._ctc_infeasible_warned = True
             logger.warning(
                 "%d peptide(s) in this batch need more CTC frames than "
-                "max_peptide_len + 1 = %d and will contribute zero loss. "
-                "Increase max_peptide_len to include them in training.",
+                "decoder_frames + 1 = %d and will contribute zero loss. "
+                "Increase decoder_frames to include them in training.",
                 infeasible.sum().item(),
-                self.max_peptide_len + 1,
+                self.decoder_frames + 1,
             )
         loss = self.ctc_loss(log_probs, truth, input_lengths, target_lengths)
         # The final layer's CTC loss is what gets logged as `*_CTCLoss`, so it

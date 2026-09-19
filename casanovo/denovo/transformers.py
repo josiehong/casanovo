@@ -1,5 +1,6 @@
 """Transformer encoder and decoder for the de novo sequencing task."""
 
+import warnings
 from collections.abc import Callable, Sequence
 
 import torch
@@ -84,9 +85,18 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         # states, for an auxiliary CTC loss each. Scoring reuses the output
         # layer, so no layer here grows the model, and a checkpoint trained
         # without them still loads.
+        requested = tuple(sorted(set(inter_ctc_layers)))
         self.inter_ctc_layers = tuple(
-            k for k in sorted(set(inter_ctc_layers)) if 1 <= k < n_layers
+            k for k in requested if 1 <= k < n_layers
         )
+        dropped = [k for k in requested if k not in self.inter_ctc_layers]
+        if dropped:
+            warnings.warn(
+                f"Ignoring inter_ctc_layers {dropped}: a decoder of "
+                f"{n_layers} layers can score layers 1 to {n_layers - 1}. "
+                f"Scoring {list(self.inter_ctc_layers)}.",
+                stacklevel=2,
+            )
 
     def forward_with_intermediates(
         self,

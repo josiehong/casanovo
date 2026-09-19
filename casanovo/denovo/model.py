@@ -172,6 +172,11 @@ class Spec2Pep(pl.LightningModule):
             max_charge=max_charge,
             inter_ctc_layers=self.inter_ctc_layers,
         )
+        # The decoder keeps only the layers it has, so take its list back as
+        # the effective one. Holding the raw request here would let the gate
+        # in _forward_step ask for intermediates from a decoder that scores
+        # nothing, and the auxiliary loss would be skipped without a word.
+        self.inter_ctc_layers = self.decoder.inter_ctc_layers
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(
             blank=self.blank_token, zero_infinity=True

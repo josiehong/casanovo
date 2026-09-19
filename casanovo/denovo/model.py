@@ -5,7 +5,17 @@ import heapq
 import itertools
 import logging
 import warnings
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import depthcharge.constants
 import einops
@@ -117,11 +127,14 @@ class Spec2Pep(pl.LightningModule):
     inter_ctc_weight : float
         Share of the training loss carried by those auxiliary
         predictions; the final layer carries the rest.
+    muon_lr : float
+        Learning rate for the Muon parameter group, the hidden weight
+        matrices. Muon updates have unit RMS, so this is on a different
+        scale than the auxiliary group's.
+    muon_momentum : float
+        Momentum for the Muon parameter group.
     **kwargs : Dict
-        Additional keyword arguments for the optimizer: ``muon_lr`` and
-        ``muon_momentum`` configure the Muon parameter group; the rest
-        are passed to the auxiliary AdamW group. ``inter_ctc_layers`` and
-        ``inter_ctc_weight`` arrive here too and are documented above.
+        Additional keyword arguments for the auxiliary AdamW group.
     """
 
     def __init__(
@@ -143,6 +156,10 @@ class Spec2Pep(pl.LightningModule):
         train_label_smoothing: float = 0.01,
         warmup_iters: int = 100_000,
         cosine_schedule_period_iters: int = 600_000,
+        inter_ctc_layers: Sequence[int] = (),
+        inter_ctc_weight: float = 0.5,
+        muon_lr: float = 0.002,
+        muon_momentum: float = 0.95,
         out_writer: Optional[ms_io.MztabWriter] = None,
         calculate_precision: bool = False,
         tokenizer: PeptideTokenizer | None = None,
@@ -168,8 +185,8 @@ class Spec2Pep(pl.LightningModule):
         # states for an auxiliary loss, and how much of the loss those
         # auxiliary predictions carry. Empty list disables it, and the
         # model is then identical to the plain CTC decoder.
-        self.inter_ctc_layers = tuple(kwargs.pop("inter_ctc_layers", ()) or ())
-        self.inter_ctc_weight = float(kwargs.pop("inter_ctc_weight", 0.5))
+        self.inter_ctc_layers = tuple(inter_ctc_layers or ())
+        self.inter_ctc_weight = float(inter_ctc_weight)
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
             d_model=dim_model,
@@ -194,11 +211,8 @@ class Spec2Pep(pl.LightningModule):
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
-        self.muon_lr = kwargs.pop("muon_lr", 0.002)
-        self.muon_momentum = kwargs.pop("muon_momentum", 0.95)
-        # Only the database search filters on peptide length. Checkpoints
-        # saved before decoder_frames split off still carry this.
-        kwargs.pop("max_peptide_len", None)
+        self.muon_lr = muon_lr
+        self.muon_momentum = muon_momentum
         # `kwargs` will contain additional arguments as well as
         # unrecognized arguments, including deprecated ones. Remove the
         # deprecated ones.

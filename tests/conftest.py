@@ -266,6 +266,7 @@ def _get_config_file(file_path, file_name, additional_cfg=None):
         "isotope_error_range": [0, 1],
         "min_peptide_len": 6,
         "max_peptide_len": 100,
+        "decoder_frames": 100,
         # n_layers is 1 here, so no layer qualifies whatever this says.
         "inter_ctc_layers": [],
         "predict_batch_size": 1024,

@@ -31,7 +31,6 @@ _config_deprecated = dict(
 # user config to list every key).
 _config_optional = frozenset(
     {
-        "decoder_frames",
         "muon_lr",
         "muon_momentum",
         "inter_ctc_weight",

@@ -484,7 +484,6 @@ class ModelRunner:
             weight_decay=self.config.weight_decay,
             muon_lr=self.config.muon_lr,
             muon_momentum=self.config.muon_momentum,
-            inter_ctc_layers=self.config.inter_ctc_layers,
             inter_ctc_weight=self.config.inter_ctc_weight,
             train_label_smoothing=self.config.train_label_smoothing,
             calculate_precision=self.config.calculate_precision,
@@ -531,6 +530,8 @@ class ModelRunner:
                 loaded_model_params.keys()
             )
             for param in architecture_params:
+                if param not in self.model.hparams:
+                    continue
                 if model_params[param] != self.model.hparams[param]:
                     if param == "tokenizer":
                         self._verify_tokenizer(

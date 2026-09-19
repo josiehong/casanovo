@@ -34,7 +34,6 @@ _config_optional = frozenset(
         "decoder_frames",
         "muon_lr",
         "muon_momentum",
-        "inter_ctc_layers",
         "inter_ctc_weight",
     }
 )

@@ -688,6 +688,141 @@ class Spec2Pep(pl.LightningModule):
             for lo, hi in self._residue_mass_windows(precursor_mass)
         )
 
+    def _pmc_grid(
+        self, precursor_mass: float, n_frames: int, vocab: int
+    ) -> Optional[Tuple[float, int, int, float, List[Tuple[float, float]]]]:
+        """
+        Size the mass axis the PMC search runs over.
+
+        Returns ``(resolution, zero_bin, n_bins, hi_max, accept_windows)``,
+        or None when no finite window bounds the search.
+        """
+        # Mass discretization. The pointer table is the memory
+        # bottleneck, so pick the finest resolution whose table fits in
+        # PMC_MAX_POINTER_BYTES rather than giving up on mass control
+        # for heavy precursors. The guard widens the mass axis to hold
+        # accumulated rounding, which grows with the resolution and the
+        # number of emissions; acceptance tests the exact mass.
+        base = self._residue_mass_windows(precursor_mass, PMC_MASS_GUARD)
+        hi_base = max(hi for _, hi in base)
+        if hi_base <= 0:
+            return None
+        # An unbounded window constrains nothing: precursor_mass_tol is
+        # "inf", which is how PMC is turned off. Bail out rather than build
+        # a mass axis of infinite extent, whose resolution would come out
+        # inf and whose bin count would be NaN. Only an empty greedy
+        # peptide reaches here under an infinite tolerance, since a
+        # non-empty one already "fits" and predict_step skips the search.
+        if not np.isfinite(hi_base):
+            return None
+        max_bins = max(4, PMC_MAX_POINTER_BYTES // (n_frames * vocab))
+        resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
+        guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
+        axis_windows = self._residue_mass_windows(precursor_mass, guard)
+        hi_max = max(hi for _, hi in axis_windows)
+        # What the readout accepts: the true windows, unguarded. The
+        # states carry exact masses, so this is the same predicate
+        # `_fits_precursor_mass` applies to the finished peptide.
+        accept_windows = self._residue_mass_windows(precursor_mass)
+        # Negative-mass tokens (the ammonia-loss N-terminal modification)
+        # push the running total below zero, so the axis starts below it.
+        # Only N-terminal modifications may be negative and only one may be
+        # emitted, so one token's worth of headroom is enough.
+        neg_mass = min(
+            (self.token_masses[c].item() for c in self.neg_mass_idx.tolist()),
+            default=0.0,
+        )
+        zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
+        n_bins = zero_bin + int(hi_max / resolution) + 2
+        if n_bins > max_bins:
+            # The widened guard pushed the table back over budget. The
+            # offset bins have to come out of the budget too, so solve for
+            # the resolution with them already reserved.
+            resolution = hi_max / max(1, max_bins - zero_bin - 2)
+            zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
+            n_bins = zero_bin + int(hi_max / resolution) + 2
+        if resolution > PMC_RESOLUTION and not self._pmc_size_warned:
+            self._pmc_size_warned = True
+            logger.warning(
+                "Coarsening precise mass control decoding to %.4f Da for "
+                "large precursor masses to keep the DP table under %d "
+                "bytes.",
+                resolution,
+                PMC_MAX_POINTER_BYTES,
+            )
+        return resolution, zero_bin, n_bins, hi_max, accept_windows
+
+    def _pmc_alphabet(
+        self, vocab: int, hi_max: float, resolution: float, device
+    ) -> Optional[Tuple[Any, Any, Any, List[bool], Dict[int, int]]]:
+        """
+        Which tokens the PMC search may emit, and by how much mass.
+
+        Returns ``(emit_idx, delta_idx, emit_exact, emit_nterm, deltas)``,
+        or None when nothing is emittable within the mass axis.
+        """
+        # Emittable tokens and their discretized masses. Padding, the
+        # blank, and the stop token do not emit, and unlike the blank they
+        # are not traversable either: a path cannot pass through the frame
+        # where the model puts its stop, so PMC pays for that frame while
+        # the greedy path does not, and the two path probabilities are not
+        # on the same scale. N-terminal modifications
+        # are emittable but only as the first residue (see `nterm_only`),
+        # which is also what bounds the negative headroom: a negative mass
+        # is allowed only for those, so at most one can be emitted.
+        excluded = {0, self.blank_token, self.stop_token}
+        nterm = set(self.nterm_idx.tolist())
+        emit_tokens, emit_deltas, emit_nterm = [], [], []
+        for c in range(min(vocab, self.token_masses.shape[0])):
+            mass = self.token_masses[c].item()
+            if c in excluded or mass > hi_max:
+                continue
+            if mass <= 0 and c not in nterm:
+                # A non-terminal residue of zero or negative mass could
+                # repeat without bound, which the fixed axis cannot hold.
+                continue
+            emit_tokens.append(c)
+            emit_deltas.append(round(mass / resolution))
+            emit_nterm.append(c in nterm)
+        if not emit_tokens:
+            return None
+        deltas = dict(zip(emit_tokens, emit_deltas))
+        emit_idx = torch.tensor(emit_tokens, device=device)
+        delta_idx = torch.tensor(emit_deltas, device=device)
+        # The unrounded masses, added to the running total alongside the
+        # rounded ones that move the state along the axis.
+        emit_exact = self.token_masses[emit_idx]
+        return emit_idx, delta_idx, emit_exact, emit_nterm, deltas
+
+    def _pmc_transitions(
+        self,
+        delta_idx,
+        emit_nterm: List[bool],
+        n_bins: int,
+        zero_bin: int,
+        device,
+    ) -> Tuple[Any, Any]:
+        """
+        Where each emission comes from on the mass axis, and whether it may.
+
+        Returns ``(src_bins, valid)``, both of shape (emissions, bins).
+        """
+        # Per-token mass shifts as gather indices over the mass axis:
+        # src_bins[e, m] = m - delta_e. A negative delta moves the source
+        # ABOVE the target, so both ends of the axis have to be checked.
+        bins = torch.arange(n_bins, device=device)
+        raw_src = bins.unsqueeze(0) - delta_idx.unsqueeze(1)
+        valid = (raw_src >= 0) & (raw_src < n_bins)
+        src_bins = raw_src.clamp(0, n_bins - 1)
+        # An N-terminal modification may only open the peptide. "Nothing
+        # emitted yet" is the zero-mass bin, so requiring the source to be
+        # `zero_bin` means requiring the target to be zero_bin + delta.
+        nterm_only = torch.tensor(emit_nterm, device=device).unsqueeze(1)
+        valid &= ~nterm_only | (
+            bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
+        )
+        return src_bins, valid
+
     def _pmc_decode(
         self, logits: torch.Tensor, precursor_mass: float
     ) -> Optional[Tuple[List[int], List[float]]]:
@@ -749,106 +884,19 @@ class Spec2Pep(pl.LightningModule):
         if self.tokenizer.reverse:
             logits = logits.flip(0)
 
-        # Mass discretization. The pointer table is the memory
-        # bottleneck, so pick the finest resolution whose table fits in
-        # PMC_MAX_POINTER_BYTES rather than giving up on mass control
-        # for heavy precursors. The guard widens the mass axis to hold
-        # accumulated rounding, which grows with the resolution and the
-        # number of emissions; acceptance tests the exact mass.
-        base = self._residue_mass_windows(precursor_mass, PMC_MASS_GUARD)
-        hi_base = max(hi for _, hi in base)
-        if hi_base <= 0:
+        grid = self._pmc_grid(precursor_mass, n_frames, vocab)
+        if grid is None:
             return None
-        # An unbounded window constrains nothing: precursor_mass_tol is
-        # "inf", which is how PMC is turned off. Bail out rather than build
-        # a mass axis of infinite extent, whose resolution would come out
-        # inf and whose bin count would be NaN. Only an empty greedy
-        # peptide reaches here under an infinite tolerance, since a
-        # non-empty one already "fits" and predict_step skips the search.
-        if not np.isfinite(hi_base):
-            return None
-        max_bins = max(4, PMC_MAX_POINTER_BYTES // (n_frames * vocab))
-        resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
-        guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
-        axis_windows = self._residue_mass_windows(precursor_mass, guard)
-        hi_max = max(hi for _, hi in axis_windows)
-        # What the readout accepts: the true windows, unguarded. The
-        # states carry exact masses, so this is the same predicate
-        # `_fits_precursor_mass` applies to the finished peptide.
-        accept_windows = self._residue_mass_windows(precursor_mass)
-        # Negative-mass tokens (the ammonia-loss N-terminal modification)
-        # push the running total below zero, so the axis starts below it.
-        # Only N-terminal modifications may be negative and only one may be
-        # emitted, so one token's worth of headroom is enough.
-        neg_mass = min(
-            (self.token_masses[c].item() for c in self.neg_mass_idx.tolist()),
-            default=0.0,
-        )
-        zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
-        n_bins = zero_bin + int(hi_max / resolution) + 2
-        if n_bins > max_bins:
-            # The widened guard pushed the table back over budget. The
-            # offset bins have to come out of the budget too, so solve for
-            # the resolution with them already reserved.
-            resolution = hi_max / max(1, max_bins - zero_bin - 2)
-            zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
-            n_bins = zero_bin + int(hi_max / resolution) + 2
-        if resolution > PMC_RESOLUTION and not self._pmc_size_warned:
-            self._pmc_size_warned = True
-            logger.warning(
-                "Coarsening precise mass control decoding to %.4f Da for "
-                "large precursor masses to keep the DP table under %d "
-                "bytes.",
-                resolution,
-                PMC_MAX_POINTER_BYTES,
-            )
+        resolution, zero_bin, n_bins, hi_max, accept_windows = grid
 
-        # Emittable tokens and their discretized masses. Padding, the
-        # blank, and the stop token do not emit, and unlike the blank they
-        # are not traversable either: a path cannot pass through the frame
-        # where the model puts its stop, so PMC pays for that frame while
-        # the greedy path does not, and the two path probabilities are not
-        # on the same scale. N-terminal modifications
-        # are emittable but only as the first residue (see `nterm_only`),
-        # which is also what bounds the negative headroom: a negative mass
-        # is allowed only for those, so at most one can be emitted.
-        excluded = {0, self.blank_token, self.stop_token}
-        nterm = set(self.nterm_idx.tolist())
-        emit_tokens, emit_deltas, emit_nterm = [], [], []
-        for c in range(min(vocab, self.token_masses.shape[0])):
-            mass = self.token_masses[c].item()
-            if c in excluded or mass > hi_max:
-                continue
-            if mass <= 0 and c not in nterm:
-                # A non-terminal residue of zero or negative mass could
-                # repeat without bound, which the fixed axis cannot hold.
-                continue
-            emit_tokens.append(c)
-            emit_deltas.append(round(mass / resolution))
-            emit_nterm.append(c in nterm)
-        if not emit_tokens:
+        alphabet = self._pmc_alphabet(vocab, hi_max, resolution, device)
+        if alphabet is None:
             return None
-        deltas = dict(zip(emit_tokens, emit_deltas))
-        emit_idx = torch.tensor(emit_tokens, device=device)
+        emit_idx, delta_idx, emit_exact, emit_nterm, deltas = alphabet
         emit_i8 = emit_idx.unsqueeze(1).to(torch.int8)
-        delta_idx = torch.tensor(emit_deltas, device=device)
-        # The unrounded masses, added to the running total alongside the
-        # rounded ones that move the state along the axis.
-        emit_exact = self.token_masses[emit_idx]
 
-        # Per-token mass shifts as gather indices over the mass axis:
-        # src_bins[e, m] = m - delta_e. A negative delta moves the source
-        # ABOVE the target, so both ends of the axis have to be checked.
-        bins = torch.arange(n_bins, device=device)
-        raw_src = bins.unsqueeze(0) - delta_idx.unsqueeze(1)
-        valid = (raw_src >= 0) & (raw_src < n_bins)
-        src_bins = raw_src.clamp(0, n_bins - 1)
-        # An N-terminal modification may only open the peptide. "Nothing
-        # emitted yet" is the zero-mass bin, so requiring the source to be
-        # `zero_bin` means requiring the target to be zero_bin + delta.
-        nterm_only = torch.tensor(emit_nterm, device=device).unsqueeze(1)
-        valid &= ~nterm_only | (
-            bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
+        src_bins, valid = self._pmc_transitions(
+            delta_idx, emit_nterm, n_bins, zero_bin, device
         )
 
         log_probs = logits.log_softmax(-1)

@@ -1033,7 +1033,9 @@ class Spec2Pep(pl.LightningModule):
             sequences,
             scores,
         ):
-            if not tokens:
+            # Beam search withheld these; CTC decoding replaced it
+            # without replacing the rule.
+            if not tokens or len(tokens) < self.min_peptide_len:
                 continue
 
             peptide = "".join(

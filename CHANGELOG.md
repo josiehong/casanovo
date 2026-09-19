@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Peptide predictions failing the minimum peptide length are not reported, irrespective of whether they match or exceed the precursor mass.
 - Decoder frames can attend to one another. Every frame is fed the padding token, whose embedding is zero, so the inferred target padding mask marked them all as padding and left only the precursor token visible.
 - Database-search candidates are no longer scored against the padding of whichever batch they landed in.
+- De novo predictions shorter than `min_peptide_len` are withheld again; beam search enforced this and CTC decoding replaced it.
 
 ## [5.1.2] - 2025-12-11
 

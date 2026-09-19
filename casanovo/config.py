@@ -25,18 +25,6 @@ _config_deprecated = dict(
     reverse_peptides=None,
 )
 
-# Options added after existing config files were written. They default from
-# the packaged config.yaml when a user config omits them, so adding an option
-# does not invalidate every config in the wild (casanovo otherwise requires a
-# user config to list every key).
-_config_optional = frozenset(
-    {
-        "muon_lr",
-        "muon_momentum",
-        "inter_ctc_weight",
-    }
-)
-
 
 class Config:
     """
@@ -150,11 +138,7 @@ class Config:
 
                         warnings.warn(warning_msg, DeprecationWarning)
                 # Check for missing entries in config file.
-                config_missing = (
-                    self._params.keys()
-                    - self._user_config.keys()
-                    - _config_optional
-                )
+                config_missing = self._params.keys() - self._user_config.keys()
                 if len(config_missing) > 0:
                     raise KeyError(
                         "Missing expected config option(s): "

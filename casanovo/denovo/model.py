@@ -1116,12 +1116,12 @@ class Spec2Pep(pl.LightningModule):
             if self.tokenizer.reverse:
                 aa_scores = aa_scores[::-1]
 
-            peptide_score = float(aa_scores.mean())
-            if not fit:
-                # PMC found no mass-matching path, so the greedy peptide
-                # survives. Beam search sorted these last; CTC decoding
-                # replaced it without replacing the rule.
-                peptide_score -= 1
+            # Upstream's aggregation, which subtracts 1 when the peptide
+            # misses the precursor, as it does when PMC found no
+            # mass-matching path and the greedy peptide survived. The
+            # product also survives the N-terminal score merge in
+            # `on_predict_batch_end`, which a mean does not.
+            peptide_score = float(_peptide_score(aa_scores, fit))
 
             predictions.append(
                 psm.PepSpecMatch(

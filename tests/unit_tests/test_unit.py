@@ -2206,6 +2206,11 @@ def test_predict_step_penalizes_mass_mismatch(monkeypatch):
     assert matched.sequence == missed.sequence
     assert missed.peptide_score < 0 <= matched.peptide_score
     assert matched.peptide_score == pytest.approx(missed.peptide_score + 1)
+    # Aggregated as upstream does, so the reported score stays the
+    # product of the reported residue scores.
+    assert matched.peptide_score == pytest.approx(
+        float(np.prod(matched.aa_scores))
+    )
 
 
 def test_run_map(mgf_small):

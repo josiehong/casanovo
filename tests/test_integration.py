@@ -194,7 +194,7 @@ def test_train_and_run(
         "FSGSGSGTDFTLTISSLQPEDFAVYYCQQDYNLP",
     ]
 
-    # pyteomics may parse "null" cells as NaN; normalize to None.
+    # pyteomics 5 parses "null" cells as NaN where 4 gave None.
     mods = [m if isinstance(m, str) else None for m in psms["modifications"]]
     assert mods == [
         None,

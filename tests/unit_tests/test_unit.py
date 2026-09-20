@@ -1964,14 +1964,14 @@ def test_pmc_decode():
         masses[aa_k] + masses[aa_a] + masses[aa_e]
     ).item() + 18.010565
 
-    tokens, confs = model._pmc_decode(logits, precursor_mass)
+    tokens, confs, _ = model._pmc_decode(logits, precursor_mass)
     assert tokens == [aa_k, aa_a, aa_e]
     assert len(confs) == len(tokens)
     assert model._fits_precursor_mass(tokens, precursor_mass)
     assert not model._fits_precursor_mass(greedy, precursor_mass)
 
     # An observed precursor mass off by one isotope is still matched.
-    tokens, _ = model._pmc_decode(logits, precursor_mass + 1.00335)
+    tokens, *_ = model._pmc_decode(logits, precursor_mass + 1.00335)
     assert tokens == [aa_k, aa_a, aa_e]
 
     # No path can reach an infeasible precursor mass.
@@ -2015,7 +2015,7 @@ def test_pmc_decode_nterm_mod():
         masses[aa_k] + masses[aa_g] + masses[nterm]
     ).item() + 18.010565
 
-    tokens, confs = model._pmc_decode(logits, precursor_mass)
+    tokens, confs, _ = model._pmc_decode(logits, precursor_mass)
     assert tokens == [aa_k, aa_g, nterm]
     assert len(confs) == len(tokens)
     assert model._fits_precursor_mass(tokens, precursor_mass)
@@ -2047,7 +2047,7 @@ def test_pmc_decode_all_nterm_mods():
             masses[aa_k] + masses[aa_g] + masses[nterm]
         ).item() + 18.010565
 
-        tokens, _ = model._pmc_decode(logits, precursor_mass)
+        tokens, *_ = model._pmc_decode(logits, precursor_mass)
         assert tokens == [aa_k, aa_g, nterm], label
         assert model._fits_precursor_mass(tokens, precursor_mass), label
         # Still rejected at the wrong end, negative mass or not.
@@ -2093,7 +2093,7 @@ def test_pmc_decode_keeps_predicted_nterm_mod():
         assert greedy == [aa_k, aa_g, aa_e, nterm], label
         assert not model._fits_precursor_mass(greedy, precursor_mass), label
 
-        tokens, _ = model._pmc_decode(logits, precursor_mass)
+        tokens, *_ = model._pmc_decode(logits, precursor_mass)
         assert tokens == [aa_k, aa_a, aa_e, nterm], label
         assert model._fits_precursor_mass(tokens, precursor_mass), label
 
@@ -2101,7 +2101,7 @@ def test_pmc_decode_keeps_predicted_nterm_mod():
         bare = (
             masses[aa_k] + masses[aa_a] + masses[aa_e]
         ).item() + denovo.model.H2O_MASS
-        tokens, _ = model._pmc_decode(logits, bare)
+        tokens, *_ = model._pmc_decode(logits, bare)
         assert tokens == [aa_k, aa_a, aa_e], label
 
 
@@ -2125,7 +2125,7 @@ def test_pmc_decode_coarse_resolution(monkeypatch):
     # A budget this small cannot hold the 0.01 Da grid; decoding should
     # coarsen the grid instead of giving up on mass control.
     monkeypatch.setattr(denovo.model, "PMC_MAX_POINTER_BYTES", 50_000)
-    tokens, _ = model._pmc_decode(logits, precursor_mass)
+    tokens, *_ = model._pmc_decode(logits, precursor_mass)
     assert tokens == [aa_k, aa_a, aa_e]
     assert model._fits_precursor_mass(tokens, precursor_mass)
 
@@ -2167,7 +2167,7 @@ def test_pmc_decode_near_miss_does_not_shadow_a_match():
 
     result = model._pmc_decode(logits, precursor_mass)
     assert result is not None, "the decoy shadowed a real match"
-    tokens, _ = result
+    tokens, *_ = result
     assert tokens == [aa_k, aa_a, aa_e]
     assert model._fits_precursor_mass(tokens, precursor_mass)
 
@@ -2936,3 +2936,50 @@ def test_db_spec2pep_forward_no_cache(tiny_config):
 
     # Assert that the non-cached path was taken
     db_model._forward_step.assert_called_once()
+
+
+def test_stop_token_is_scored_with_the_peptide(monkeypatch):
+    """The stop is trained as an emission, so it counts in the score.
+
+    CTC supervises it (`add_stop` puts it in the target), and upstream's
+    peptide score counts it, so decoding scores it too. It is not part
+    of the peptide, so it stays out of the reported residue scores.
+    """
+    model = _pmc_model()
+    model.min_peptide_len = 0
+    seq = [model.tokenizer.index[a] for a in ("K", "A", "E")]
+
+    logits = torch.full((1, 8, model.vocab_size), -10.0)
+    for frame, token in enumerate(seq):
+        logits[0, frame, token] = 5.0
+    # Deliberately less certain than the residues, so its contribution
+    # to the product is visible.
+    logits[0, 3, model.stop_token] = 2.0
+    logits[0, 4:, model.blank_token] = 5.0
+
+    mass = sum(model.token_masses[t].item() for t in seq)
+    mass += denovo.model.H2O_MASS
+    monkeypatch.setattr(model, "_forward_step", lambda batch: (logits, None))
+    monkeypatch.setattr(
+        model,
+        "_process_batch",
+        lambda batch: (None, None, torch.tensor([[mass]]), None),
+    )
+
+    (pred,) = model.predict_step(
+        {
+            "peak_file": ["a.mgf"],
+            "scan_id": [1],
+            "precursor_charge": torch.tensor([2]),
+            "precursor_mz": torch.tensor([400.0]),
+        }
+    )
+
+    _, _, (stop_conf,) = model._ctc_decode(logits)
+    assert stop_conf is not None and stop_conf < 1
+    # Reported residues exclude the stop; the peptide score includes it.
+    assert len(pred.aa_scores) == len(seq)
+    assert pred.peptide_score == pytest.approx(
+        float(np.prod(pred.aa_scores)) * stop_conf
+    )
+    assert pred.peptide_score < float(np.prod(pred.aa_scores))

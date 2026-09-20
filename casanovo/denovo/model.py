@@ -564,7 +564,9 @@ class Spec2Pep(pl.LightningModule):
 
     def _ctc_decode(
         self, logits: torch.Tensor
-    ) -> Tuple[List[List[int]], List[List[float]]]:
+    ) -> Tuple[
+        List[List[int]], List[List[float]], List[Optional[float]]
+    ]:
         """
         Greedy CTC decoding of frame-level logits.
 
@@ -586,6 +588,10 @@ class Spec2Pep(pl.LightningModule):
         scores : List[List[float]]
             The confidence for each decoded token, taken as the maximum
             probability over the frames merged into that token.
+        stop_scores : List[Optional[float]]
+            The stop's own confidence, where one was emitted. It is
+            scored with the peptide but is not part of it, so it is
+            returned apart from the tokens rather than among them.
         """
         probs = torch.softmax(logits, dim=-1)
         frame_confs, frame_tokens = probs.max(dim=-1)
@@ -593,7 +599,7 @@ class Spec2Pep(pl.LightningModule):
         # Padding (0) is treated as non-emitting, like the blank.
         silent = (0, self.blank_token)
 
-        sequences, scores = [], []
+        sequences, scores, stop_scores = [], [], []
         for b, (tokens, confs) in enumerate(
             zip(frame_tokens.tolist(), frame_confs.tolist())
         ):
@@ -608,8 +614,13 @@ class Spec2Pep(pl.LightningModule):
                         conf[-1] = prob
                         frames[-1] = j
                 prev = token
+            # The stop ends the peptide but is scored with it, the way
+            # upstream's peptide score counts it, so its confidence is
+            # kept aside rather than dropped with the frames after it.
+            stop_conf = None
             if self.stop_token in seq:
                 stop = seq.index(self.stop_token)
+                stop_conf = conf[stop]
                 seq, conf, frames = seq[:stop], conf[:stop], frames[:stop]
             # With a reversed tokenizer the N-terminus is the last token.
             nterm_pos = len(seq) - 1 if self.tokenizer.reverse else 0
@@ -626,7 +637,8 @@ class Spec2Pep(pl.LightningModule):
                 fixed_conf.append(prob)
             sequences.append(fixed_seq)
             scores.append(fixed_conf)
-        return sequences, scores
+            stop_scores.append(stop_conf)
+        return sequences, scores, stop_scores
 
     def _residue_mass_windows(
         self, precursor_mass: float, guard: float = 0.0
@@ -758,32 +770,31 @@ class Spec2Pep(pl.LightningModule):
         """
         Which tokens the PMC search may emit, and by how much mass.
 
-        Returns ``(emit_idx, delta_idx, emit_exact, emit_nterm, deltas)``,
+        Returns ``(emit_idx, delta_idx, emit_exact, emit_pinned, deltas)``,
         or None when nothing is emittable within the mass axis.
         """
-        # Emittable tokens and their discretized masses. Padding, the
-        # blank, and the stop token do not emit, and unlike the blank they
-        # are not traversable either: a path cannot pass through the frame
-        # where the model puts its stop, so PMC pays for that frame while
-        # the greedy path does not, and the two path probabilities are not
-        # on the same scale. N-terminal modifications
-        # are emittable but only as the first residue (see `nterm_only`),
-        # which is also what bounds the negative headroom: a negative mass
-        # is allowed only for those, so at most one can be emitted.
-        excluded = {0, self.blank_token, self.stop_token}
-        nterm = set(self.nterm_idx.tolist())
-        emit_tokens, emit_deltas, emit_nterm = [], [], []
+        # Emittable tokens and their discretized masses. Only padding and
+        # the blank never emit; the blank stays traversable, as CTC needs.
+        excluded = {0, self.blank_token}
+        # Pinned tokens may only be emitted at one point on the mass
+        # axis, which is what lets a token of zero or negative mass in at
+        # all: it cannot then repeat without bound. An N-terminal
+        # modification opens the peptide, and the stop opens PMC's own
+        # order, since the reversed tokenizer puts it last and the frames
+        # are flipped. Both are therefore emitted from the zero-mass bin.
+        pinned = set(self.nterm_idx.tolist()) | {self.stop_token}
+        emit_tokens, emit_deltas, emit_pinned = [], [], []
         for c in range(min(vocab, self.token_masses.shape[0])):
             mass = self.token_masses[c].item()
             if c in excluded or mass > hi_max:
                 continue
-            if mass <= 0 and c not in nterm:
+            if mass <= 0 and c not in pinned:
                 # A non-terminal residue of zero or negative mass could
                 # repeat without bound, which the fixed axis cannot hold.
                 continue
             emit_tokens.append(c)
             emit_deltas.append(round(mass / resolution))
-            emit_nterm.append(c in nterm)
+            emit_pinned.append(c in pinned)
         if not emit_tokens:
             return None
         deltas = dict(zip(emit_tokens, emit_deltas))
@@ -792,12 +803,12 @@ class Spec2Pep(pl.LightningModule):
         # The unrounded masses, added to the running total alongside the
         # rounded ones that move the state along the axis.
         emit_exact = self.token_masses[emit_idx]
-        return emit_idx, delta_idx, emit_exact, emit_nterm, deltas
+        return emit_idx, delta_idx, emit_exact, emit_pinned, deltas
 
     def _pmc_transitions(
         self,
         delta_idx,
-        emit_nterm: List[bool],
+        emit_pinned: List[bool],
         n_bins: int,
         zero_bin: int,
         device,
@@ -814,18 +825,21 @@ class Spec2Pep(pl.LightningModule):
         raw_src = bins.unsqueeze(0) - delta_idx.unsqueeze(1)
         valid = (raw_src >= 0) & (raw_src < n_bins)
         src_bins = raw_src.clamp(0, n_bins - 1)
-        # An N-terminal modification may only open the peptide. "Nothing
-        # emitted yet" is the zero-mass bin, so requiring the source to be
-        # `zero_bin` means requiring the target to be zero_bin + delta.
-        nterm_only = torch.tensor(emit_nterm, device=device).unsqueeze(1)
-        valid &= ~nterm_only | (
+        # A pinned token may only be emitted before any residue mass has
+        # accumulated. "Nothing emitted yet" is the zero-mass bin, so
+        # requiring the source to be `zero_bin` means requiring the
+        # target to be zero_bin + delta. The stop's delta is zero, which
+        # pins it to zero_bin itself, ahead of any N-terminal
+        # modification, which is where the frame flip puts it.
+        pinned_only = torch.tensor(emit_pinned, device=device).unsqueeze(1)
+        valid &= ~pinned_only | (
             bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
         )
         return src_bins, valid
 
     def _pmc_decode(
         self, logits: torch.Tensor, precursor_mass: float
-    ) -> Optional[Tuple[List[int], List[float]]]:
+    ) -> Optional[Tuple[List[int], List[float], Optional[float]]]:
         """
         Precise mass control (PMC) decoding for a single spectrum.
 
@@ -842,13 +856,17 @@ class Spec2Pep(pl.LightningModule):
         cannot make the search commit to a path the final mass check
         rejects (as in PrimeNovo's `mass_con.py`).
 
-        Stop and padding are excluded from the search, as is any
-        non-terminal residue of zero or negative mass (it could repeat
-        without bound, which a fixed axis cannot hold). N-terminal
-        modifications may only be emitted as the peptide's first
-        residue, and that is also what bounds the axis below zero: only
-        they may carry a negative mass, so at most one such step is ever
-        taken. As an approximation for speed, a token takes part in a
+        Padding is excluded from the search, as is any residue of zero
+        or negative mass that is not pinned (it could repeat without
+        bound, which a fixed axis cannot hold). A pinned token may only
+        be emitted before any residue mass has accumulated, which is
+        also what bounds the axis below zero: only pinned tokens may
+        carry a negative mass, so at most one such step is ever taken.
+        N-terminal modifications are pinned because they open the
+        peptide, and the stop because the frame flip puts it at the
+        opening of this search's order; it is returned separately, since
+        it is scored with the peptide but is not part of it. As an
+        approximation for speed, a token takes part in a
         frame only where its probability exceeds ``PMC_MIN_EMIT_PROB``:
         it cannot be emitted there, and a run of it cannot span that
         frame either, since the state is dropped rather than carried.
@@ -869,10 +887,11 @@ class Spec2Pep(pl.LightningModule):
 
         Returns
         -------
-        Optional[Tuple[List[int], List[float]]]
-            The decoded token indices and per-token confidences, or
-            None if no mass-matching path exists (or the search was
-            skipped because the DP table would be too large).
+        Optional[Tuple[List[int], List[float], Optional[float]]]
+            The decoded token indices, their per-token confidences, and
+            the stop's confidence if the path emitted one, or None if no
+            mass-matching path exists (or the search was skipped because
+            the DP table would be too large).
         """
         device = logits.device
         n_frames, vocab = logits.shape
@@ -892,11 +911,11 @@ class Spec2Pep(pl.LightningModule):
         alphabet = self._pmc_alphabet(vocab, hi_max, resolution, device)
         if alphabet is None:
             return None
-        emit_idx, delta_idx, emit_exact, emit_nterm, deltas = alphabet
+        emit_idx, delta_idx, emit_exact, emit_pinned, deltas = alphabet
         emit_i8 = emit_idx.unsqueeze(1).to(torch.int8)
 
         src_bins, valid = self._pmc_transitions(
-            delta_idx, emit_nterm, n_bins, zero_bin, device
+            delta_idx, emit_pinned, n_bins, zero_bin, device
         )
 
         log_probs = logits.log_softmax(-1)
@@ -1046,11 +1065,23 @@ class Spec2Pep(pl.LightningModule):
             # tokens in the tokenizer's own order.
             tokens.reverse()
             confs.reverse()
+        # The stop is scored like the peptide's other emissions but is
+        # not part of it, so it leaves here on its own, as it does from
+        # `_ctc_decode`. The pin allows only one, and taking the best
+        # keeps the readout total if that ever stops holding.
+        stop_conf = max(
+            (s for c, s in zip(tokens, confs) if c == self.stop_token),
+            default=None,
+        )
+        if stop_conf is not None:
+            keep = [c != self.stop_token for c in tokens]
+            tokens = [c for c, k in zip(tokens, keep) if k]
+            confs = [s for s, k in zip(confs, keep) if k]
         # Agrees with the readout by construction; kept as the guard on
         # an empty decode.
         if not tokens or not self._fits_precursor_mass(tokens, precursor_mass):
             return None
-        return tokens, confs
+        return tokens, confs, stop_conf
 
     def predict_step(
         self, batch: Dict[str, torch.Tensor], *args
@@ -1073,7 +1104,7 @@ class Spec2Pep(pl.LightningModule):
             Predicted PSMs for the given batch of spectra.
         """
         logits, _ = self._forward_step(batch)
-        sequences, scores = self._ctc_decode(logits)
+        sequences, scores, stop_scores = self._ctc_decode(logits)
 
         # Precise mass control: when the greedy peptide does not match
         # the precursor mass, search for the best CTC path that does.
@@ -1088,18 +1119,19 @@ class Spec2Pep(pl.LightningModule):
                 pmc = self._pmc_decode(logits[i], precursor_mass)
                 if pmc is not None:
                     # PMC only returns mass-matching paths.
-                    sequences[i], scores[i] = pmc
+                    sequences[i], scores[i], stop_scores[i] = pmc
                     fit = True
             fits.append(fit)
 
         predictions = []
-        for filename, scan, charge, prec_mz, tokens, confs, fit in zip(
+        for filename, scan, charge, prec_mz, tokens, confs, stop, fit in zip(
             batch["peak_file"],
             batch["scan_id"],
             batch["precursor_charge"],
             batch["precursor_mz"],
             sequences,
             scores,
+            stop_scores,
             fits,
         ):
             # Beam search withheld these; CTC decoding replaced it
@@ -1120,8 +1152,13 @@ class Spec2Pep(pl.LightningModule):
             # misses the precursor, as it does when PMC found no
             # mass-matching path and the greedy peptide survived. The
             # product also survives the N-terminal score merge in
-            # `on_predict_batch_end`, which a mean does not.
-            peptide_score = float(_peptide_score(aa_scores, fit))
+            # `on_predict_batch_end`, which a mean does not. The stop is
+            # scored with the peptide, as upstream counts it, but is not
+            # reported among the residues.
+            scored = aa_scores
+            if stop is not None:
+                scored = np.append(aa_scores, stop)
+            peptide_score = float(_peptide_score(scored, fit))
 
             predictions.append(
                 psm.PepSpecMatch(

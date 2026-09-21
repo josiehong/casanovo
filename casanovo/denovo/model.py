@@ -168,7 +168,10 @@ class Spec2Pep(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.tokenizer = tokenizer or PeptideTokenizer()
+        # Reversed, as `model_runner` builds it. Precise mass control needs
+        # that direction, and depthcharge defaults to the other, so a bare
+        # model would otherwise lose mass control without saying so.
+        self.tokenizer = tokenizer or PeptideTokenizer(reverse=True)
         # Vocabulary: tokenizer tokens incl. padding (0), plus a
         # dedicated CTC blank class as the last index.
         self.vocab_size = len(self.tokenizer) + 2
@@ -209,6 +212,7 @@ class Spec2Pep(pl.LightningModule):
         self._ctc_infeasible_warned = False
         self._pmc_size_warned = False
         self._pmc_vocab_warned = False
+        self._pmc_reverse_warned = False
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -892,19 +896,33 @@ class Spec2Pep(pl.LightningModule):
             The decoded token indices, their per-token confidences, and
             the stop's confidence if the path emitted one, or None if no
             mass-matching path exists. None also means the search was
-            declined, because the DP table would be too large or the
-            vocabulary outgrew the int8 backtracking pointers. The caller
-            keeps the greedy peptide either way.
+            declined: the DP table would be too large, the vocabulary
+            outgrew the int8 backtracking pointers, or the tokenizer is
+            not reversed. The caller keeps the greedy peptide either way.
         """
         device = logits.device
         n_frames, vocab = logits.shape
+        # The stop is pinned to the zero-mass bin, which is where the frame
+        # flip puts it for a reversed tokenizer: it closes that tokenizer's
+        # order, so flipping opens this search's. Without the flip the stop
+        # closes the frames instead, at full residue mass, and the pin
+        # cannot place it there. `model_runner` always builds a reversed
+        # tokenizer, so this only guards a directly constructed model.
+        if not self.tokenizer.reverse:
+            if not self._pmc_reverse_warned:
+                self._pmc_reverse_warned = True
+                logger.warning(
+                    "Skipping precise mass control: it places the stop token "
+                    "by flipping the frames, which needs a reversed "
+                    "tokenizer."
+                )
+            return None
         # A reversed tokenizer emits the peptide C-terminus first, which
         # would put an N-terminal modification last. Decoding the frames
-        # back to front puts it first in either case, so the "N-terminal
-        # tokens open the peptide" rule below is the only one needed;
-        # the emitted tokens are flipped back before returning.
-        if self.tokenizer.reverse:
-            logits = logits.flip(0)
+        # back to front puts it first, so the "N-terminal tokens open the
+        # peptide" rule below is the only one needed; the emitted tokens
+        # are flipped back before returning.
+        logits = logits.flip(0)
 
         grid = self._pmc_grid(precursor_mass, n_frames, vocab)
         if grid is None:
@@ -1069,13 +1087,11 @@ class Spec2Pep(pl.LightningModule):
                     m -= deltas[c]
             c = prev
 
-        tokens = [c for c, _ in reversed(emissions)]
-        confs = [s for _, s in reversed(emissions)]
-        if self.tokenizer.reverse:
-            # Undo the frame flip so the caller still receives the
-            # tokens in the tokenizer's own order.
-            tokens.reverse()
-            confs.reverse()
+        # Undo the frame flip so the caller still receives the tokens in
+        # the tokenizer's own order. The guard above left only the
+        # reversed case, so this is unconditional.
+        tokens = [c for c, _ in emissions]
+        confs = [s for _, s in emissions]
         # The stop is scored like the peptide's other emissions but is
         # not part of it, so it leaves here on its own, as it does from
         # `_ctc_decode`. The pin allows only one, and taking the best

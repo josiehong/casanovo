@@ -5,6 +5,7 @@ import functools
 import hashlib
 import heapq
 import io
+import logging
 import math
 import os
 import pathlib
@@ -1976,6 +1977,53 @@ def test_pmc_decode():
 
     # No path can reach an infeasible precursor mass.
     assert model._pmc_decode(logits, 5_000.0) is None
+
+
+def test_default_tokenizer_is_reversed():
+    """A model built without a tokenizer still supports PMC.
+
+    depthcharge's own default is a forward tokenizer, which PMC declines,
+    so a bare model would quietly decode without mass control.
+    """
+    model = Spec2Pep(dim_model=8, n_head=2, dim_feedforward=8, n_layers=1)
+    assert model.tokenizer.reverse
+
+
+def test_pmc_decode_declines_forward_tokenizer(caplog):
+    """PMC places the stop by flipping the frames, so it needs a flip."""
+    tokenizer = depthcharge.tokenizers.peptides.MskbPeptideTokenizer(
+        reverse=False, start_token=None, stop_token="$"
+    )
+    model = Spec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=1,
+        residues="massivekb",
+        tokenizer=tokenizer,
+    )
+    idx = tokenizer.index
+    aa_k, aa_a, aa_e = idx["K"], idx["A"], idx["E"]
+    masses = model.token_masses
+    precursor_mass = (
+        masses[aa_k] + masses[aa_a] + masses[aa_e]
+    ).item() + denovo.model.H2O_MASS
+
+    logits = torch.full((4, model.vocab_size), -10.0)
+    logits[0, aa_k] = 5.0
+    logits[1, aa_a] = 5.0
+    logits[2, aa_e] = 5.0
+    logits[3, model.blank_token] = 5.0
+
+    # Declined rather than decoded against a stop it cannot place.
+    with caplog.at_level(logging.WARNING):
+        assert model._pmc_decode(logits, precursor_mass) is None
+    assert "reversed" in caplog.text
+    # Warned once, so a full run does not repeat it per spectrum.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert model._pmc_decode(logits, precursor_mass) is None
+    assert "reversed" not in caplog.text
 
 
 def _pmc_model():

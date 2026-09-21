@@ -2178,6 +2178,63 @@ def test_pmc_decode_coarse_resolution(monkeypatch):
     assert model._fits_precursor_mass(tokens, precursor_mass)
 
 
+def test_pmc_decode_emits_one_stop():
+    """The stop is scored once, however tempting a second one is.
+
+    It carries no mass, so pinning it to the zero-mass bin left that bin
+    still satisfying the pin: a blank could return there and emit
+    another, counting its log-probability twice in a path score that
+    reports only one stop. A continuous run is a single CTC emission, so
+    the second one needs a blank-dominant frame between two
+    stop-dominant ones.
+    """
+    model = _pmc_model()
+    idx = model.tokenizer.index
+    aa_k, aa_a, aa_e = idx["K"], idx["A"], idx["E"]
+    stop, blank = model.stop_token, model.blank_token
+    masses = model.token_masses
+    precursor_mass = (
+        masses[aa_k] + masses[aa_a] + masses[aa_e]
+    ).item() + denovo.model.H2O_MASS
+
+    # Built in the DP's own order, then flipped, so the model's flip for
+    # a reversed tokenizer restores exactly this.
+    dp = torch.full((10, model.vocab_size), -10.0)
+    dp[:, blank] = 0.0
+    dp[0, stop] = 3.0
+    dp[1, blank] = 3.0
+    dp[2, stop] = 3.0
+    dp[4, aa_k] = 5.0
+    dp[6, aa_a] = 5.0
+    dp[8, aa_e] = 5.0
+
+    tokens, confs, stop_conf = model._pmc_decode(dp.flip(0), precursor_mass)
+    # The stop leaves separately, so it is never among the residues.
+    assert tokens == [aa_e, aa_a, aa_k]
+    assert len(confs) == len(tokens)
+    assert stop_conf is not None
+    assert model._fits_precursor_mass(tokens, precursor_mass)
+
+    # The decoded peptide alone does not show the double emission, since
+    # the stops are stripped either way, so check the rule that forbids
+    # it: the stop has one legal target and it is not where it starts.
+    resolution = denovo.model.PMC_RESOLUTION
+    emit_idx, delta_idx, _, emit_pinned, emit_is_stop, deltas = (
+        model._pmc_alphabet(model.vocab_size, 5_000.0, resolution, "cpu")
+    )
+    assert masses[stop].item() == 0.0, "the stop must carry no mass"
+    assert deltas[stop] == 1, "yet it must still move the state"
+
+    zero_bin, n_bins = 5, 40
+    src_bins, valid = model._pmc_transitions(
+        delta_idx, emit_pinned, emit_is_stop, n_bins, zero_bin, "cpu"
+    )
+    row = emit_idx.tolist().index(stop)
+    targets = valid[row].nonzero().flatten().tolist()
+    assert targets == [zero_bin + 1]
+    assert int(src_bins[row, zero_bin + 1]) == zero_bin
+
+
 def test_pmc_decode_near_miss_does_not_shadow_a_match():
     """A near-isobaric decoy must not shadow a mass-matching path.
 

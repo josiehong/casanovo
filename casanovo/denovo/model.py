@@ -749,15 +749,19 @@ class Spec2Pep(pl.LightningModule):
             (self.token_masses[c].item() for c in self.neg_mass_idx.tolist()),
             default=0.0,
         )
+        # One bin above that for the stop, which carries no mass but moves
+        # the state anyway so that it cannot be emitted twice. A path that
+        # emitted one runs one bin above a path of the same mass that did
+        # not, so the axis needs the room.
         zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
-        n_bins = zero_bin + int(hi_max / resolution) + 2
+        n_bins = zero_bin + int(hi_max / resolution) + 3
         if n_bins > max_bins:
             # The widened guard pushed the table back over budget. The
             # offset bins have to come out of the budget too, so solve for
             # the resolution with them already reserved.
-            resolution = hi_max / max(1, max_bins - zero_bin - 2)
+            resolution = hi_max / max(1, max_bins - zero_bin - 3)
             zero_bin = int(np.ceil(max(0.0, -neg_mass) / resolution)) + 1
-            n_bins = zero_bin + int(hi_max / resolution) + 2
+            n_bins = zero_bin + int(hi_max / resolution) + 3
         if resolution > PMC_RESOLUTION and not self._pmc_size_warned:
             self._pmc_size_warned = True
             logger.warning(
@@ -771,12 +775,15 @@ class Spec2Pep(pl.LightningModule):
 
     def _pmc_alphabet(
         self, vocab: int, hi_max: float, resolution: float, device
-    ) -> Optional[Tuple[Any, Any, Any, List[bool], Dict[int, int]]]:
+    ) -> Optional[
+        Tuple[Any, Any, Any, List[bool], List[bool], Dict[int, int]]
+    ]:
         """
         Which tokens the PMC search may emit, and by how much mass.
 
-        Returns ``(emit_idx, delta_idx, emit_exact, emit_pinned, deltas)``,
-        or None when nothing is emittable within the mass axis.
+        Returns ``(emit_idx, delta_idx, emit_exact, emit_pinned,
+        emit_is_stop, deltas)``, or None when nothing is emittable within
+        the mass axis.
         """
         # Emittable tokens and their discretized masses. Only padding and
         # the blank never emit; the blank stays traversable, as CTC needs.
@@ -788,7 +795,7 @@ class Spec2Pep(pl.LightningModule):
         # order, since the reversed tokenizer puts it last and the frames
         # are flipped. Both are therefore emitted from the zero-mass bin.
         pinned = set(self.nterm_idx.tolist()) | {self.stop_token}
-        emit_tokens, emit_deltas, emit_pinned = [], [], []
+        emit_tokens, emit_deltas, emit_pinned, emit_is_stop = [], [], [], []
         for c in range(min(vocab, self.token_masses.shape[0])):
             mass = self.token_masses[c].item()
             if c in excluded or mass > hi_max:
@@ -798,8 +805,17 @@ class Spec2Pep(pl.LightningModule):
                 # repeat without bound, which the fixed axis cannot hold.
                 continue
             emit_tokens.append(c)
-            emit_deltas.append(round(mass / resolution))
+            # The stop carries no mass, so pinning it to the zero-mass bin
+            # leaves that bin still satisfying the pin: a blank could
+            # return there and emit another. Step it one bin instead. The
+            # bin is not the mass, which `state_mass` carries exactly and
+            # the readout tests, so this only moves the state out of reach
+            # of its own pin. One stop per path, without a state bit.
+            emit_deltas.append(
+                1 if c == self.stop_token else round(mass / resolution)
+            )
             emit_pinned.append(c in pinned)
+            emit_is_stop.append(c == self.stop_token)
         if not emit_tokens:
             return None
         deltas = dict(zip(emit_tokens, emit_deltas))
@@ -808,12 +824,20 @@ class Spec2Pep(pl.LightningModule):
         # The unrounded masses, added to the running total alongside the
         # rounded ones that move the state along the axis.
         emit_exact = self.token_masses[emit_idx]
-        return emit_idx, delta_idx, emit_exact, emit_pinned, deltas
+        return (
+            emit_idx,
+            delta_idx,
+            emit_exact,
+            emit_pinned,
+            emit_is_stop,
+            deltas,
+        )
 
     def _pmc_transitions(
         self,
         delta_idx,
         emit_pinned: List[bool],
+        emit_is_stop: List[bool],
         n_bins: int,
         zero_bin: int,
         device,
@@ -833,12 +857,23 @@ class Spec2Pep(pl.LightningModule):
         # A pinned token may only be emitted before any residue mass has
         # accumulated. "Nothing emitted yet" is the zero-mass bin, so
         # requiring the source to be `zero_bin` means requiring the
-        # target to be zero_bin + delta. The stop's delta is zero, which
-        # pins it to zero_bin itself, ahead of any N-terminal
-        # modification, which is where the frame flip puts it.
+        # target to be zero_bin + delta.
         pinned_only = torch.tensor(emit_pinned, device=device).unsqueeze(1)
-        valid &= ~pinned_only | (
-            bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
+        is_stop = torch.tensor(emit_is_stop, device=device).unsqueeze(1)
+        from_open = bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
+        # The stop steps one bin without carrying mass, so a path that
+        # emitted one sits at zero_bin + 1 with nothing emitted yet. An
+        # N-terminal modification opens the peptide after it, since the
+        # frame flip puts the stop first, so it may start from either.
+        # The stop itself may not: leaving it with the single source is
+        # what stops a second one. Only a modification of exactly minus
+        # one bin could step back and re-open that door, and the real
+        # ones are +25.98, +42.01, -17.03 and +43.01 Da, thousands away.
+        from_stopped = bins.unsqueeze(0) == zero_bin + 1 + delta_idx.unsqueeze(
+            1
+        )
+        valid &= ~pinned_only | torch.where(
+            is_stop, from_open, from_open | from_stopped
         )
         return src_bins, valid
 
@@ -870,7 +905,11 @@ class Spec2Pep(pl.LightningModule):
         N-terminal modifications are pinned because they open the
         peptide, and the stop because the frame flip puts it at the
         opening of this search's order; it is returned separately, since
-        it is scored with the peptide but is not part of it. As an
+        it is scored with the peptide but is not part of it. The stop
+        also steps one bin without carrying any mass, so that emitting
+        it moves the path out of reach of its own pin and no second one
+        can follow; the readout tests the exact mass, not the bin, so
+        the offset costs only a bin of headroom. As an
         approximation for speed, a token takes part in a
         frame only where its probability exceeds ``PMC_MIN_EMIT_PROB``:
         it cannot be emitted there, and a run of it cannot span that
@@ -932,11 +971,18 @@ class Spec2Pep(pl.LightningModule):
         alphabet = self._pmc_alphabet(vocab, hi_max, resolution, device)
         if alphabet is None:
             return None
-        emit_idx, delta_idx, emit_exact, emit_pinned, deltas = alphabet
+        (
+            emit_idx,
+            delta_idx,
+            emit_exact,
+            emit_pinned,
+            emit_is_stop,
+            deltas,
+        ) = alphabet
         emit_i8 = emit_idx.unsqueeze(1).to(torch.int8)
 
         src_bins, valid = self._pmc_transitions(
-            delta_idx, emit_pinned, n_bins, zero_bin, device
+            delta_idx, emit_pinned, emit_is_stop, n_bins, zero_bin, device
         )
 
         log_probs = logits.log_softmax(-1)

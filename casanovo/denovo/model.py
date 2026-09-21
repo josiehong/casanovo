@@ -1375,17 +1375,15 @@ class DbSpec2Pep(Spec2Pep):
         """
         The forward step.
 
-        If the encoder output is already present in the batch, it is used
-        directly by the decoder. Otherwise, the full forward pass including
-        the encoder is performed.
+        Score candidate peptides against an encoder output the batch
+        already carries. Each spectrum is encoded once and all of its
+        candidates are scored against that, so nothing here encodes.
 
         Parameters
         ----------
         batch : Dict[str, torch.Tensor]
-            A batch from the SpectrumDataset. It must contain ``seq``.
-            For a full forward pass, it also needs ``mz_array``,
-            ``intensity_array``, ``precursor_mz``, and ``precursor_charge``.
-            Alternatively, it can contain precomputed encoder outputs:
+            A candidate batch from ``_psm_batches``, carrying the
+            candidate tokens in ``seq`` and the encoder outputs
             ``memory``, ``mem_masks``, and ``precursors``.
 
         Returns
@@ -1424,10 +1422,17 @@ class DbSpec2Pep(Spec2Pep):
             )
             probs = self.softmax(logits)
             return probs, tokens
-        else:
-            pred, truth = self._forward_step(batch)
-            pred = self.softmax(pred)
-            return pred, truth
+        # Upstream fell back to `_forward_step` here, which was equivalent
+        # because it fed the candidate to the decoder and differed only in
+        # encoding the spectrum again. This decoder takes no peptide: it
+        # decodes blank frames that CTC aligns to the target afterwards, so
+        # `_forward_step` returns frame logits that say nothing about the
+        # candidate, and the same ones for every candidate of a spectrum.
+        # There is no scoring this way, so say so rather than return them.
+        raise ValueError(
+            "Database search scores candidates against a cached encoder "
+            "output; this batch carries none. `_psm_batches` attaches it."
+        )
 
     def predict_step(
         self,

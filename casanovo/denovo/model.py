@@ -208,6 +208,7 @@ class Spec2Pep(pl.LightningModule):
         )
         self._ctc_infeasible_warned = False
         self._pmc_size_warned = False
+        self._pmc_vocab_warned = False
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -890,8 +891,10 @@ class Spec2Pep(pl.LightningModule):
         Optional[Tuple[List[int], List[float], Optional[float]]]
             The decoded token indices, their per-token confidences, and
             the stop's confidence if the path emitted one, or None if no
-            mass-matching path exists (or the search was skipped because
-            the DP table would be too large).
+            mass-matching path exists. None also means the search was
+            declined, because the DP table would be too large or the
+            vocabulary outgrew the int8 backtracking pointers. The caller
+            keeps the greedy peptide either way.
         """
         device = logits.device
         n_frames, vocab = logits.shape
@@ -938,12 +941,20 @@ class Spec2Pep(pl.LightningModule):
         # Kept on the model device; backtracking reads single entries.
         # int8 holds the symbol index, so the alphabet has to fit in it:
         # above 127 the cast would wrap and backtracking would follow the
-        # wrong symbols without any error.
+        # wrong symbols without any error. Nothing checks the residue
+        # dictionary against this bound, so a model trains normally and
+        # only reaches it here. Decline the search rather than raise; the
+        # caller then keeps the greedy peptide, as it does whenever no
+        # mass-matching path exists.
         if vocab > 127:
-            raise ValueError(
-                f"PMC decoding stores predecessors as int8, so it supports "
-                f"at most 127 tokens, but the vocabulary has {vocab}"
-            )
+            if not self._pmc_vocab_warned:
+                self._pmc_vocab_warned = True
+                logger.warning(
+                    "Skipping precise mass control: it holds at most 127 "
+                    "tokens, and this vocabulary has %d.",
+                    vocab,
+                )
+            return None
         pointers = torch.empty(
             (n_frames, n_bins, vocab), dtype=torch.int8, device=device
         )

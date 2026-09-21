@@ -148,7 +148,7 @@ class Spec2Pep(pl.LightningModule):
         residues: str | Dict[str, float] = "canonical",
         max_charge: int = 5,
         precursor_mass_tol: float = 50,
-        isotope_error_range: Tuple[int, int] = (0, 1),
+        isotope_error_range: Tuple[int, int] = (0, 3),
         min_peptide_len: int = 6,
         n_beams: int = 1,
         top_match: int = 1,

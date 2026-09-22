@@ -69,13 +69,13 @@ def test_initialize_model(tmp_path, mgf_small):
     # resuming takes them from the checkpoint.
     config.learning_rate = 1e-3
     config.warmup_iters = 7
-    config.self_cond_weight = 0.25
+    config.inter_ctc_weight = 0.25
     runner = ModelRunner(config=config, model_filename=str(ckpt))
     runner.initialize_tokenizer()
     runner.initialize_model(train=True)
     assert runner.model.hparams.lr == 1e-3
     assert runner.model.hparams.warmup_iters == 7
-    assert runner.model.hparams.self_cond_weight == 0.25
+    assert runner.model.hparams.inter_ctc_weight == 0.25
 
     config.resume_training = True
     runner = ModelRunner(config=config, model_filename=str(ckpt))
@@ -83,7 +83,7 @@ def test_initialize_model(tmp_path, mgf_small):
     runner.initialize_model(train=True)
     assert runner.model.hparams.lr == Config().learning_rate
     assert runner.model.hparams.warmup_iters == Config().warmup_iters
-    assert runner.model.hparams.self_cond_weight == Config().self_cond_weight
+    assert runner.model.hparams.inter_ctc_weight == Config().inter_ctc_weight
     # Inference is unaffected by resume_training.
     runner = ModelRunner(config=config, model_filename=str(ckpt))
     runner.initialize_tokenizer()

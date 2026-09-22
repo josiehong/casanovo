@@ -186,8 +186,8 @@ class Spec2Pep(pl.LightningModule):
         # states for an auxiliary loss, and how much of the loss those
         # auxiliary predictions carry. Empty list disables it, and the
         # model is then identical to the plain CTC decoder.
-        self.self_cond_layers = tuple(kwargs.pop("self_cond_layers", ()) or ())
-        self.self_cond_weight = float(kwargs.pop("self_cond_weight", 0.5))
+        self.inter_ctc_layers = tuple(kwargs.pop("inter_ctc_layers", ()) or ())
+        self.inter_ctc_weight = float(kwargs.pop("inter_ctc_weight", 0.5))
         self.decoder = PeptideDecoder(
             n_tokens=self.tokenizer,
             d_model=dim_model,
@@ -196,7 +196,7 @@ class Spec2Pep(pl.LightningModule):
             n_layers=n_layers,
             dropout=dropout,
             max_charge=max_charge,
-            self_cond_layers=self.self_cond_layers,
+            inter_ctc_layers=self.inter_ctc_layers,
         )
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(
@@ -385,8 +385,8 @@ class Spec2Pep(pl.LightningModule):
             The ground truth tokens for training, or None for inference.
         intermediates : list of torch.Tensor
             Only when ``return_intermediates``: the scores from each
-            self-conditioning layer, for the auxiliary CTC losses. Empty
-            unless ``self_cond_layers`` is set.
+            intermediate CTC layer, for the auxiliary CTC losses. Empty
+            unless ``inter_ctc_layers`` is set.
         """
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
@@ -400,8 +400,8 @@ class Spec2Pep(pl.LightningModule):
             dtype=torch.long,
             device=self.device,
         )
-        if self.self_cond_layers or return_intermediates:
-            scores, intermediates = self.decoder.forward_self_conditioned(
+        if self.inter_ctc_layers or return_intermediates:
+            scores, intermediates = self.decoder.forward_with_intermediates(
                 tokens=blank_tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
@@ -460,7 +460,7 @@ class Spec2Pep(pl.LightningModule):
             )
 
         # The final layer's CTC loss is what gets logged as `*_CTCLoss`, so it
-        # stays comparable with runs that predate self-conditioning and keeps
+        # stays comparable with runs that predate intermediate CTC and keeps
         # driving best-checkpoint selection. The combined objective below is
         # what the optimizer sees; logging that instead would mix in the
         # shallower layers' worse predictions and both compare wrongly against
@@ -475,8 +475,8 @@ class Spec2Pep(pl.LightningModule):
         )
         self._log_chimeric_split(mode, per_spectrum, batch)
         if aux is not None:
-            loss = (1 - self.self_cond_weight) * loss + (
-                self.self_cond_weight * aux
+            loss = (1 - self.inter_ctc_weight) * loss + (
+                self.inter_ctc_weight * aux
             )
             for key, value in (
                 (f"{mode}_CTCLoss_intermediate", aux),
@@ -622,7 +622,7 @@ class Spec2Pep(pl.LightningModule):
         pred : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
             The final layer's frame-level scores.
         intermediates : List[torch.Tensor]
-            The self-conditioning layers' own scores, if any.
+            The intermediate CTC layers' own scores, if any.
         truth : torch.Tensor of shape (n_spectra, max_len)
             The padded target token indices.
 
@@ -630,7 +630,7 @@ class Spec2Pep(pl.LightningModule):
         -------
         Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
             The final layer's loss, the mean loss over the
-            self-conditioning layers or None when there are none, and the
+            intermediate CTC layers or None when there are none, and the
             final layer's loss per spectrum, which averages to the first.
         """
         target_lengths = (truth != 0).sum(dim=1)
@@ -648,7 +648,7 @@ class Spec2Pep(pl.LightningModule):
         loss = per_spectrum.mean()
         if not intermediates:
             return loss, None, per_spectrum
-        # Self-conditioned CTC: the same objective on each conditioning
+        # Intermediate CTC: the same objective on each conditioning
         # layer's own prediction, so those layers are trained to say
         # something worth feeding forward.
         aux = torch.stack(
@@ -668,7 +668,7 @@ class Spec2Pep(pl.LightningModule):
         Nothing says which peptide belongs in which slot, so both
         assignments are scored and the cheaper one is kept. Only that
         assignment contributes gradient. The choice is made once, from the
-        final layer, and reused for every self-conditioning layer: letting
+        final layer, and reused for every intermediate CTC layer: letting
         each layer pick its own would train them toward conflicting
         assignments, and a prediction fed forward under one assignment
         would be read by the next layer under another.
@@ -682,7 +682,7 @@ class Spec2Pep(pl.LightningModule):
         pred : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
             The final layer's frame-level scores.
         intermediates : List[torch.Tensor]
-            The self-conditioning layers' own scores, if any.
+            The intermediate CTC layers' own scores, if any.
         batch : Dict[str, torch.Tensor]
             The batch, holding both targets under ``seq`` and ``seq_2``.
 
@@ -690,7 +690,7 @@ class Spec2Pep(pl.LightningModule):
         -------
         Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
             The final layer's loss, the mean loss over the
-            self-conditioning layers or None when there are none, and the
+            intermediate CTC layers or None when there are none, and the
             final layer's loss per spectrum, which averages to the first.
         """
         truth_a = batch["seq"]

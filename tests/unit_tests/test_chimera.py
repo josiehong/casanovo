@@ -180,8 +180,8 @@ def _spectrum_batch(n_spectra=2, n_peaks=12):
     }
 
 
-@pytest.mark.parametrize("self_cond_layers", [(), (1,)])
-def test_frames_attend_to_each_other(self_cond_layers):
+@pytest.mark.parametrize("inter_ctc_layers", [(), (1,)])
+def test_frames_attend_to_each_other(inter_ctc_layers):
     """Adding decoder frames changes the logits of the earlier ones.
 
     The decoder is non-autoregressive, so its frames are meant to attend
@@ -200,14 +200,14 @@ def test_frames_attend_to_each_other(self_cond_layers):
     checkpoint, over 101 shared positions, at a maximum absolute
     difference of exactly zero.
 
-    Both decode paths are covered, since ``forward_self_conditioned``
+    Both decode paths are covered, since ``forward_with_intermediates``
     repeats the input preparation instead of calling ``embed``.
     """
     model = _model(
         chimera=False,
         max_peptide_len=8,
         n_layers=2,
-        self_cond_layers=self_cond_layers,
+        inter_ctc_layers=inter_ctc_layers,
     ).eval()
     batch = _spectrum_batch()
 
@@ -392,7 +392,7 @@ def test_an_unlabelled_slot_keeps_the_loss_symmetric():
 
 
 def test_intermediates_reuse_the_final_assignment():
-    """Every self-conditioning layer scores the same slot assignment.
+    """Every intermediate CTC layer scores the same slot assignment.
 
     Letting each layer choose its own would feed a prediction forward
     under one assignment and read it back under another.
@@ -416,7 +416,7 @@ def test_intermediates_reuse_the_final_assignment():
     assert no_aux is None
     assert aux is not None
     # The final layer's loss is what gets logged, so it must not shift
-    # when self-conditioning is switched on.
+    # when intermediate CTC is switched on.
     assert torch.allclose(alone, combined)
 
 

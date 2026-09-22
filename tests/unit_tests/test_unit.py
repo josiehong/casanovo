@@ -1865,7 +1865,7 @@ def test_intermediate_ctc_adds_no_parameters():
     )
     torch.manual_seed(0)
     plain = Spec2Pep(**kwargs).eval()
-    unfed = Spec2Pep(**kwargs, self_cond_layers=(1, 2)).eval()
+    unfed = Spec2Pep(**kwargs, inter_ctc_layers=(1, 2)).eval()
     # Scoring reuses the output layer the model already has, so the two
     # are the same size and a checkpoint from either loads into the other.
     assert plain.state_dict().keys() == unfed.state_dict().keys()

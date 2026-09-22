@@ -55,7 +55,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         positional_encoder: PositionalEncoder | bool = True,
         padding_int: int | None = None,
         max_charge: int = 4,
-        self_cond_layers: Sequence[int] = (),
+        inter_ctc_layers: Sequence[int] = (),
     ) -> None:
         """Initialize a PeptideDecoder."""
 
@@ -90,11 +90,11 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         # states, for an auxiliary CTC loss each. Scoring reuses the output
         # layer, so no layer here grows the model, and a checkpoint trained
         # without them still loads.
-        self.self_cond_layers = tuple(
-            k for k in sorted(set(self_cond_layers)) if 1 <= k < n_layers
+        self.inter_ctc_layers = tuple(
+            k for k in sorted(set(inter_ctc_layers)) if 1 <= k < n_layers
         )
 
-    def forward_self_conditioned(
+    def forward_with_intermediates(
         self,
         tokens: torch.Tensor | None,
         *args: torch.Tensor,
@@ -107,7 +107,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         Decode, scoring the stack's own hidden states along the way.
 
         Intermediate CTC (Lee and Watanabe, ICASSP 2021): after each layer
-        in ``self_cond_layers`` the hidden states are scored with the same
+        in ``inter_ctc_layers`` the hidden states are scored with the same
         output layer the model already has, and that prediction carries an
         auxiliary CTC loss during training. The score is not fed back into
         the stack, so the layers below are supervised without changing what
@@ -126,7 +126,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             The final-layer scores, identical in meaning to ``forward``.
         intermediates : list of torch.Tensor
             One score tensor per conditioning layer, for the auxiliary
-            CTC losses. Empty when self-conditioning is off, in which
+            CTC losses. Empty when intermediate CTC is off, in which
             case the scores match ``forward`` exactly.
         """
         if tokens is None:
@@ -155,7 +155,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
                 memory_mask=memory_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
             )
-            if depth in self.self_cond_layers:
+            if depth in self.inter_ctc_layers:
                 intermediates.append(self.final(encoded))
 
         if self.transformer_decoder.norm is not None:

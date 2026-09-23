@@ -170,7 +170,11 @@ class Spec2Pep(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.tokenizer = tokenizer or PeptideTokenizer()
+        # Reversed, as `model_runner` builds it. depthcharge defaults to
+        # the other direction, and the two are not interchangeable here:
+        # the reversed order is what `_ctc_decode` reads the N-terminus
+        # from and what precise mass control flips its frames against.
+        self.tokenizer = tokenizer or PeptideTokenizer(reverse=True)
         # Vocabulary: tokenizer tokens incl. padding (0), plus a
         # dedicated CTC blank class as the last index.
         self.vocab_size = len(self.tokenizer) + 2
@@ -199,6 +203,11 @@ class Spec2Pep(pl.LightningModule):
             max_charge=max_charge,
             inter_ctc_layers=self.inter_ctc_layers,
         )
+        # The decoder keeps only the layers it has, so take its list back as
+        # the effective one. Holding the raw request here would let the gate
+        # in _forward_step ask for intermediates from a decoder that scores
+        # nothing, and the auxiliary loss would be skipped without a word.
+        self.inter_ctc_layers = self.decoder.inter_ctc_layers
         self.softmax = torch.nn.Softmax(2)
         self.ctc_loss = torch.nn.CTCLoss(
             blank=self.blank_token, zero_infinity=True

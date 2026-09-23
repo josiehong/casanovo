@@ -224,13 +224,21 @@ def test_frames_attend_to_each_other(inter_ctc_layers):
     )
 
 
-def test_decoder_input_is_blank():
-    """Every decoder frame is fed the CTC blank, from a row of its own."""
+def test_decoder_frames_carry_no_token():
+    """Every decoder frame is fed token id 0, whose row stays zero.
+
+    The blank is an output class only; it gets no embedding row, which is
+    what keeps this decoder the same shape as the non-chimeric NAR arm's.
+    A row of its own would add one learned vector shared by every frame,
+    and a vector identical at every position cannot say anything
+    frame-specific -- position alone tells the frames apart.
+    """
     model = _model(max_peptide_len=8, n_layers=2).eval()
     token_encoder = model.decoder.token_encoder
-    # Input and output number the blank alike.
-    assert token_encoder.num_embeddings == model.vocab_size
+    # One output class beyond the embeddings: the blank.
+    assert model.decoder.final.out_features == token_encoder.num_embeddings + 1
     assert model.decoder.final.out_features == model.vocab_size
+    assert model.blank_token == token_encoder.num_embeddings
 
     fed = []
     token_encoder.register_forward_hook(
@@ -240,9 +248,11 @@ def test_decoder_input_is_blank():
         model._forward_step(_spectrum_batch())
 
     assert fed[0].shape[1] == model.n_decoder_frames
-    assert (fed[0] == model.blank_token).all()
-    # A learned vector, not the frozen zero row of padding.
-    assert token_encoder.weight[model.blank_token].abs().sum() > 0
+    assert (fed[0] == 0).all()
+    # padding_idx holds it there, so the frames carry no information and
+    # nothing about them trains.
+    assert token_encoder.padding_idx == 0
+    assert token_encoder.weight[0].abs().sum() == 0
 
 
 def test_frames_scale_with_chimera():
@@ -782,3 +792,48 @@ def test_both_slots_matching_falls_back_to_position(monkeypatch):
         lambda tokens, mass, mz=None, z=None, partner=False: (2, 0.0, 1e9),
     )
     assert model._partner_slots(frames, precursors) == [[False], [True]]
+
+
+def test_database_padding_does_not_change_a_candidate_score():
+    """A padded candidate scores as it does alone.
+
+    `embed` cannot infer which positions are padding: de novo frames and
+    database candidates both use token 0, and only the caller knows which
+    it means. When it guessed, real positions attended to padding and a
+    candidate's score depended on what it happened to be batched with.
+    """
+    from casanovo.denovo.model import DbSpec2Pep
+
+    tokenizer = _tokenizer()
+    model = DbSpec2Pep(
+        dim_model=8,
+        n_head=2,
+        dim_feedforward=8,
+        n_layers=1,
+        max_peptide_len=20,
+        tokenizer=tokenizer,
+    ).eval()
+
+    short = tokenizer.tokenize(["PEPTIDEK"], add_stop=True)
+    # The same peptide, padded as a longer candidate would pad it.
+    padded = torch.zeros((1, short.shape[1] + 6), dtype=short.dtype)
+    padded[:, : short.shape[1]] = short
+
+    batch = _spectrum_batch(n_spectra=1)
+    mzs, ints, precursors, _ = model._process_batch(batch)
+    memory, mem_masks = model.encoder(mzs, ints)
+
+    def score(tokens):
+        with torch.no_grad():
+            probs, _ = model(
+                {
+                    "memory": memory,
+                    "mem_masks": mem_masks,
+                    "precursors": precursors,
+                    "seq": tokens,
+                }
+            )
+        # Only the real positions, and the precursor column `embed` adds.
+        return probs[:, : short.shape[1] + 1]
+
+    assert torch.allclose(score(short), score(padded), atol=1e-6)

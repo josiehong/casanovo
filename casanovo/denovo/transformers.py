@@ -73,17 +73,17 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         self.charge_encoder = torch.nn.Embedding(max_charge, d_model)
         self.mass_encoder = FloatEncoder(d_model)
 
-        # One embedding row and one output class beyond the tokenizer's
-        # (which include padding at index 0), at the same index: the
-        # dedicated CTC blank. Every frame is fed the blank, and a frame
-        # predicts it wherever it emits nothing.
-        self.token_encoder = torch.nn.Embedding(
-            self.token_encoder.num_embeddings + 1,
-            d_model,
-            padding_idx=self._padding_int,
-        )
+        # Override the output layer with one class beyond the token
+        # embeddings (which include padding at index 0): the last index
+        # serves as the dedicated CTC blank class.
+        #
+        # The blank gets no embedding row of its own. Every frame is fed
+        # token id 0, whose row `padding_idx` holds frozen at zero, so the
+        # frames carry no token information and position alone tells them
+        # apart. A trainable row here would add one vector shared by every
+        # frame, which cannot say anything frame-specific.
         self.final = torch.nn.Linear(
-            d_model, self.token_encoder.num_embeddings
+            d_model, self.token_encoder.num_embeddings + 1
         )
 
         # The layers after which this decoder also scores its own hidden
@@ -114,11 +114,11 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         the layers above receive, and inference is unaffected.
 
         This has to open up the layer stack rather than call
-        ``transformer_decoder`` in one shot, so it repeats the input
-        preparation from ``embed``: the all-False target mask that makes
-        attention non-causal, and no key padding mask, since every frame
-        is a real decoding slot. See ``embed`` for why the superclass's
-        inferred padding mask is wrong here.
+        ``transformer_decoder`` in one shot, so it prepares its input with
+        ``_prepare_frames`` as ``embed`` does. No key padding mask goes
+        with it: this path decodes de novo, where every frame is a real
+        slot. A database search, whose tokens are padded sequences, goes
+        through ``embed`` instead.
 
         Returns
         -------
@@ -129,21 +129,7 @@ class PeptideDecoder(AnalyteTransformerDecoder):
             losses. Empty when intermediate CTC is off, in which case
             the scores match ``forward`` exactly.
         """
-        if tokens is None:
-            tokens = torch.tensor([[]]).to(self.device)
-
-        encoded = self.token_encoder(tokens)
-        global_token = self.global_token_hook(tokens, *args, **kwargs)
-        encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
-        encoded = self.positional_encoder(encoded)
-
-        # Non-causal attention, as in `embed` above: every frame sees
-        # every other frame. No key padding mask for the same reason
-        # given there.
-        length = encoded.shape[1]
-        tgt_mask = torch.zeros(
-            (length, length), dtype=torch.bool, device=encoded.device
-        )
+        encoded, tgt_mask = self._prepare_frames(tokens, *args, **kwargs)
 
         intermediates = []
         for depth, layer in enumerate(self.transformer_decoder.layers, 1):
@@ -195,25 +181,18 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         precursors = masses + charges
         return precursors
 
-    def embed(
+    def _prepare_frames(
         self,
         tokens: torch.Tensor | None,
         *args: torch.Tensor,
-        memory: torch.Tensor | None,
-        memory_key_padding_mask: torch.Tensor | None = None,
-        memory_mask: torch.Tensor | None = None,
-        tgt_mask: torch.Tensor | None = None,
         **kwargs: dict,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Embed the decoder frames with full, non-causal attention.
+        Encode the decoder frames and build the all-False target mask.
 
-        ``tgt_mask`` is all False, so every frame sees every other frame.
-        ``tgt_key_padding_mask`` is None, which is why this reimplements
-        the superclass rather than delegating to it: the superclass infers
-        padding as ``encoded.sum(axis=2) == 0``, which marked every frame
-        as padding when frames were fed token id 0, ``padding_idx``. Every
-        frame is now fed the CTC blank, and no frame is padding.
+        The mask lets every frame see every other frame. It is built here,
+        in one place, because ``embed`` and ``forward_with_intermediates``
+        both need it and a second copy could drift from the first.
         """
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)
@@ -223,17 +202,59 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         encoded = torch.cat([global_token[:, None, :], encoded], dim=1)
         encoded = self.positional_encoder(encoded)
 
-        if tgt_mask is None:
-            length = encoded.shape[1]
-            tgt_mask = torch.zeros(
-                (length, length), dtype=torch.bool, device=encoded.device
+        length = encoded.shape[1]
+        tgt_mask = torch.zeros(
+            (length, length), dtype=torch.bool, device=encoded.device
+        )
+        return encoded, tgt_mask
+
+    def embed(
+        self,
+        tokens: torch.Tensor | None,
+        *args: torch.Tensor,
+        memory: torch.Tensor | None,
+        memory_key_padding_mask: torch.Tensor | None = None,
+        memory_mask: torch.Tensor | None = None,
+        tgt_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+        **kwargs: dict,
+    ) -> torch.Tensor:
+        """
+        Embed the decoder frames with full, non-causal attention.
+
+        Reimplements the superclass rather than delegating to it, so that
+        no key padding mask reaches the layers unless a caller asks for
+        one. The superclass infers padding as ``encoded.sum(axis=2) == 0``,
+        which marks every de novo frame as padding, since all of them are
+        fed token id 0 and that row embeds to zero. No frame there is
+        padding, and nothing in the values can say so: a database search
+        pads with token 0 as well. Only the caller knows which case it is.
+
+        ``tgt_key_padding_mask`` marks padding in ``tokens``, and the
+        precursor token's column is prepended here so callers need not.
+        Leave it None to decode de novo; pass ``tokens == padding_idx``
+        when the tokens are real sequences padded to a common length.
+        """
+        encoded, full_mask = self._prepare_frames(tokens, *args, **kwargs)
+        if tgt_key_padding_mask is not None:
+            # Position 0 holds the precursor token, never padding.
+            tgt_key_padding_mask = torch.cat(
+                [
+                    torch.zeros(
+                        (tgt_key_padding_mask.shape[0], 1),
+                        dtype=torch.bool,
+                        device=tgt_key_padding_mask.device,
+                    ),
+                    tgt_key_padding_mask,
+                ],
+                dim=1,
             )
 
         return self.transformer_decoder(
             tgt=encoded,
             memory=memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=None,
+            tgt_mask=full_mask if tgt_mask is None else tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask,
             memory_mask=memory_mask,
         )

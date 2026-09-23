@@ -391,25 +391,30 @@ class Spec2Pep(pl.LightningModule):
         mzs, ints, precursors, seqs = self._process_batch(batch)
         memories, mem_masks = self.encoder(mzs, ints)
 
-        # Decode a fixed number of frames, each fed the CTC blank; the CTC
-        # loss aligns them to the (shorter) ground truth peptide. Chimeric
-        # sequencing decodes two peptides, so it needs twice the frames.
-        blank_tokens = torch.full(
+        # Decode a fixed number of frames; the CTC loss aligns them to the
+        # (shorter) ground truth peptide. Chimeric sequencing decodes two
+        # peptides, so it needs twice the frames.
+        #
+        # Every frame is fed token id 0, whose embedding row `padding_idx`
+        # holds frozen at zero, so no frame carries token information and
+        # position alone distinguishes them. `embed` is told explicitly
+        # that none of this is padding; it cannot be inferred, since a
+        # database search pads with token 0 too.
+        zero_tokens = torch.zeros(
             (mzs.shape[0], self.n_decoder_frames),
-            self.blank_token,
             dtype=torch.long,
             device=self.device,
         )
         if self.inter_ctc_layers or return_intermediates:
             scores, intermediates = self.decoder.forward_with_intermediates(
-                tokens=blank_tokens,
+                tokens=zero_tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
                 precursors=precursors,
             )
         else:
             scores = self.decoder(
-                tokens=blank_tokens,
+                tokens=zero_tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
                 precursors=precursors,
@@ -2203,11 +2208,17 @@ class DbSpec2Pep(Spec2Pep):
             memories, mem_masks = batch["memory"], batch["mem_masks"]
             precursors = batch["precursors"]
             tokens = batch["seq"]
+            # These are real peptides padded to the longest candidate in
+            # the batch, unlike the de novo frames, so the padding has to
+            # be masked or a candidate's score depends on what it was
+            # batched with.
             logits = self.decoder(
                 tokens=tokens,
                 memory=memories,
                 memory_key_padding_mask=mem_masks,
                 precursors=precursors,
+                tgt_key_padding_mask=tokens
+                == self.decoder.token_encoder.padding_idx,
             )
             probs = self.softmax(logits)
             return probs, tokens

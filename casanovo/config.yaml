@@ -184,12 +184,13 @@ weight_decay: 1e-5
 muon_lr: 0.002
 # Momentum for the Muon parameter group.
 muon_momentum: 0.95
-# Intermediate CTC: decoder layers (1-based) after which the model scores
-# its own hidden states and feeds that prediction into the next layer, so
-# positions are no longer predicted independently. Empty disables it and the
-# decoder is then identical to plain CTC. Placement follows the paper's
-# spacing rule floor(k*L/(K+1)), which for L=9 layers and K=4 points gives
-# [1, 3, 5, 7].
+# Intermediate CTC: decoder layers (1-based) whose hidden states are scored
+# with the model's own output layer and given an auxiliary CTC loss, so the
+# layers below are supervised directly instead of only through the layers
+# above them. The score is not fed back into the stack, so this changes
+# training alone and inference is untouched. Empty disables it. Placement
+# follows the paper's spacing rule floor(k*L/(K+1)), which for L=9 layers
+# and K=4 points gives [1, 3, 5, 7].
 inter_ctc_layers: [1, 3, 5, 7]
 # Share of the training loss carried by those intermediate predictions; the
 # final layer carries the rest. Ignored when inter_ctc_layers is empty.

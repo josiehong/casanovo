@@ -125,9 +125,9 @@ class PeptideDecoder(AnalyteTransformerDecoder):
         scores : torch.Tensor of shape (batch, len_seq, n_tokens)
             The final-layer scores, identical in meaning to ``forward``.
         intermediates : list of torch.Tensor
-            One score tensor per conditioning layer, for the auxiliary
-            CTC losses. Empty when intermediate CTC is off, in which
-            case the scores match ``forward`` exactly.
+            One score tensor per scored layer, for the auxiliary CTC
+            losses. Empty when intermediate CTC is off, in which case
+            the scores match ``forward`` exactly.
         """
         if tokens is None:
             tokens = torch.tensor([[]]).to(self.device)

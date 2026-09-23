@@ -648,9 +648,9 @@ class Spec2Pep(pl.LightningModule):
         loss = per_spectrum.mean()
         if not intermediates:
             return loss, None, per_spectrum
-        # Intermediate CTC: the same objective on each conditioning
-        # layer's own prediction, so those layers are trained to say
-        # something worth feeding forward.
+        # Intermediate CTC: the same objective on each scored layer's own
+        # prediction, so those layers are supervised directly rather than
+        # only through the layers above them.
         aux = torch.stack(
             [reduce(scores).mean() for scores in intermediates]
         ).mean()
@@ -669,9 +669,9 @@ class Spec2Pep(pl.LightningModule):
         assignments are scored and the cheaper one is kept. Only that
         assignment contributes gradient. The choice is made once, from the
         final layer, and reused for every intermediate CTC layer: letting
-        each layer pick its own would train them toward conflicting
-        assignments, and a prediction fed forward under one assignment
-        would be read by the next layer under another.
+        each layer pick its own would point the auxiliary losses at a
+        different slot assignment from the one the final loss is training
+        toward, so the two would pull the stack apart.
 
         A slot the annotation leaves empty contributes nothing, so the
         model is never trained to stay silent in it. See the comment on

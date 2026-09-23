@@ -39,6 +39,18 @@ isotope_error_range: [0, 3]
 # costs decoding time and memory, and can force a coarser mass grid on heavy
 # precursors, so keep it near the charges the instrument actually produces.
 charge_range: [1, 4]
+# The width of the precursor isolation window, in m/z. Chimeric mode only,
+# and only for the co-isolated peptide: the recorded m/z belongs to whichever
+# precursor the instrument selected, so the other peptide's mass is not among
+# the candidates built from it. Setting this holds that peptide to the window
+# it must have been isolated in instead, one interval per charge, which is
+# wide enough to subsume the isotope errors and reaches both sides of the
+# recorded m/z. Leave empty to hold both peptides to the recorded precursor,
+# which is what every run before this did.
+isolation_window_width:
+# How far the isolation window's center sits from the recorded precursor m/z,
+# in m/z, for methods that offset it. Only read when a width is set.
+isolation_window_offset: 0.0
 # The minimum length of considered peptides.
 min_peptide_len: 6
 # The maximum length of considered peptides. This is also the number of

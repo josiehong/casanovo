@@ -475,3 +475,98 @@ def test_chimeric_data_and_prediction(
     runner.model.on_predict_batch_end(psms)
     assert len(runner.model.out_writer.psms) == len(psms)
     assert all(np.isfinite(p.calc_mz) for p in runner.model.out_writer.psms)
+
+
+def test_the_partner_window_spans_the_isolation_window():
+    """One interval per charge, covering every m/z the window could hold."""
+    model = _model(chimera=True, charge_range=(1, 4),
+                   isolation_window_width=1.6)
+    mz = 600.0
+    windows = model._isolation_windows(mz)
+    assert [z for z, _, _ in windows] == [1, 2, 3, 4]
+    for z, lo, hi in windows:
+        assert lo == pytest.approx((mz - 0.8 - PROTON_MASS) * z - H2O_MASS)
+        assert hi == pytest.approx((mz + 0.8 - PROTON_MASS) * z - H2O_MASS)
+        # Wide enough to subsume the isotope errors it replaces.
+        assert hi - lo == pytest.approx(1.6 * z)
+
+
+def test_a_partner_above_the_recorded_precursor_is_accepted():
+    """The case the old windows could never reach.
+
+    The isotope centers are always ``mass - iso * spacing``, so a partner
+    isolated ABOVE the recorded m/z is unreachable however many isotopes
+    are allowed. About half of them sit there.
+    """
+    model = _model(chimera=True, charge_range=(1, 4),
+                   isolation_window_width=1.6)
+    mz, z = 600.0, 2
+    residue_mass = (mz + 0.45 - PROTON_MASS) * z - H2O_MASS
+    assert any(lo <= residue_mass <= hi
+               for _, lo, hi in model._isolation_windows(mz))
+    old = model._residue_mass_windows(
+        model._precursor_candidates((mz - PROTON_MASS) * z, mz, z)
+    )
+    assert not any(lo <= residue_mass <= hi for _, lo, hi in old)
+
+
+def test_a_mass_outside_every_interval_is_still_rejected():
+    """The constraint is looser, not absent."""
+    model = _model(chimera=True, charge_range=(1, 4),
+                   isolation_window_width=1.6)
+    windows = model._isolation_windows(600.0)
+    beyond = max(hi for _, _, hi in windows) + 10.0
+    assert not any(lo <= beyond <= hi for _, lo, hi in windows)
+
+
+def test_without_a_width_every_window_is_unchanged():
+    """The regression guard: an unconfigured run decodes exactly as before."""
+    model = _model(chimera=True, charge_range=(1, 4))
+    mass, mz, z = 1198.0, 600.0, 2
+    old = model._residue_mass_windows(
+        model._precursor_candidates(mass, mz, z)
+    )
+    for partner in (False, True):
+        assert model._slot_windows(mass, mz, z, partner=partner) == old
+
+
+def test_the_partner_slot_is_the_one_that_misses_the_precursor(monkeypatch):
+    """The role comes from the greedy peptides, not the slot's position.
+
+    ``A:B`` and ``B:A`` are the same annotation and the loss keeps the
+    better pairing, so the selected peptide lands in either slot. Here it
+    lands in slot B, and the flags have to come out swapped.
+    """
+    model = _model(chimera=True, charge_range=(1, 4),
+                   isolation_window_width=1.6)
+    frames = [torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)]
+    precursors = torch.tensor([[1198.0, 2.0, 600.0]])
+
+    monkeypatch.setattr(
+        model, "_ctc_decode",
+        lambda slot: ([[1]] if slot is frames[0] else [[2]], [[0.9]]),
+    )
+    # Only the peptide in slot B falls in a recorded-precursor window.
+    monkeypatch.setattr(
+        model, "_matching_window",
+        lambda tokens, mass, mz=None, z=None, partner=False: (
+            None if tokens == [1] else (2, 0.0, 1e9)
+        ),
+    )
+    assert model._partner_slots(frames, precursors) == [[True], [False]]
+
+
+def test_both_slots_matching_falls_back_to_position(monkeypatch):
+    """With nothing to choose between them, slot B stays the partner."""
+    model = _model(chimera=True, charge_range=(1, 4),
+                   isolation_window_width=1.6)
+    frames = [torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)]
+    precursors = torch.tensor([[1198.0, 2.0, 600.0]])
+    monkeypatch.setattr(
+        model, "_ctc_decode", lambda slot: ([[1]], [[0.9]])
+    )
+    monkeypatch.setattr(
+        model, "_matching_window",
+        lambda tokens, mass, mz=None, z=None, partner=False: (2, 0.0, 1e9),
+    )
+    assert model._partner_slots(frames, precursors) == [[False], [True]]

@@ -17,6 +17,7 @@ from typing import (
     Union,
 )
 
+import depthcharge.constants
 import einops
 import lightning.pytorch as pl
 import numpy as np
@@ -31,8 +32,8 @@ from .muon import MuonWithAuxAdamW
 
 logger = logging.getLogger("casanovo")
 
-H2O_MASS = 18.010565
-ISOTOPE_SPACING = 1.00335
+H2O_MASS = depthcharge.constants.H2O
+ISOTOPE_SPACING = depthcharge.constants.C13
 PROTON_MASS = 1.007276
 # Precise mass control (PMC) decoding settings: the mass discretization
 # step, the headroom added to the mass axis so that rounding cannot carry
@@ -149,7 +150,7 @@ class Spec2Pep(pl.LightningModule):
         residues: str | Dict[str, float] = "canonical",
         max_charge: int = 5,
         precursor_mass_tol: float = 50,
-        isotope_error_range: Tuple[int, int] = (0, 1),
+        isotope_error_range: Tuple[int, int] = (0, 3),
         charge_range: Optional[Tuple[int, int]] = None,
         isolation_window_width: Optional[float] = None,
         isolation_window_offset: float = 0.0,
@@ -213,7 +214,7 @@ class Spec2Pep(pl.LightningModule):
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
-        self.muon_lr = kwargs.pop("muon_lr", 0.02)
+        self.muon_lr = kwargs.pop("muon_lr", 0.002)
         self.muon_momentum = kwargs.pop("muon_momentum", 0.95)
         # `kwargs` will contain additional arguments as well as
         # unrecognized arguments, including deprecated ones. Remove the

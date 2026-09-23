@@ -2878,18 +2878,20 @@ def test_precursor_rescue():
 
 
 def test_db_spec2pep_forward_no_cache(tiny_config):
-    """Test the DbSpec2Pep forward method without a cache."""
+    """Scoring a candidate needs the cache, so refuse without it.
+
+    Upstream fell back to `_forward_step`, which was equivalent there
+    because it fed the candidate to the decoder. This decoder takes
+    blank frames instead, so that fallback would have scored every
+    candidate of a spectrum identically, against frames that never saw
+    it.
+    """
     tokenizer = depthcharge.tokenizers.peptides.PeptideTokenizer(
         residues=Config(tiny_config).residues
     )
     db_model = DbSpec2Pep(tokenizer=tokenizer)
 
-    # Mock the _forward_step method to confirm it's called
-    db_model._forward_step = unittest.mock.MagicMock(
-        return_value=(torch.zeros(1, 5, 25), torch.zeros(1, 4))
-    )
-
-    # Create a batch without pre-computed encoder outputs
+    # A batch without the precomputed encoder outputs.
     mock_batch = {
         "mz_array": torch.zeros((1, 10)),
         "intensity_array": torch.zeros((1, 10)),
@@ -2898,7 +2900,5 @@ def test_db_spec2pep_forward_no_cache(tiny_config):
         "seq": torch.randint(1, 20, (1, 8)),
     }
 
-    db_model.forward(mock_batch)
-
-    # Assert that the non-cached path was taken
-    db_model._forward_step.assert_called_once()
+    with pytest.raises(ValueError, match="cached encoder output"):
+        db_model.forward(mock_batch)

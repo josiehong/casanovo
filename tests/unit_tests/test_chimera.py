@@ -33,7 +33,7 @@ def _model(**kwargs):
         n_head=2,
         dim_feedforward=8,
         n_layers=1,
-        max_peptide_len=20,
+        decoder_frames=40,
         tokenizer=_tokenizer(),
         chimera=True,
     )
@@ -146,14 +146,14 @@ def test_plain_checkpoint_loads_into_chimeric():
     sinusoidal and computed per forward pass, there is no learned
     per-position query, and `chimera`, `n_decoder_frames` and
     `chimera_split` are plain ints set after the encoder and decoder are
-    built. `max_peptide_len` is deliberately changed here too, since the
+    built. `decoder_frames` is deliberately changed here too, since the
     pretrained single-peptide runs used a different frame budget.
 
     Guarded by a test rather than left to the training job, which would
     otherwise report it as "Weights file incompatible" after claiming a GPU.
     """
-    single = _model(chimera=False, max_peptide_len=100)
-    chimeric = _model(chimera=True, max_peptide_len=60)
+    single = _model(chimera=False, decoder_frames=100)
+    chimeric = _model(chimera=True, decoder_frames=120)
     assert single.n_decoder_frames != chimeric.n_decoder_frames
 
     state = single.state_dict()
@@ -205,7 +205,7 @@ def test_frames_attend_to_each_other(inter_ctc_layers):
     """
     model = _model(
         chimera=False,
-        max_peptide_len=8,
+        decoder_frames=8,
         n_layers=2,
         inter_ctc_layers=inter_ctc_layers,
     ).eval()
@@ -213,7 +213,7 @@ def test_frames_attend_to_each_other(inter_ctc_layers):
 
     with torch.no_grad():
         short, _ = model._forward_step(batch)
-        model.n_decoder_frames = 2 * model.max_peptide_len
+        model.n_decoder_frames = 2 * model.n_decoder_frames
         long, _ = model._forward_step(batch)
 
     shared = short.shape[1]
@@ -233,7 +233,7 @@ def test_decoder_frames_carry_no_token():
     and a vector identical at every position cannot say anything
     frame-specific -- position alone tells the frames apart.
     """
-    model = _model(max_peptide_len=8, n_layers=2).eval()
+    model = _model(decoder_frames=8, n_layers=2).eval()
     token_encoder = model.decoder.token_encoder
     # One output class beyond the embeddings: the blank.
     assert model.decoder.final.out_features == token_encoder.num_embeddings + 1
@@ -255,18 +255,23 @@ def test_decoder_frames_carry_no_token():
     assert token_encoder.weight[0].abs().sum() == 0
 
 
-def test_frames_scale_with_chimera():
-    """Each slot gets a full max_peptide_len frames."""
-    single = _model(chimera=False)
-    assert single.n_decoder_frames == single.max_peptide_len
+def test_the_two_slots_split_the_frames_evenly():
+    """Each slot gets half the frames, so neither peptide has more room.
 
-    chimeric = _model(chimera=True)
-    assert chimeric.n_decoder_frames == 2 * chimeric.max_peptide_len
-    # The decoder prepends a global precursor token, so slot A is one
-    # frame longer than slot B.
+    The loss scores both ways of assigning the two peptides to the slots
+    and keeps the cheaper one. An uneven split would let the frame count
+    decide that, rather than the peptides.
+    """
+    single = _model(chimera=False, decoder_frames=40)
+    assert single.n_decoder_frames == 40
+
+    chimeric = _model(chimera=True, decoder_frames=40)
+    assert chimeric.n_decoder_frames == 40
+    # The decoder prepends a global precursor token, so it runs one
+    # position wider and slot A carries that position.
     frames = chimeric.n_decoder_frames + 1
-    assert chimeric.chimera_split == chimeric.max_peptide_len + 1
-    assert frames - chimeric.chimera_split == chimeric.max_peptide_len
+    assert chimeric.chimera_split == 21
+    assert frames - chimeric.chimera_split == 20
 
 
 def test_single_loss_matches_builtin_reduction():

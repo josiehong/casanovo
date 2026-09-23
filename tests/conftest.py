@@ -351,6 +351,7 @@ def _get_config_file(file_path, file_name, additional_cfg=None):
         "charge_range": None,
         "min_peptide_len": 6,
         "max_peptide_len": 100,
+        "decoder_frames": 100,
         # Off by default so these tests keep covering the single-peptide
         # model. The chimeric path has its own config and tests.
         "chimera": False,
@@ -465,7 +466,13 @@ def tiny_config_chimera(tmp_path):
     return _get_config_file(
         tmp_path,
         "config_chimera.yml",
-        additional_cfg={"chimera": True, "charge_range": [1, 4]},
+        # Twice the frames of the single-peptide config, so each slot has
+        # the room one peptide gets there.
+        additional_cfg={
+            "chimera": True,
+            "charge_range": [1, 4],
+            "decoder_frames": 200,
+        },
     )
 
 

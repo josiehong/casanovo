@@ -53,11 +53,15 @@ isolation_window_width:
 isolation_window_offset: 0.0
 # The minimum length of considered peptides.
 min_peptide_len: 6
-# The maximum length of considered peptides. This is also the number of
-# decoder frames the CTC objective aligns one peptide to. Chimeric mode gives
-# each of its two peptides this many frames, so the decoder runs twice as wide
-# rather than each peptide getting half as much room.
+# The maximum length of considered peptides, and the floor for
+# decoder_frames. It no longer sets the frame count: that is decoder_frames.
 max_peptide_len: 60
+# CTC frames the decoder emits: a compute budget, not a length limit. Must
+# cover a peptide's length plus one frame per repeated residue. The decoder
+# prepends a precursor token, which this does not count, so it runs one
+# position wider. Chimeric mode splits these frames into two equal slots, one
+# peptide each, so it must then be even and at least twice max_peptide_len.
+decoder_frames: 120
 # Sequence the two co-fragmented peptides of a chimeric spectrum, one in each
 # half of the decoder frames, instead of a single peptide across all of them.
 # Training annotations are then written "PEP1:PEP2", and a spectrum annotated

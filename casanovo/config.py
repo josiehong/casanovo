@@ -34,6 +34,7 @@ _config_optional = frozenset(
         "charge_range",
         "chimera",
         "chimera_curriculum",
+        "decoder_frames",
         "isolation_window_offset",
         "isolation_window_width",
         "muon_lr",
@@ -75,6 +76,7 @@ class Config:
         isolation_window_offset=float,
         min_peptide_len=int,
         max_peptide_len=int,
+        decoder_frames=int,
         chimera=bool,
         chimera_curriculum=int,
         predict_batch_size=int,
@@ -182,6 +184,27 @@ class Config:
         # Validate.
         for key, val in self._config_types.items():
             self.validate_param(key, val)
+
+        # CTC needs a frame per residue, so the budget has to cover the
+        # longest peptide considered. Repeats need one more each, which
+        # only the data knows; training warns about those. Chimeric mode
+        # splits the frames into two slots, so each peptide gets half.
+        frames = self._params["decoder_frames"]
+        needed = self._params["max_peptide_len"]
+        if self._params["chimera"]:
+            if frames % 2:
+                raise ValueError(
+                    f"decoder_frames ({frames}) must be even in chimeric "
+                    "mode, which splits the frames into two equal slots"
+                )
+            needed *= 2
+        if frames < needed:
+            raise ValueError(
+                f"decoder_frames ({frames}) is below {needed}; peptides of "
+                f"max_peptide_len ({self._params['max_peptide_len']}) could "
+                "not be decoded"
+                + (" in both slots" if self._params["chimera"] else "")
+            )
 
         self._params["n_workers"] = utils.n_workers()
 

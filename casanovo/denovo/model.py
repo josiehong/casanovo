@@ -76,6 +76,12 @@ class Spec2Pep(pl.LightningModule):
         with the m/z encoding for each peak.
     max_peptide_len : int
         The maximum peptide length to decode.
+    decoder_frames : int
+        The CTC frames the decoder emits, not counting the precursor token
+        it prepends, so it runs one position wider than this. A compute
+        budget rather than a length limit: CTC needs a frame per residue
+        and one more per repeated residue. Chimeric mode splits the frames
+        into two equal slots.
     residues : str | Dict[str, float]
         The amino acid dictionary and their masses. By default
         ("canonical") this is only the 20 canonical amino acids, with
@@ -147,6 +153,7 @@ class Spec2Pep(pl.LightningModule):
         n_layers: int = 9,
         dropout: float = 0.0,
         max_peptide_len: int = 100,
+        decoder_frames: int = 120,
         residues: str | Dict[str, float] = "canonical",
         max_charge: int = 5,
         precursor_mass_tol: float = 50,
@@ -254,19 +261,20 @@ class Spec2Pep(pl.LightningModule):
 
         # Chimeric sequencing: the decoder frames are split into two slots,
         # one peptide each, instead of carrying a single peptide. Each slot
-        # gets a full `max_peptide_len` frames, so that setting keeps meaning
-        # the longest peptide the model can emit and the decoder simply runs
-        # twice as wide. The decoder prepends a global precursor token, so
-        # slot A is everything before `chimera_split`, one frame longer than
-        # slot B, which is everything from it on.
+        # gets half of them, so a peptide has the same room whichever slot
+        # it lands in; the permutation-invariant loss scores both
+        # assignments, and an uneven split would let the frame count decide
+        # which one wins. The decoder prepends a global precursor token, so
+        # slot A is everything before `chimera_split`, one position longer
+        # than slot B, which is everything from it on.
         #
         # Splitting the frames rather than marking the boundary with a
         # separator residue keeps the alphabet, and so the mass axis PMC
         # searches, identical to single-peptide sequencing, and lets PMC run
         # per slot with no changes.
         self.chimera = chimera
-        self.n_decoder_frames = self.max_peptide_len * (2 if chimera else 1)
-        self.chimera_split = 1 + self.max_peptide_len
+        self.n_decoder_frames = decoder_frames
+        self.chimera_split = 1 + decoder_frames // 2
 
         # Logging.
         self.calculate_precision = calculate_precision
@@ -403,8 +411,9 @@ class Spec2Pep(pl.LightningModule):
         memories, mem_masks = self.encoder(mzs, ints)
 
         # Decode a fixed number of frames; the CTC loss aligns them to the
-        # (shorter) ground truth peptide. Chimeric sequencing decodes two
-        # peptides, so it needs twice the frames.
+        # (shorter) ground truth peptide. The decoder prepends the precursor
+        # token, so it runs one position wider than this, as the
+        # non-chimeric arm's does.
         #
         # Every frame is fed token id 0, whose embedding row `padding_idx`
         # holds frozen at zero, so no frame carries token information and
@@ -619,7 +628,7 @@ class Spec2Pep(pl.LightningModule):
             logger.warning(
                 "%d peptide(s) in this batch need more CTC frames than the "
                 "%d available and will contribute zero loss. Increase "
-                "max_peptide_len to include them in training.",
+                "decoder_frames to include them in training.",
                 infeasible.sum().item(),
                 n_frames,
             )

@@ -2133,7 +2133,10 @@ class Spec2Pep(pl.LightningModule):
         for p in self.parameters():
             if not p.requires_grad:
                 continue
-            if p.ndim >= 2 and id(p) not in aux_ids:
+            # Squeeze first: ndim alone calls the encoder's spectrum
+            # token, shaped (1, 1, d_model), a matrix, and Muon would
+            # normalize its update to a size the gradient cannot affect.
+            if p.squeeze().ndim >= 2 and id(p) not in aux_ids:
                 muon_params.append(p)
             else:
                 aux_params.append(p)

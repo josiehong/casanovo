@@ -991,3 +991,37 @@ def test_the_mass_search_may_emit_one_stop_and_only_one():
     assert int(src_bins[row, zero_bin + 1]) == zero_bin, (
         "and it must be reachable only from the zero-mass bin"
     )
+
+
+def test_the_mass_search_needs_a_reversed_tokenizer(caplog):
+    """The stop's pin only lands where the frame flip puts it.
+
+    PMC pins the stop to the zero-mass bin, which is the opening of its
+    own order after the frames are flipped. A reversed tokenizer closes
+    the peptide with the stop, so flipping opens with it. Without the
+    flip the stop closes the frames instead, at full residue mass, where
+    the pin cannot place it, and the search would return peptides the
+    caller could not trust. Decline it instead.
+
+    `model_runner` always builds a reversed tokenizer, so this guards a
+    directly constructed model.
+    """
+    forward = ChimeraTokenizer(
+        residues=Config().residues,
+        reverse=False,
+        start_token=None,
+        stop_token="$",
+    )
+    model = _model(tokenizer=forward)
+    assert not model.tokenizer.reverse
+
+    logits = torch.zeros(model.n_decoder_frames + 1, model.vocab_size)
+    with caplog.at_level("WARNING"):
+        assert model._pmc_decode(logits, 500.0) is None
+    assert "reversed tokenizer" in caplog.text
+
+    # Warned once, not once per spectrum.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert model._pmc_decode(logits, 500.0) is None
+    assert "reversed tokenizer" not in caplog.text

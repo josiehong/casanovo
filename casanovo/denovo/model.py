@@ -246,6 +246,7 @@ class Spec2Pep(pl.LightningModule):
         self._ctc_infeasible_warned = False
         self._pmc_size_warned = False
         self._pmc_vocab_warned = False
+        self._pmc_reverse_warned = False
         # Optimizer settings.
         self.warmup_iters = warmup_iters
         self.cosine_schedule_period_iters = cosine_schedule_period_iters
@@ -1421,13 +1422,27 @@ class Spec2Pep(pl.LightningModule):
         """
         device = logits.device
         n_frames, vocab = logits.shape
+        # The stop is pinned to the zero-mass bin, which is where the frame
+        # flip puts it for a reversed tokenizer: it closes that tokenizer's
+        # order, so flipping opens this search's. Without the flip the stop
+        # closes the frames instead, at full residue mass, and the pin
+        # cannot place it there. `model_runner` always builds a reversed
+        # tokenizer, so this only guards a directly constructed model.
+        if not self.tokenizer.reverse:
+            if not self._pmc_reverse_warned:
+                self._pmc_reverse_warned = True
+                logger.warning(
+                    "Skipping precise mass control: it places the stop token "
+                    "by flipping the frames, which needs a reversed "
+                    "tokenizer."
+                )
+            return None
         # A reversed tokenizer emits the peptide C-terminus first, which
         # would put an N-terminal modification last. Decoding the frames
-        # back to front puts it first in either case, so the "N-terminal
-        # tokens open the peptide" rule below is the only one needed;
-        # the emitted tokens are flipped back before returning.
-        if self.tokenizer.reverse:
-            logits = logits.flip(0)
+        # back to front puts it first, so the "N-terminal tokens open the
+        # peptide" rule below is the only one needed; the emitted tokens
+        # are flipped back before returning.
+        logits = logits.flip(0)
 
         # Mass discretization. The pointer table is the memory
         # bottleneck, so pick the finest resolution whose table fits in
@@ -1677,11 +1692,10 @@ class Spec2Pep(pl.LightningModule):
 
         tokens = [c for c, _ in reversed(emissions)]
         confs = [s for _, s in reversed(emissions)]
-        if self.tokenizer.reverse:
-            # Undo the frame flip so the caller still receives the
-            # tokens in the tokenizer's own order.
-            tokens.reverse()
-            confs.reverse()
+        # Undo the frame flip so the caller still receives the tokens in
+        # the tokenizer's own order.
+        tokens.reverse()
+        confs.reverse()
         # The stop is scored like the peptide's other emissions but is
         # not part of it, so it leaves here on its own, as it does from
         # `_ctc_decode`. The pin allows only one, and taking the best

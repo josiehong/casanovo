@@ -1919,14 +1919,14 @@ def test_pmc_decode():
         masses[aa_k] + masses[aa_a] + masses[aa_e]
     ).item() + 18.010565
 
-    tokens, confs, _ = model._pmc_decode(logits, precursor_mass)
+    tokens, confs = model._pmc_decode(logits, precursor_mass)[:2]
     assert tokens == [aa_k, aa_a, aa_e]
     assert len(confs) == len(tokens)
     assert model._fits_precursor_mass(tokens, precursor_mass)
     assert not model._fits_precursor_mass(greedy, precursor_mass)
 
     # An observed precursor mass off by one isotope is still matched.
-    tokens, _, _ = model._pmc_decode(logits, precursor_mass + 1.00335)
+    tokens = model._pmc_decode(logits, precursor_mass + 1.00335).tokens
     assert tokens == [aa_k, aa_a, aa_e]
 
     # No path can reach an infeasible precursor mass.
@@ -2010,7 +2010,7 @@ def test_pmc_decode_charge_range():
     # Allowing 2-6 recovers it, and reports the charge it matched under
     # rather than the annotated one.
     model.charge_range = (2, 6)
-    tokens, confs, charge = model._pmc_decode(
+    tokens, confs, _, charge, _ = model._pmc_decode(
         logits, wrong_mass, precursor_mz, annotated_charge
     )
     assert tokens == [aa_k, aa_a, aa_e]
@@ -2067,7 +2067,7 @@ def test_pmc_decode_nterm_mod():
         masses[aa_k] + masses[aa_g] + masses[nterm]
     ).item() + 18.010565
 
-    tokens, confs, _ = model._pmc_decode(logits, precursor_mass)
+    tokens, confs = model._pmc_decode(logits, precursor_mass)[:2]
     assert tokens == [aa_k, aa_g, nterm]
     assert len(confs) == len(tokens)
     assert model._fits_precursor_mass(tokens, precursor_mass)
@@ -2099,7 +2099,7 @@ def test_pmc_decode_all_nterm_mods():
             masses[aa_k] + masses[aa_g] + masses[nterm]
         ).item() + 18.010565
 
-        tokens, _, _ = model._pmc_decode(logits, precursor_mass)
+        tokens = model._pmc_decode(logits, precursor_mass).tokens
         assert tokens == [aa_k, aa_g, nterm], label
         assert model._fits_precursor_mass(tokens, precursor_mass), label
         # Still rejected at the wrong end, negative mass or not.
@@ -2129,7 +2129,7 @@ def test_pmc_decode_coarse_resolution(monkeypatch):
     # A budget this small cannot hold the 0.01 Da grid; decoding should
     # coarsen the grid instead of giving up on mass control.
     monkeypatch.setattr(denovo.model, "PMC_MAX_POINTER_BYTES", 50_000)
-    tokens, _, _ = model._pmc_decode(logits, precursor_mass)
+    tokens = model._pmc_decode(logits, precursor_mass).tokens
     assert tokens == [aa_k, aa_a, aa_e]
     assert model._fits_precursor_mass(tokens, precursor_mass)
 
@@ -2174,7 +2174,7 @@ def test_pmc_decode_near_miss_does_not_shadow_a_match():
 
     result = model._pmc_decode(logits, precursor_mass)
     assert result is not None, "the decoy shadowed a real match"
-    tokens, _, _ = result
+    tokens = result.tokens
     assert tokens == [aa_k, aa_a, aa_e]
     assert model._fits_precursor_mass(tokens, precursor_mass)
 

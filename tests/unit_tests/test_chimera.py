@@ -903,8 +903,10 @@ def test_the_fit_flag_reaches_the_score(monkeypatch):
     for frame, token in enumerate([idx["K"], idx["A"], idx["E"]]):
         logits[:, frame, token] = 5.0
 
-    *_, fits = model._decode_frames(logits, precursors)
-    assert fits == [False], "an unreachable precursor cannot be matched"
+    decoded = model._decode_frames(logits, precursors)
+    assert [d.fit for d in decoded] == [False], (
+        "an unreachable precursor cannot be matched"
+    )
 
     monkeypatch.setattr(model, "_forward_step", lambda b: (logits, None))
     monkeypatch.setattr(
@@ -916,4 +918,76 @@ def test_the_fit_flag_reaches_the_score(monkeypatch):
     assert all(p.peptide_score < 0 for p in psms), (
         "a peptide no window accepted must sort below every one that "
         "matched, and only a negative score does that"
+    )
+
+
+def test_the_stop_is_scored_with_the_peptide_not_among_the_residues():
+    """CTC supervises the stop, so upstream's score counts it.
+
+    It must not reach `aa_scores`, which is reported per residue and has
+    to stay one entry per residue of the sequence; putting it there would
+    shift every residue's score by one in the mzTab.
+    """
+    model = _model()
+    confs = [0.9, 0.8, 0.5]
+    tokens = _tokens(model.tokenizer, "PEK")
+    args = (tokens, confs, 2, ("file", "1"), 400.0, True)
+
+    without = model._build_psm(*args)
+    with_stop = model._build_psm(*args, 0.5)
+
+    # Reported residues are unchanged; only the score sees the stop.
+    assert len(with_stop.aa_scores) == len(without.aa_scores) == len(tokens)
+    assert np.allclose(with_stop.aa_scores, without.aa_scores)
+    assert with_stop.peptide_score == pytest.approx(
+        without.peptide_score * 0.5
+    )
+    assert with_stop.peptide_score < float(np.prod(with_stop.aa_scores))
+
+
+def test_the_mass_search_may_emit_one_stop_and_only_one():
+    """The stop carries no mass, so its own pin would re-admit it.
+
+    Pinned tokens may only be emitted from the zero-mass bin. A stop of
+    zero mass would leave the state on that bin, where a blank could
+    return and emit a second, counting its log-probability twice in a
+    score that reports one stop. Stepping it a bin moves the state out of
+    reach of its own pin.
+
+    The decoded peptide cannot show this, since the stops are stripped
+    either way, so assert the rule: the stop has one legal target and it
+    is not where it starts.
+    """
+    model = _model()
+    stop = model.stop_token
+    assert model.token_masses[stop].item() == 0.0, (
+        "the stop must carry no mass"
+    )
+
+    resolution, n_bins, zero_bin = 0.01, 64, 8
+    device = model.token_masses.device
+    emit_idx, delta_idx, _, emit_pinned, deltas = model._pmc_alphabet(
+        model.vocab_size, 5_000.0, resolution, device
+    )
+    emit_tokens = [int(c) for c in emit_idx]
+
+    assert stop in deltas, "the stop must be emittable"
+    assert deltas[stop] == 1, "the stop must still move the state"
+    assert emit_pinned[emit_tokens.index(stop)], "and it must be pinned"
+    bins = torch.arange(n_bins, device=device)
+    raw_src = bins.unsqueeze(0) - delta_idx.unsqueeze(1)
+    valid = (raw_src >= 0) & (raw_src < n_bins)
+    src_bins = raw_src.clamp(0, n_bins - 1)
+    pinned_only = torch.tensor(emit_pinned, device=device).unsqueeze(1)
+    valid &= ~pinned_only | (
+        bins.unsqueeze(0) == zero_bin + delta_idx.unsqueeze(1)
+    )
+
+    row = emit_tokens.index(stop)
+    targets = [int(b) for b in bins[valid[row]]]
+    assert targets == [zero_bin + 1], (
+        "the stop must have exactly one legal target, one bin along"
+    )
+    assert int(src_bins[row, zero_bin + 1]) == zero_bin, (
+        "and it must be reachable only from the zero-mass bin"
     )

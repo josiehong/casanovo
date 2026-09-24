@@ -1674,9 +1674,10 @@ class Spec2Pep(pl.LightningModule):
             spectrum_id = (batch["peak_file"][i], batch["scan_id"][i])
             exp_mz = float(prec_mz.item())
             matches = []
-            for sequences, scores, charges in slots:
+            for sequences, scores, charges, fits in slots:
                 match = self._build_psm(
-                    sequences[i], scores[i], charges[i], spectrum_id, exp_mz
+                    sequences[i], scores[i], charges[i], spectrum_id,
+                    exp_mz, fits[i],
                 )
                 if match is not None:
                     matches.append(match)
@@ -1713,15 +1714,19 @@ class Spec2Pep(pl.LightningModule):
 
         Returns
         -------
-        Tuple[List[List[int]], List[List[float]], List[int]]
-            The decoded tokens, their confidences, and the charge each
-            peptide was accepted under. With ``charge_range`` unset that
-            charge is always the annotated one; with a range set it is the
-            charge whose window the peptide matched, which is what
-            ``calc_mz`` has to be computed from downstream.
+        Tuple[List[List[int]], List[List[float]], List[int], List[bool]]
+            The decoded tokens, their confidences, the charge each peptide
+            was accepted under, and whether it landed in a precursor
+            window at all. With ``charge_range`` unset that charge is
+            always the annotated one; with a range set it is the charge
+            whose window the peptide matched, which is what ``calc_mz``
+            has to be computed from downstream. A peptide that matched
+            nothing keeps its greedy confidence, and the score subtracts
+            one so it sorts below every peptide that did match.
         """
         sequences, scores = self._ctc_decode(logits)
         charges = [int(z) for z in precursors[:, 1].tolist()]
+        fits = [False] * len(sequences)
         for i, tokens in enumerate(sequences):
             precursor_mass = precursors[i, 0].item()
             precursor_mz = precursors[i, 2].item()
@@ -1736,13 +1741,16 @@ class Spec2Pep(pl.LightningModule):
                 )
                 if window is not None:
                     charges[i] = window[0]
+                    fits[i] = True
                     continue
             pmc = self._pmc_decode(
                 logits[i], precursor_mass, precursor_mz, annotated,
                 is_partner,
             )
             if pmc is not None:
+                # PMC only returns mass-matching paths.
                 sequences[i], scores[i], charges[i] = pmc
+                fits[i] = True
             elif self.chimera and tokens:
                 # No window accepted this peptide, so no charge was chosen
                 # for it. Reporting the annotated charge would be wrong
@@ -1752,7 +1760,7 @@ class Spec2Pep(pl.LightningModule):
                     tokens, precursor_mass, precursor_mz, annotated,
                     is_partner,
                 )
-        return sequences, scores, charges
+        return sequences, scores, charges, fits
 
     def _partner_slots(
         self, frames: Sequence[torch.Tensor], precursors: torch.Tensor
@@ -1885,6 +1893,7 @@ class Spec2Pep(pl.LightningModule):
         charge: int,
         spectrum_id: Tuple[str, str],
         exp_mz: float,
+        fit: bool = True,
     ) -> Optional[psm.PepSpecMatch]:
         """
         Assemble one PSM from decoded tokens.
@@ -1901,6 +1910,10 @@ class Spec2Pep(pl.LightningModule):
             The peak file and scan identifier.
         exp_mz : float
             The observed precursor m/z.
+        fit : bool
+            Whether the peptide landed in a precursor window. When it did
+            not, ``_peptide_score`` subtracts one so it sorts below every
+            peptide that did.
 
         Returns
         -------
@@ -1917,10 +1930,16 @@ class Spec2Pep(pl.LightningModule):
         if self.tokenizer.reverse:
             aa_scores = aa_scores[::-1]
 
+        # Upstream's aggregation: the product of the residue scores, minus
+        # one when the peptide misses the precursor. The product also
+        # survives the N-terminal score merge in `on_predict_batch_end`,
+        # where `aa_scores[1] *= aa_scores[0]` and element 0 is dropped; a
+        # mean does not, so it would stop being the aggregate of the very
+        # scores reported beside it.
         return psm.PepSpecMatch(
             sequence=peptide,
             spectrum_id=spectrum_id,
-            peptide_score=float(aa_scores.mean()),
+            peptide_score=float(_peptide_score(aa_scores, fit)),
             charge=int(charge),
             calc_mz=np.nan,
             exp_mz=exp_mz,

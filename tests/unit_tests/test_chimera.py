@@ -842,3 +842,78 @@ def test_database_padding_does_not_change_a_candidate_score():
         return probs[:, : short.shape[1] + 1]
 
     assert torch.allclose(score(short), score(padded), atol=1e-6)
+
+
+def test_peptide_score_is_the_product_of_the_residue_scores():
+    """Upstream's aggregation, not the mean the CTC arm had.
+
+    It also has to survive `on_predict_batch_end`, which merges an
+    N-terminal modification's score into the residue that follows it
+    (`aa_scores[1] *= aa_scores[0]`, element 0 dropped). A product is
+    unchanged by that; a mean is not, so a mean would stop being the
+    aggregate of the very scores reported beside it.
+    """
+    model = _model()
+    confs = [0.9, 0.8, 0.5]
+    match = model._build_psm(
+        _tokens(model.tokenizer, "PEK"), confs, 2, ("file", "1"), 400.0
+    )
+    assert match.peptide_score == pytest.approx(0.9 * 0.8 * 0.5)
+    # Not the mean, which this deliberately replaces.
+    assert match.peptide_score != pytest.approx(np.mean(confs))
+
+
+def test_a_peptide_that_misses_every_window_sorts_last():
+    """PMC may give up, and what it leaves behind must rank below the rest.
+
+    Upstream's beam search withheld these; CTC decoding replaced it
+    without replacing the rule, so a peptide no precursor window accepted
+    kept its full confidence and outranked peptides that did match.
+    """
+    model = _model()
+    confs = [0.9, 0.8, 0.5]
+    tokens = _tokens(model.tokenizer, "PEK")
+    args = (tokens, confs, 2, ("file", "1"), 400.0)
+
+    matched = model._build_psm(*args, True)
+    missed = model._build_psm(*args, False)
+
+    assert matched.sequence == missed.sequence
+    assert missed.peptide_score < 0 <= matched.peptide_score
+    assert matched.peptide_score == pytest.approx(missed.peptide_score + 1)
+
+
+def test_the_fit_flag_reaches_the_score(monkeypatch):
+    """The whole path, since the flag crosses two functions to get there.
+
+    `_decode_frames` decides it and `predict_step` hands it to
+    `_build_psm`. Testing `_build_psm` alone would not catch it being
+    dropped in between, which is the part this adds.
+    """
+    model = _model(decoder_frames=8, min_peptide_len=0).eval()
+    batch = _spectrum_batch(n_spectra=1)
+    _, _, precursors, _ = model._process_batch(batch)
+
+    # A precursor mass no path can reach, so no window accepts anything
+    # and PMC gives up, leaving the greedy peptide behind.
+    precursors = precursors.clone()
+    precursors[:, 0] = 50_000.0
+    logits = torch.zeros(1, model.n_decoder_frames + 1, model.vocab_size)
+    idx = model.tokenizer.index
+    for frame, token in enumerate([idx["K"], idx["A"], idx["E"]]):
+        logits[:, frame, token] = 5.0
+
+    *_, fits = model._decode_frames(logits, precursors)
+    assert fits == [False], "an unreachable precursor cannot be matched"
+
+    monkeypatch.setattr(model, "_forward_step", lambda b: (logits, None))
+    monkeypatch.setattr(
+        model, "_process_batch", lambda b: (None, None, precursors, None)
+    )
+    psms = model.predict_step(batch)
+
+    assert psms, "the greedy peptide should still be reported"
+    assert all(p.peptide_score < 0 for p in psms), (
+        "a peptide no window accepted must sort below every one that "
+        "matched, and only a negative score does that"
+    )

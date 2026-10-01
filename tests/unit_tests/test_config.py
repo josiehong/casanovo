@@ -111,3 +111,23 @@ def test_override_mps(monkeypatch, tiny_config, tmp_path, caplog):
             "overwritten to 'cpu' on Apple Silicon" in rec.getMessage()
             for rec in caplog.records
         )
+
+
+def test_isolation_window_optional(tmp_path, tiny_config):
+    """A config written before the isolation window options still loads."""
+    config = Config(tiny_config)
+    assert config.isolation_window_width is None
+    assert config.isolation_window_offset == 0.0
+
+    filename = str(tmp_path / "config_isolation.yml")
+    with (
+        open(tiny_config, "r", encoding="utf-8") as f_in,
+        open(filename, "w", encoding="utf-8") as f_out,
+    ):
+        cfg = yaml.safe_load(f_in)
+        cfg["isolation_window_width"] = 2
+        yaml.safe_dump(cfg, f_out)
+
+    config = Config(filename)
+    assert config.isolation_window_width == 2.0
+    assert isinstance(config.isolation_window_width, float)

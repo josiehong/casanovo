@@ -3365,3 +3365,274 @@ def test_split_chimeric_prediction_top2_and_filtering(tiny_config):
     assert len(preds) == 2
     sequences = {seq for _, _, seq in preds}
     assert sequences == {"AAR", "SAK"}  # PEPTANEK (longest) scores lowest
+
+
+def _precursors(model, peptide, charge=2):
+    """The precursor (mass, charge, m/z) a peptide would be recorded with."""
+    mz = model.tokenizer.calculate_precursor_ions(
+        peptide, torch.tensor(charge)
+    ).item()
+    return torch.tensor([[(mz - 1.007276) * charge, charge, mz]])
+
+
+class _ScriptedDecoder(torch.nn.Module):
+    """A decoder that wants ``best`` and, less eagerly, ``second``."""
+
+    def __init__(self, model, best, second):
+        super().__init__()
+        self.vocab_size, self.stop_token = model.vocab_size, model.stop_token
+        self.scripts = [
+            (model.tokenizer.tokenize([script], add_stop=True)[0], logit)
+            for script, logit in ((second, 8.0), (best, 10.0))
+        ]
+
+    def forward(self, tokens, **kwargs):
+        logits = torch.zeros(len(tokens), tokens.shape[1] + 1, self.vocab_size)
+        for pos in range(logits.shape[1]):
+            for script, logit in self.scripts:
+                token = script[pos] if pos < len(script) else self.stop_token
+                logits[:, pos, token] = logit
+        return logits
+
+
+class _NoEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # The model reads its device off its first parameter.
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, mzs, intensities):
+        return (
+            torch.zeros(len(mzs), 1, 1),
+            torch.zeros(len(mzs), 1, dtype=torch.bool),
+        )
+
+
+def _scripted_model(tiny_config, best, second, reverse=False, **kwargs):
+    model = _chimera_model(tiny_config, n_beams=3, **kwargs)
+    model.tokenizer.reverse = reverse
+    # The stop token doubles as the separator, so a second peptide is only
+    # decoded when it is forced.
+    model.force_chimera = "+" in best
+    model.decoder = _ScriptedDecoder(model, best, second)
+    model.encoder = _NoEncoder()
+    return model
+
+
+def _decode(model, precursors):
+    spectra = torch.zeros(len(precursors), 1)
+    return model.beam_search_decode(spectra, spectra, precursors)
+
+
+def test_mass_windows(tiny_config):
+    """One window per isotope around the precursor, one per charge around
+    the isolation window."""
+    model = _chimera_model(
+        tiny_config,
+        max_charge=3,
+        precursor_mass_tol=20,
+        isotope_error_range=(0, 1),
+        isolation_window_width=2.0,
+        isolation_window_offset=0.25,
+    )
+    precursors = _precursors(model, "LESLIEK")
+    mz = precursors[0, 2].item()
+    residue_mass = (
+        model.tokenizer.masses[model.tokenizer.tokenize(["LESLIEK"])[0]]
+        .sum()
+        .item()
+    )
+
+    windows = model._mass_windows(precursors)
+    assert windows.shape == (1, 2 + 3, 2)
+    assert model._n_precursor_windows == 2
+    # The recorded precursor, monoisotopic and one isotope down.
+    for isotope, (lower, upper) in enumerate(windows[0, :2].tolist()):
+        center = residue_mass - isotope * db_utils.ISOTOPE_SPACING
+        assert lower < center < upper
+        assert upper - lower == pytest.approx(
+            2 * 20e-6 * (center + 18.0106), rel=1e-3
+        )
+    # The isolation window at each charge, off-center by the offset.
+    for charge, (lower, upper) in enumerate(windows[0, 2:].tolist(), 1):
+        assert upper - lower == pytest.approx(2.0 * charge)
+        assert (lower + upper) / 2 == pytest.approx(
+            (mz + 0.25 - 1.007276) * charge - 18.0106, abs=1e-3
+        )
+
+    # No isolation window, no constraint.
+    assert _chimera_model(tiny_config)._mass_windows(precursors) is None
+
+    # A model that predicts one peptide has no co-isolated one to place.
+    single = Spec2Pep(
+        tokenizer=depthcharge.tokenizers.peptides.PeptideTokenizer(
+            residues=Config(tiny_config).residues
+        ),
+        isolation_window_width=2.0,
+    )
+    assert single._mass_windows(precursors).shape == (1, 2, 2)
+
+
+def test_feasible_tokens(tiny_config):
+    """A token is feasible if its peptide can still end in a window."""
+    model = _chimera_model(
+        tiny_config, precursor_mass_tol=20, isolation_window_width=2.0
+    )
+    model.tokenizer.reverse = False
+    index = model.tokenizer.index
+    stop = model.stop_token
+    # LESLIEK is the selected peptide. LKSLIEK is ~1 Da lighter: inside the
+    # isolation window, far outside the precursor tolerance. LKSLIAK is
+    # outside both.
+    windows = model._mass_windows(_precursors(model, "LESLIEK"))
+
+    def feasible(prefix):
+        # "+" tokenizes to the stop token, which is also the separator.
+        tokens = model.tokenizer.tokenize([prefix])[0][None, :]
+        return model._feasible_tokens(tokens, windows)[0]
+
+    # Padding never is.
+    assert not feasible("LESL")[0]
+    # A peptide cannot end before it weighs enough.
+    assert not feasible("LESL")[stop]
+    # The only peptide of a prediction has to match the precursor.
+    assert feasible("LESLIEK")[stop]
+    assert not feasible("LKSLIEK")[stop]
+
+    # When a second peptide is forced, the isolation window is enough to
+    # end the first.
+    model.force_chimera = True
+    assert feasible("LESLIEK")[stop] and feasible("LKSLIEK")[stop]
+    assert not feasible("LKSLIAK")[stop]
+
+    # After the selected peptide, the second only needs the isolation
+    # window.
+    assert feasible("LESLIEK+LKSLIEK")[stop]
+    assert not feasible("LESLIEK+LKSLIAK")[stop]
+
+    # After a co-isolated peptide, the second has to be the selected one,
+    # which the search knows a residue ahead: K completes it, nothing else
+    # does.
+    assert feasible("LKSLIEK+LESLIE").nonzero().flatten().tolist() == [
+        index["K"]
+    ]
+    assert feasible("LKSLIEK+LESLIEK").nonzero().flatten().tolist() == [stop]
+    assert not feasible("LKSLIEK+LKSLIEK")[stop]
+
+    # Each beam is judged against its own spectrum's windows.
+    model.force_chimera = False
+    both = torch.cat(
+        [windows, model._mass_windows(_precursors(model, "LKSLIEK"))]
+    )
+    tokens = model.tokenizer.tokenize(["LKSLIEK", "LKSLIEK"])
+    assert model._feasible_tokens(tokens, both)[:, stop].tolist() == [
+        False,
+        True,
+    ]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_beam_search_mass_constrained(tiny_config, reverse):
+    """The search leaves a path it prefers for one that fits the mass."""
+    precursors_from = functools.partial(_precursors, peptide="LESLIEK")
+
+    # One peptide: the decoder wants LESLIAK, the precursor says LESLIEK.
+    free = _scripted_model(tiny_config, "LESLIAK", "LESLIEK", reverse)
+    ((prediction,),) = _decode(free, precursors_from(free))
+    assert prediction[2] == "LESLIAK"
+
+    model = _scripted_model(
+        tiny_config, "LESLIAK", "LESLIEK", reverse, isolation_window_width=2.0
+    )
+    ((prediction,),) = _decode(model, precursors_from(model))
+    assert prediction[2] == "LESLIEK"
+    assert prediction[0] > 0
+
+    # Two peptides: the co-isolated one is ~1 Da off the precursor, which
+    # the isolation window allows, and the path outside it is dropped.
+    model = _scripted_model(
+        tiny_config,
+        "LESLIEK+LKSLIAK",
+        "LESLIEK+LKSLIEK",
+        reverse,
+        isolation_window_width=2.0,
+    )
+    (predictions,) = _decode(model, precursors_from(model))
+    assert {seq for _, _, seq in predictions} == {"LESLIEK", "LKSLIEK"}
+    assert all(score > 0 for score, _, _ in predictions)
+
+    # Whichever of the two comes first.
+    model = _scripted_model(
+        tiny_config,
+        "LKSLIAK+LESLIEK",
+        "LKSLIEK+LESLIEK",
+        reverse,
+        isolation_window_width=2.0,
+    )
+    (predictions,) = _decode(model, precursors_from(model))
+    assert {seq for _, _, seq in predictions} == {"LESLIEK", "LKSLIEK"}
+
+
+def test_beam_search_mass_constrained_fallback(tiny_config):
+    """A spectrum nothing fits is decoded freely and penalized."""
+    model = _scripted_model(
+        tiny_config,
+        "LESLIEK+LKSLIAK",
+        "LESLIEK+LKSLIEK",
+        isolation_window_width=2.0,
+    )
+    # No peptide is as light as the second precursor, so the constrained
+    # search has nowhere to go for it. The first is unaffected.
+    precursors = torch.cat(
+        [_precursors(model, "LESLIEK"), torch.tensor([[9.0, 1.0, 10.0]])]
+    )
+    constrained, fallback = _decode(model, precursors)
+    assert {seq for _, _, seq in constrained} == {"LESLIEK", "LKSLIEK"}
+    assert all(score > 0 for score, _, _ in constrained)
+    assert {seq for _, _, seq in fallback} == {"LESLIEK", "LKSLIAK"}
+    assert all(-1 <= score < 0 for score, _, _ in fallback)
+
+
+def test_beam_search_unconstrained_by_default(tiny_config):
+    """Without an isolation window the search never looks at masses."""
+    model = _scripted_model(tiny_config, "LESLIAK+LKSLIAK", "LESLIEK")
+    model._feasible_tokens = unittest.mock.MagicMock(
+        side_effect=AssertionError
+    )
+    model._peptides_fit = unittest.mock.MagicMock(side_effect=AssertionError)
+    # Nowhere near either peptide.
+    (predictions,) = _decode(model, torch.tensor([[9.0, 1.0, 10.0]]))
+    assert {seq for _, _, seq in predictions} == {"LESLIAK", "LKSLIAK"}
+    assert all(score > 0 for score, _, _ in predictions)
+
+
+def test_split_prediction_mass_penalty(tiny_config):
+    """Only the peptides outside their window are penalized."""
+    model = _chimera_model(
+        tiny_config, precursor_mass_tol=20, isolation_window_width=2.0
+    )
+    model.tokenizer.reverse = False
+    windows = model._mass_windows(_precursors(model, "LESLIEK"))[0]
+
+    def scores(prediction):
+        tokens = model.tokenizer.tokenize([prediction])[0]
+        fits = model._peptides_fit(tokens, windows)
+        pep_score = 0.5 - (not all(fits))
+        return {
+            seq: score
+            for score, _, seq in model._split_prediction(
+                tokens, np.full(len(tokens), 0.9), pep_score, windows
+            )
+        }
+
+    # Both fit: the selected peptide and one in the isolation window.
+    assert all(s > 0 for s in scores("LKSLIEK+LESLIEK").values())
+    # The selected one fits, the other is outside the isolation window.
+    split = scores("LESLIEK+LKSLIAK")
+    assert split["LESLIEK"] > 0 and split["LKSLIAK"] < 0
+    assert split["LKSLIAK"] == pytest.approx(0.9**7 - 1)
+    # Neither matches the precursor, so neither is the selected peptide.
+    assert all(s < 0 for s in scores("LKSLIEK+LKSLIAK").values())
+    # A lone peptide has to match the precursor.
+    assert scores("LESLIEK") == {"LESLIEK": 0.5}
+    assert scores("LKSLIEK") == {"LKSLIEK": -0.5}

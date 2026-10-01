@@ -32,10 +32,27 @@ devices:
 
 # Number of beams used in beam search.
 n_beams: 1
+# The width of the precursor isolation window, in m/z. Setting this makes
+# beam search mass-constrained: a token is only decoded if the peptide it
+# extends can still reach an allowed mass, and a peptide can only end at one.
+# The recorded precursor m/z belongs to the peptide the instrument selected,
+# so one peptide of a prediction has to match it, within `precursor_mass_tol`
+# and `isotope_error_range` below. A co-isolated peptide of a chimeric
+# spectrum can be far from it, and only has to fall inside the isolation
+# window at some charge up to `max_charge`. A spectrum that nothing can be
+# decoded for under the constraint is decoded without it, and its peptides
+# that miss their mass get a negative score. Leave empty to apply no mass
+# constraint.
+isolation_window_width:
+# How far the isolation window's center sits from the recorded precursor m/z,
+# in m/z, for methods that offset it. Only read when a width is set.
+isolation_window_offset: 0.0
 
 
 ###
-# The following parameters are unique to Casanovo's database search mode.
+# The following parameters are unique to Casanovo's database search mode,
+# except for `precursor_mass_tol` and `isotope_error_range`, which de novo
+# sequencing also reads when `isolation_window_width` is set.
 ###
 
 # Max absolute difference allowed with respect to observed precursor m/z.

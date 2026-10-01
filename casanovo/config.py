@@ -25,6 +25,17 @@ _config_deprecated = dict(
     reverse_peptides=None,
 )
 
+# Options added after existing config files were written. They default from
+# the packaged config.yaml when a user config omits them, so adding an option
+# does not invalidate every config in the wild (casanovo otherwise requires a
+# user config to list every key).
+_config_optional = frozenset(
+    {
+        "isolation_window_offset",
+        "isolation_window_width",
+    }
+)
+
 
 class Config:
     """
@@ -51,6 +62,8 @@ class Config:
     _config_types = dict(
         precursor_mass_tol=float,
         isotope_error_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
+        isolation_window_width=float,
+        isolation_window_offset=float,
         min_peptide_len=int,
         max_peptide_len=int,
         predict_batch_size=int,
@@ -134,7 +147,11 @@ class Config:
 
                         warnings.warn(warning_msg, DeprecationWarning)
                 # Check for missing entries in config file.
-                config_missing = self._params.keys() - self._user_config.keys()
+                config_missing = (
+                    self._params.keys()
+                    - self._user_config.keys()
+                    - _config_optional
+                )
                 if len(config_missing) > 0:
                     raise KeyError(
                         "Missing expected config option(s): "

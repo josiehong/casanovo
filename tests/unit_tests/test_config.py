@@ -118,6 +118,7 @@ def test_isolation_window_optional(tmp_path, tiny_config):
     config = Config(tiny_config)
     assert config.isolation_window_width is None
     assert config.isolation_window_offset == 0.0
+    assert config.charge_range == (1, 4)
 
     filename = str(tmp_path / "config_isolation.yml")
     with (

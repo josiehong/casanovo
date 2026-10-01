@@ -39,7 +39,7 @@ n_beams: 1
 # so one peptide of a prediction has to match it, within `precursor_mass_tol`
 # and `isotope_error_range` below. A co-isolated peptide of a chimeric
 # spectrum can be far from it, and only has to fall inside the isolation
-# window at some charge up to `max_charge`. A spectrum that nothing can be
+# window at some charge in `charge_range`. A spectrum that nothing can be
 # decoded for under the constraint is decoded without it, and its peptides
 # that miss their mass get a negative score. Leave empty to apply no mass
 # constraint.
@@ -47,6 +47,13 @@ isolation_window_width:
 # How far the isolation window's center sits from the recorded precursor m/z,
 # in m/z, for methods that offset it. Only read when a width is set.
 isolation_window_offset: 0.0
+# The charges a peptide may carry, as [min, max]. Only read when a width is
+# set. The recorded charge is then a guess, since nothing says which peptide
+# of a chimeric spectrum it belongs to: the precursor mass is recomputed from
+# the recorded m/z at each charge in the range, and a co-isolated peptide is
+# placed in the isolation window at each of them. Leave empty to hold the
+# peptide that matches the precursor to the recorded charge.
+charge_range: [1, 4]
 
 
 ###

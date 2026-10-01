@@ -31,6 +31,7 @@ _config_deprecated = dict(
 # user config to list every key).
 _config_optional = frozenset(
     {
+        "charge_range",
         "isolation_window_offset",
         "isolation_window_width",
     }
@@ -64,6 +65,7 @@ class Config:
         isotope_error_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
         isolation_window_width=float,
         isolation_window_offset=float,
+        charge_range=lambda min_max: (int(min_max[0]), int(min_max[1])),
         min_peptide_len=int,
         max_peptide_len=int,
         predict_batch_size=int,

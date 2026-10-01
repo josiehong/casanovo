@@ -3460,6 +3460,29 @@ def test_mass_windows(tiny_config):
             (mz + 0.25 - 1.007276) * charge - 18.0106, abs=1e-3
         )
 
+    # With a charge range the recorded charge is one guess among several:
+    # the precursor gets its isotope windows at every charge.
+    ranged = _chimera_model(
+        tiny_config,
+        precursor_mass_tol=20,
+        isotope_error_range=(0, 1),
+        isolation_window_width=2.0,
+        charge_range=(1, 3),
+    )
+    windows = ranged._mass_windows(precursors)
+    assert windows.shape == (1, 3 * 2 + 3, 2)
+    assert ranged._n_precursor_windows == 6
+    selected = iter(windows[0, :6].tolist())
+    for charge in (1, 2, 3):
+        for isotope in (0, 1):
+            lower, upper = next(selected)
+            center = (
+                (mz - 1.007276) * charge
+                - isotope * db_utils.ISOTOPE_SPACING
+                - 18.0106
+            )
+            assert lower < center < upper
+
     # No isolation window, no constraint.
     assert _chimera_model(tiny_config)._mass_windows(precursors) is None
 
@@ -3529,6 +3552,28 @@ def test_feasible_tokens(tiny_config):
         False,
         True,
     ]
+
+
+def test_feasible_tokens_charge_range(tiny_config):
+    """A wrong recorded charge only matters without a charge range."""
+    # LESLIEK was isolated at 2+ and recorded as 3+.
+    precursors = _precursors(_chimera_model(tiny_config), "LESLIEK")
+    precursors[0, 1] = 3
+
+    def can_end(**kwargs):
+        model = _chimera_model(
+            tiny_config, isolation_window_width=2.0, **kwargs
+        )
+        model.tokenizer.reverse = False
+        tokens = model.tokenizer.tokenize(["LESLIEK"])
+        windows = model._mass_windows(precursors)
+        return bool(
+            model._feasible_tokens(tokens, windows)[0, model.stop_token]
+        )
+
+    assert not can_end()
+    assert can_end(charge_range=(1, 4))
+    assert not can_end(charge_range=(3, 4))
 
 
 @pytest.mark.parametrize("reverse", [False, True])

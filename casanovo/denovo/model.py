@@ -92,6 +92,13 @@ class Spec2Pep(pl.LightningModule):
     isolation_window_offset : float
         How far the isolation window's center sits from the recorded
         precursor m/z, in m/z.
+    charge_range : Optional[Tuple[int, int]]
+        The charges a peptide may carry, for the mass-constrained beam
+        search. The recorded charge is then only a guess: the precursor
+        mass is recomputed from the recorded m/z at each charge in the
+        range. When ``None``, the peptide that matches the precursor
+        carries the recorded charge and a co-isolated one any charge up
+        to ``max_charge``.
     n_log : int
         The number of epochs to wait between logging messages.
     train_label_smoothing : float
@@ -130,6 +137,7 @@ class Spec2Pep(pl.LightningModule):
         isotope_error_range: Tuple[int, int] = (0, 1),
         isolation_window_width: Optional[float] = None,
         isolation_window_offset: float = 0.0,
+        charge_range: Optional[Tuple[int, int]] = None,
         n_log: int = 10,
         train_label_smoothing: float = 0.01,
         warmup_iters: int = 100_000,
@@ -205,6 +213,9 @@ class Spec2Pep(pl.LightningModule):
         self.isotope_error_range = tuple(isotope_error_range)
         self.isolation_window_width = isolation_window_width
         self.isolation_window_offset = isolation_window_offset
+        self.charge_range = (
+            None if charge_range is None else tuple(charge_range)
+        )
         self.stop_token = self.tokenizer.stop_int
 
         # Logging.
@@ -551,6 +562,11 @@ class Spec2Pep(pl.LightningModule):
         carry any charge, so it gets one window per charge spanning the
         isolation window instead. Only a chimeric model gets those.
 
+        With ``charge_range`` set the recorded charge is a guess, since
+        nothing says which peptide it belongs to or that it is right:
+        the precursor gets a window per charge in the range too, at the
+        mass the recorded m/z implies for that charge.
+
         Parameters
         ----------
         precursors : torch.Tensor of size (n_spectra, 3)
@@ -569,20 +585,31 @@ class Spec2Pep(pl.LightningModule):
             return None
         precursors = precursors.detach().double().cpu()
         charge, mz = precursors[:, 1:2], precursors[:, 2:3]
+        charges = torch.arange(
+            *(
+                (1, self.max_charge + 1)
+                if self.charge_range is None
+                else (self.charge_range[0], self.charge_range[1] + 1)
+            ),
+            dtype=torch.float64,
+        )
 
         isotopes = torch.arange(
             self.isotope_error_range[0],
             self.isotope_error_range[1] + 1,
             dtype=torch.float64,
         )
-        centers = (mz - PROTON) * charge - ISOTOPE_SPACING * isotopes
+        # One center per (charge, isotope error) pair.
+        selected = charge if self.charge_range is None else charges[None, :]
+        neutral = (mz - PROTON) * selected
+        centers = neutral.unsqueeze(2) - ISOTOPE_SPACING * isotopes
+        centers = centers.flatten(start_dim=1)
         tol = self.precursor_mass_tol / 1e6
         windows = torch.stack(
             [centers * (1 - tol), centers * (1 + tol)], dim=2
         )
 
         if self.is_chimeric:
-            charges = torch.arange(1, self.max_charge + 1, dtype=torch.float64)
             center = mz + self.isolation_window_offset
             half = self.isolation_window_width / 2
             isolation = torch.stack(
@@ -602,7 +629,15 @@ class Spec2Pep(pl.LightningModule):
         The number of leading ``_mass_windows`` built from the recorded
         precursor.
         """
-        return self.isotope_error_range[1] - self.isotope_error_range[0] + 1
+        n_charges = (
+            1
+            if self.charge_range is None
+            else self.charge_range[1] - self.charge_range[0] + 1
+        )
+        n_isotopes = (
+            self.isotope_error_range[1] - self.isotope_error_range[0] + 1
+        )
+        return n_charges * n_isotopes
 
     def _peptide_spans(
         self, pred_tokens: torch.Tensor

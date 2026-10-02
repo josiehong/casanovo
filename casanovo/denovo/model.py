@@ -78,27 +78,30 @@ class Spec2Pep(pl.LightningModule):
         Number of PSMs to return for each spectrum.
     precursor_mass_tol : float
         The mass tolerance (in ppm) around the recorded precursor that
-        a predicted peptide is held to during beam search. Only read
-        when ``isolation_window_width`` is set.
-    isotope_error_range : Tuple[int, int]
-        The isotope errors to consider around the recorded precursor.
+        a non-chimeric model's peptide is held to during beam search.
         Only read when ``isolation_window_width`` is set.
+    isotope_error_range : Tuple[int, int]
+        The isotope errors to consider around the recorded precursor,
+        for a non-chimeric model. Only read when
+        ``isolation_window_width`` is set.
     isolation_window_width : Optional[float]
         The width of the precursor isolation window, in m/z. When set,
-        beam search is mass-constrained: it only decodes tokens that
-        keep one peptide of a prediction on the recorded precursor and
-        any co-isolated peptide inside the isolation window. When
-        ``None``, beam search applies no mass constraint.
+        beam search is mass-constrained: a chimeric model only decodes
+        tokens that keep every peptide of a prediction inside the
+        isolation window, and a non-chimeric model ones that keep its
+        peptide on the recorded precursor. When ``None``, beam search
+        applies no mass constraint.
     isolation_window_offset : float
         How far the isolation window's center sits from the recorded
         precursor m/z, in m/z.
     charge_range : Optional[Tuple[int, int]]
         The charges a peptide may carry, for the mass-constrained beam
-        search. The recorded charge is then only a guess: the precursor
-        mass is recomputed from the recorded m/z at each charge in the
-        range. When ``None``, the peptide that matches the precursor
-        carries the recorded charge and a co-isolated one any charge up
-        to ``max_charge``.
+        search. A chimeric model's peptide is placed in the isolation
+        window at each charge in the range; a non-chimeric model's
+        precursor mass is recomputed from the recorded m/z at each.
+        When ``None``, a chimeric model's peptide may carry any charge
+        up to ``max_charge`` and a non-chimeric model's the recorded
+        one.
     n_log : int
         The number of epochs to wait between logging messages.
     train_label_smoothing : float
@@ -357,23 +360,18 @@ class Spec2Pep(pl.LightningModule):
         memories, mem_masks = self.encoder(mzs, intensities)
         windows = self._mass_windows(precursors)
         pred_peptides = self._beam_search(
-            memories, mem_masks, precursors, windows, windows is not None
+            memories, mem_masks, precursors, windows
         )
         if windows is None:
             return pred_peptides
 
         # A spectrum the constrained search finished nothing for is decoded
-        # again without the constraint, so it still gets a prediction. Its
-        # peptides are scored against the windows instead, and the ones
-        # outside rank below anything the constrained search produced.
+        # again without the constraint, so it still gets a prediction,
+        # scored as any unconstrained one.
         unmatched = [i for i, preds in enumerate(pred_peptides) if not preds]
         if unmatched:
             retry = self._beam_search(
-                memories[unmatched],
-                mem_masks[unmatched],
-                precursors[unmatched],
-                windows[unmatched],
-                False,
+                memories[unmatched], mem_masks[unmatched], precursors[unmatched]
             )
             for i, preds in zip(unmatched, retry):
                 pred_peptides[i] = preds
@@ -385,7 +383,6 @@ class Spec2Pep(pl.LightningModule):
         mem_masks: torch.Tensor,
         precursors: torch.Tensor,
         windows: Optional[torch.Tensor] = None,
-        constrain: bool = False,
     ) -> List[List[Tuple[float, np.ndarray, str]]]:
         """
         Beam search over encoded spectra.
@@ -400,14 +397,10 @@ class Spec2Pep(pl.LightningModule):
             The measured precursor mass (axis 0), precursor charge
             (axis 1), and precursor m/z (axis 2) of each MS/MS spectrum.
         windows : Optional[torch.Tensor] of shape (n_spectra, n_windows, 2)
-            The ``_mass_windows`` of each spectrum, or ``None`` to apply
-            no mass constraint.
-        constrain : bool
-            Hold the search to ``windows``: a token is only decoded if
-            the peptide it extends can still end up in a window, and a
-            peptide can only end inside one. Otherwise the search runs
-            free and ``windows`` only penalize the peptides that end up
-            outside.
+            The ``_mass_windows`` to hold the search to: a token is only
+            decoded if the peptide it extends can still end up in a
+            window, and a peptide can only end inside one. ``None``
+            applies no mass constraint.
 
         Returns
         -------
@@ -449,7 +442,7 @@ class Spec2Pep(pl.LightningModule):
             precursors=precursors,
         ).to(scores.dtype)
         first_scores = pred[:, 0, :]
-        if constrain:
+        if windows is not None:
             # Float64 keeps a ppm window exact; MPS does not have it.
             search_windows = windows.to(
                 device,
@@ -458,7 +451,7 @@ class Spec2Pep(pl.LightningModule):
             feasible = self._feasible_tokens(tokens[:, :0, 0], search_windows)
             first_scores = first_scores.masked_fill(~feasible, -torch.inf)
         top_indices = torch.topk(first_scores, beam, dim=1)[1]
-        if constrain:
+        if windows is not None:
             # With fewer feasible tokens than beams, pad out the rest.
             top_indices = top_indices * torch.gather(feasible, 1, top_indices)
             search_windows = einops.repeat(
@@ -497,7 +490,6 @@ class Spec2Pep(pl.LightningModule):
                         step,
                         beams_to_cache,
                         pred_cache,
-                        None if constrain else windows,
                     )
 
                 # Stop decoding when all current beams have been finished.
@@ -530,7 +522,7 @@ class Spec2Pep(pl.LightningModule):
                     self._feasible_tokens(
                         tokens[:, : step + 1], search_windows
                     )
-                    if constrain
+                    if windows is not None
                     else None
                 )
                 tokens, scores = self._get_topk_beams(
@@ -545,9 +537,7 @@ class Spec2Pep(pl.LightningModule):
 
         # Return the peptide with the highest confidence score, within
         # the precursor m/z tolerance if possible.
-        return list(
-            self._get_top_peptide(pred_cache, None if constrain else windows)
-        )
+        return list(self._get_top_peptide(pred_cache))
 
     def _mass_windows(
         self, precursors: torch.Tensor
@@ -555,17 +545,21 @@ class Spec2Pep(pl.LightningModule):
         """
         The mass windows a predicted peptide may fall in.
 
-        The recorded precursor m/z belongs to the peptide the instrument
-        selected, so that peptide is held to it, within
-        ``precursor_mass_tol`` and over ``isotope_error_range``. A
-        co-isolated peptide can sit anywhere in the isolation window and
-        carry any charge, so it gets one window per charge spanning the
-        isolation window instead. Only a chimeric model gets those.
+        A chimeric model's peptides were co-isolated: each can sit
+        anywhere in the isolation window and carry any charge, so it
+        gets one window per charge spanning the isolation window. The
+        recorded precursor m/z is not held to either of them. The
+        instrument's selected ion is often neither label of a chimeric
+        spectrum (MSFragger DDA+ identifies the features in the window,
+        not the selected ion), so a rule that one peptide match the
+        precursor would forbid the right answer for those spectra.
 
-        With ``charge_range`` set the recorded charge is a guess, since
-        nothing says which peptide it belongs to or that it is right:
-        the precursor gets a window per charge in the range too, at the
-        mass the recorded m/z implies for that charge.
+        A model that predicts one peptide has nothing co-isolated to
+        place, so its peptide is held to the recorded precursor, within
+        ``precursor_mass_tol`` and over ``isotope_error_range``. With
+        ``charge_range`` set the recorded charge is a guess: the
+        precursor gets a window per charge in the range, at the mass the
+        recorded m/z implies for that charge.
 
         Parameters
         ----------
@@ -577,8 +571,7 @@ class Spec2Pep(pl.LightningModule):
         -------
         Optional[torch.Tensor] of shape (n_spectra, n_windows, 2)
             The lower and upper bound of each window, as a sum of
-            residue masses. The first ``_n_precursor_windows`` belong to
-            the recorded precursor. ``None`` if no isolation window is
+            residue masses. ``None`` if no isolation window is
             configured, in which case no mass constraint applies.
         """
         if self.isolation_window_width is None:
@@ -594,6 +587,18 @@ class Spec2Pep(pl.LightningModule):
             dtype=torch.float64,
         )
 
+        if self.is_chimeric:
+            center = mz + self.isolation_window_offset
+            half = self.isolation_window_width / 2
+            windows = torch.stack(
+                [
+                    (center - half - PROTON) * charges,
+                    (center + half - PROTON) * charges,
+                ],
+                dim=2,
+            )
+            return windows - depthcharge.constants.H2O
+
         isotopes = torch.arange(
             self.isotope_error_range[0],
             self.isotope_error_range[1] + 1,
@@ -608,36 +613,7 @@ class Spec2Pep(pl.LightningModule):
         windows = torch.stack(
             [centers * (1 - tol), centers * (1 + tol)], dim=2
         )
-
-        if self.is_chimeric:
-            center = mz + self.isolation_window_offset
-            half = self.isolation_window_width / 2
-            isolation = torch.stack(
-                [
-                    (center - half - PROTON) * charges,
-                    (center + half - PROTON) * charges,
-                ],
-                dim=2,
-            )
-            windows = torch.cat([windows, isolation], dim=1)
-
         return windows - depthcharge.constants.H2O
-
-    @property
-    def _n_precursor_windows(self) -> int:
-        """
-        The number of leading ``_mass_windows`` built from the recorded
-        precursor.
-        """
-        n_charges = (
-            1
-            if self.charge_range is None
-            else self.charge_range[1] - self.charge_range[0] + 1
-        )
-        n_isotopes = (
-            self.isotope_error_range[1] - self.isotope_error_range[0] + 1
-        )
-        return n_charges * n_isotopes
 
     def _peptide_spans(
         self, pred_tokens: torch.Tensor
@@ -668,43 +644,6 @@ class Spec2Pep(pl.LightningModule):
                 start = pos + 1
         spans.append((start, len(pred_tokens)))
         return spans
-
-    def _peptides_fit(
-        self, pred_tokens: torch.Tensor, windows: torch.Tensor
-    ) -> List[bool]:
-        """
-        Whether each peptide of a prediction fits its mass window.
-
-        One peptide of a prediction has to be the one the instrument
-        selected and match the recorded precursor. Nothing says which,
-        since the two peptides of a chimera come in either order, so any
-        of them may. The others only have to fall in the isolation
-        window. If none matches the recorded precursor the prediction
-        does not explain the spectrum and none of its peptides fit.
-
-        Parameters
-        ----------
-        pred_tokens : torch.Tensor of shape (length,)
-            The predicted tokens for a single beam, without stop token.
-        windows : torch.Tensor of shape (n_windows, 2)
-            The spectrum's ``_mass_windows``.
-
-        Returns
-        -------
-        List[bool]
-            One flag per span in ``_peptide_spans``. An empty span holds
-            no peptide and fits trivially.
-        """
-        pred_tokens = pred_tokens.cpu()
-        token_masses = self.tokenizer.masses.double().cpu()
-        in_window, in_precursor = [], []
-        for start, end in self._peptide_spans(pred_tokens):
-            mass = token_masses[pred_tokens[start:end]].sum()
-            fits = (windows[:, 0] <= mass) & (mass <= windows[:, 1])
-            in_window.append(start == end or bool(fits.any()))
-            in_precursor.append(bool(fits[: self._n_precursor_windows].any()))
-        selected = any(in_precursor)
-        return [selected and fits for fits in in_window]
 
     def _reachable_masses(self) -> torch.Tensor:
         """
@@ -772,17 +711,15 @@ class Spec2Pep(pl.LightningModule):
         has to be a mass residues can add up to. A peptide can only end,
         with the separator or the stop token, at a mass inside one.
 
-        One peptide of a prediction is the one the instrument selected
-        and has to match the recorded precursor; a co-isolated one only
-        has to fall in the isolation window. The two come in either
-        order, so the first peptide may end in any window, and the
-        isolation window stays open to the second only if the first
-        matched the precursor. A prediction of one peptide has to match
-        the precursor, and no prediction gets a third.
+        A chimeric model's peptides each have to end in the isolation
+        window, at any charge, and no prediction gets a third. A model
+        that predicts one peptide has to end it on the recorded
+        precursor.
 
         When the stop token is also the separator, a force-chimera
-        decode ends its first peptide with it under the separator's
-        rule, and any other decode ends its only peptide with it.
+        decode ends its first peptide with it and any other decode ends
+        its only peptide with it; either way the peptide has to be in a
+        window.
 
         Parameters
         ----------
@@ -799,34 +736,20 @@ class Spec2Pep(pl.LightningModule):
         token_masses = self.tokenizer.masses.to(windows)
         reachable = self._reachable_masses().to(windows)
         lower, upper = windows[:, :, 0], windows[:, :, 1]
-        n_precursor = self._n_precursor_windows
         prefix_masses = token_masses[prefix]
 
-        # The mass of the peptide being decoded, and the windows it may
-        # still end in.
-        admissible = torch.ones_like(lower, dtype=torch.bool)
-        has_closed = torch.zeros(
-            prefix.shape[0], dtype=torch.bool, device=prefix.device
-        )
+        # The mass of the peptide being decoded.
         if self.is_chimeric:
             is_separator = prefix == self.chimeric_separator_idx
             is_open = is_separator.flip(1).cumsum(1).flip(1) == 0
             open_mass = (prefix_masses * is_open).sum(dim=1)
-            closed_mass = (prefix_masses * ~is_open).sum(dim=1, keepdim=True)
             has_closed = is_separator.any(dim=1)
-            closed_is_selected = (
-                (lower[:, :n_precursor] <= closed_mass)
-                & (closed_mass <= upper[:, :n_precursor])
-            ).any(dim=1)
-            admissible[:, n_precursor:] = (
-                ~has_closed | closed_is_selected
-            ).unsqueeze(1)
         else:
             open_mass = prefix_masses.sum(dim=1)
 
         # A residue is feasible if a reachable mass lies between what is
-        # left to the lower and to the upper bound of an admissible
-        # window. Past the end of the table, assume one does.
+        # left to the lower and to the upper bound of a window. Past the
+        # end of the table, assume one does.
         mass = open_mass[:, None, None] + token_masses[None, :, None]
         gap_lower = lower[:, None, :] - mass - REACHABLE_RESOLUTION
         gap_upper = upper[:, None, :] - mass + REACHABLE_RESOLUTION
@@ -837,30 +760,16 @@ class Spec2Pep(pl.LightningModule):
         ]
         completes = (gap_lower <= nearest) & (nearest <= gap_upper)
         completes |= gap_upper > REACHABLE_MAX_MASS
-        feasible = (completes & admissible[:, None, :]).any(dim=2)
+        feasible = completes.any(dim=2)
 
-        # A peptide can only end at a mass inside an admissible window.
-        in_window = (lower <= open_mass[:, None]) & (
-            open_mass[:, None] <= upper
-        )
-        ends_selected = in_window[:, :n_precursor].any(dim=1)
-        ends_admissible = (in_window & admissible).any(dim=1)
+        # A peptide can only end at a mass inside a window.
+        ends = (
+            (lower <= open_mass[:, None]) & (open_mass[:, None] <= upper)
+        ).any(dim=1)
         feasible[:, 0] = False
-        if not self.is_chimeric:
-            feasible[:, self.stop_token] = ends_selected
-        elif self.chimeric_separator_idx != self.stop_token:
-            feasible[:, self.stop_token] = torch.where(
-                has_closed, ends_admissible, ends_selected
-            )
-            feasible[:, self.chimeric_separator_idx] = (
-                ~has_closed & ends_admissible
-            )
-        elif getattr(self, "force_chimera", False):
-            # Before the first stop every window is admissible, so this
-            # is the separator's rule there and the stop's after it.
-            feasible[:, self.stop_token] = ends_admissible
-        else:
-            feasible[:, self.stop_token] = ends_selected
+        feasible[:, self.stop_token] = ends
+        if self.is_chimeric and self.chimeric_separator_idx != self.stop_token:
+            feasible[:, self.chimeric_separator_idx] = ~has_closed & ends
         return feasible
 
     def _finish_beams(
@@ -968,7 +877,6 @@ class Spec2Pep(pl.LightningModule):
         pred_cache: Dict[
             int, List[Tuple[float, float, np.ndarray, torch.Tensor]]
         ],
-        windows: Optional[torch.Tensor] = None,
     ):
         """
         Cache terminated beams.
@@ -994,11 +902,6 @@ class Spec2Pep(pl.LightningModule):
             with the peptide score, a random tie-breaking
             float, the amino acid-level scores, and the predicted tokens
             is stored.
-        windows : Optional[torch.Tensor] of shape (n_spectra, n_windows, 2)
-            The ``_mass_windows`` of each spectrum, or ``None`` to apply
-            no mass constraint. A prediction with a peptide outside its
-            window has 1 subtracted from its peptide score, so that it
-            ranks below every prediction that fits.
         """
         # Find non-zero indices for more efficient iteration
         cache_indices = (
@@ -1037,10 +940,6 @@ class Spec2Pep(pl.LightningModule):
             aa_scores = aa_scores[:-1]
 
             pred_peptide_cpu = pred_peptide.cpu()
-            if windows is not None and not all(
-                self._peptides_fit(pred_peptide_cpu, windows[spec_idx])
-            ):
-                peptide_score -= 1
             peptide_entry = (
                 peptide_score,
                 np.random.random_sample(),
@@ -1197,7 +1096,6 @@ class Spec2Pep(pl.LightningModule):
         pred_cache: Dict[
             int, List[Tuple[float, float, np.ndarray, torch.Tensor]]
         ],
-        windows: Optional[torch.Tensor] = None,
     ) -> Iterable[List[Tuple[float, np.ndarray, str]]]:
         """
         Return the peptide with the highest confidence score for each
@@ -1212,9 +1110,6 @@ class Spec2Pep(pl.LightningModule):
             ordered by peptide score. For each finished beam, a tuple
             with the peptide score, a random tie-breaking float, the
             amino acid-level scores, and the predicted tokens is stored.
-        windows : Optional[torch.Tensor] of shape (n_spectra, n_windows, 2)
-            The ``_mass_windows`` of each spectrum, or ``None`` if no
-            mass constraint applied.
 
         Returns
         -------
@@ -1224,7 +1119,7 @@ class Spec2Pep(pl.LightningModule):
             score, the amino acid scores, and the predicted peptide
             sequence.
         """
-        for spec_idx, peptides in pred_cache.items():
+        for peptides in pred_cache.values():
             if len(peptides) > 0:
                 spectrum_preds = []
                 for pep_score, _, aa_scores, pred_tokens in heapq.nlargest(
@@ -1232,10 +1127,7 @@ class Spec2Pep(pl.LightningModule):
                 ):
                     spectrum_preds.extend(
                         self._split_prediction(
-                            pred_tokens,
-                            aa_scores,
-                            pep_score,
-                            None if windows is None else windows[spec_idx],
+                            pred_tokens, aa_scores, pep_score
                         )
                     )
                 yield spectrum_preds
@@ -1247,7 +1139,6 @@ class Spec2Pep(pl.LightningModule):
         pred_tokens: torch.Tensor,
         aa_scores: np.ndarray,
         pep_score: float,
-        windows: Optional[torch.Tensor] = None,
     ) -> List[Tuple[float, np.ndarray, str]]:
         """
         Split a (possibly chimeric) prediction into its peptide(s).
@@ -1272,11 +1163,6 @@ class Spec2Pep(pl.LightningModule):
             The amino acid scores for ``pred_tokens``, in tokenizer order.
         pep_score : float
             The peptide score of the (whole) prediction.
-        windows : Optional[torch.Tensor] of shape (n_windows, 2)
-            The spectrum's ``_mass_windows``, or ``None`` if no mass
-            constraint applied. A peptide of a chimera that falls outside
-            its window has 1 subtracted from its re-computed score, as
-            ``_cache_finished_beams`` did to the whole prediction's.
 
         Returns
         -------
@@ -1295,14 +1181,9 @@ class Spec2Pep(pl.LightningModule):
 
         spans = self._peptide_spans(pred_tokens)
         is_chimera = len(spans) > 1
-        fits = (
-            [True] * len(spans)
-            if windows is None
-            else self._peptides_fit(pred_tokens, windows)
-        )
 
         predictions = []
-        for (start, end), fit in zip(spans, fits):
+        for start, end in spans:
             sub_tokens = pred_tokens[start:end]
             # Drop invalid peptides: too short, or an N-terminal modification
             # placed off the peptide's N-terminus (which would detokenize to an
@@ -1314,11 +1195,7 @@ class Spec2Pep(pl.LightningModule):
             sub_scores = aa_scores[start:end]
             # Preserve the original peptide score for a non-chimeric (single
             # peptide) prediction; recompute per-peptide for a true chimera.
-            score = (
-                _peptide_score(sub_scores) - (not fit)
-                if is_chimera
-                else pep_score
-            )
+            score = _peptide_score(sub_scores) if is_chimera else pep_score
             predictions.append(_finalize(sub_tokens, sub_scores, score))
 
         # A chimera contains at most two peptides; keep the two highest-scoring

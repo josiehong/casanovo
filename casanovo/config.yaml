@@ -35,31 +35,32 @@ n_beams: 1
 # The width of the precursor isolation window, in m/z. Setting this makes
 # beam search mass-constrained: a token is only decoded if the peptide it
 # extends can still reach an allowed mass, and a peptide can only end at one.
-# The recorded precursor m/z belongs to the peptide the instrument selected,
-# so one peptide of a prediction has to match it, within `precursor_mass_tol`
-# and `isotope_error_range` below. A co-isolated peptide of a chimeric
-# spectrum can be far from it, and only has to fall inside the isolation
-# window at some charge in `charge_range`. A spectrum that nothing can be
-# decoded for under the constraint is decoded without it, and its peptides
-# that miss their mass get a negative score. Leave empty to apply no mass
-# constraint.
+# For a chimeric model every peptide of a prediction has to fall inside the
+# isolation window at some charge in `charge_range`; the recorded precursor
+# m/z is not held to either, since the selected ion is often neither of the
+# co-isolated peptides. A non-chimeric model's peptide has to match the
+# recorded precursor, within `precursor_mass_tol` and `isotope_error_range`
+# below. A spectrum that nothing can be decoded for under the constraint is
+# decoded without it, and scored like any other. Leave empty to apply no
+# mass constraint.
 isolation_window_width:
 # How far the isolation window's center sits from the recorded precursor m/z,
 # in m/z, for methods that offset it. Only read when a width is set.
 isolation_window_offset: 0.0
 # The charges a peptide may carry, as [min, max]. Only read when a width is
-# set. The recorded charge is then a guess, since nothing says which peptide
-# of a chimeric spectrum it belongs to: the precursor mass is recomputed from
-# the recorded m/z at each charge in the range, and a co-isolated peptide is
-# placed in the isolation window at each of them. Leave empty to hold the
-# peptide that matches the precursor to the recorded charge.
+# set. The recorded charge is a guess, since nothing says which peptide of a
+# chimeric spectrum it belongs to: a chimeric model's peptide is placed in the
+# isolation window at each charge in the range, and a non-chimeric model's
+# precursor mass is recomputed from the recorded m/z at each. Leave empty for
+# any charge up to `max_charge` (chimeric) or the recorded one (non-chimeric).
 charge_range: [1, 4]
 
 
 ###
 # The following parameters are unique to Casanovo's database search mode,
-# except for `precursor_mass_tol` and `isotope_error_range`, which de novo
-# sequencing also reads when `isolation_window_width` is set.
+# except for `precursor_mass_tol` and `isotope_error_range`, which a
+# non-chimeric model's de novo sequencing also reads when
+# `isolation_window_width` is set.
 ###
 
 # Max absolute difference allowed with respect to observed precursor m/z.

@@ -3425,8 +3425,8 @@ def _decode(model, precursors):
 
 
 def test_mass_windows(tiny_config):
-    """One window per isotope around the precursor, one per charge around
-    the isolation window."""
+    """A chimeric model gets one window per charge spanning the isolation
+    window; a non-chimeric model one per isotope around the precursor."""
     model = _chimera_model(
         tiny_config,
         max_charge=3,
@@ -3443,36 +3443,63 @@ def test_mass_windows(tiny_config):
         .item()
     )
 
+    # The isolation window at each charge up to max_charge, off-center by
+    # the offset. Nothing holds a peptide to the recorded precursor.
     windows = model._mass_windows(precursors)
-    assert windows.shape == (1, 2 + 3, 2)
-    assert model._n_precursor_windows == 2
-    # The recorded precursor, monoisotopic and one isotope down.
-    for isotope, (lower, upper) in enumerate(windows[0, :2].tolist()):
-        center = residue_mass - isotope * db_utils.ISOTOPE_SPACING
-        assert lower < center < upper
-        assert upper - lower == pytest.approx(
-            2 * 20e-6 * (center + 18.0106), rel=1e-3
-        )
-    # The isolation window at each charge, off-center by the offset.
-    for charge, (lower, upper) in enumerate(windows[0, 2:].tolist(), 1):
+    assert windows.shape == (1, 3, 2)
+    for charge, (lower, upper) in enumerate(windows[0].tolist(), 1):
         assert upper - lower == pytest.approx(2.0 * charge)
         assert (lower + upper) / 2 == pytest.approx(
             (mz + 0.25 - 1.007276) * charge - 18.0106, abs=1e-3
         )
 
-    # With a charge range the recorded charge is one guess among several:
-    # the precursor gets its isotope windows at every charge.
+    # With a charge range, the charges in it.
     ranged = _chimera_model(
         tiny_config,
+        max_charge=3,
+        isolation_window_width=2.0,
+        charge_range=(2, 4),
+    )
+    windows = ranged._mass_windows(precursors)
+    assert windows.shape == (1, 3, 2)
+    for charge, (lower, upper) in zip((2, 3, 4), windows[0].tolist()):
+        assert upper - lower == pytest.approx(2.0 * charge)
+
+    # No isolation window, no constraint.
+    assert _chimera_model(tiny_config)._mass_windows(precursors) is None
+
+    # A model that predicts one peptide holds it to the recorded
+    # precursor: monoisotopic and one isotope down, at the recorded charge.
+    tokenizer = depthcharge.tokenizers.peptides.PeptideTokenizer(
+        residues=Config(tiny_config).residues
+    )
+    single = Spec2Pep(
+        tokenizer=tokenizer,
+        precursor_mass_tol=20,
+        isotope_error_range=(0, 1),
+        isolation_window_width=2.0,
+    )
+    windows = single._mass_windows(precursors)
+    assert windows.shape == (1, 2, 2)
+    for isotope, (lower, upper) in enumerate(windows[0].tolist()):
+        center = residue_mass - isotope * db_utils.ISOTOPE_SPACING
+        assert lower < center < upper
+        assert upper - lower == pytest.approx(
+            2 * 20e-6 * (center + 18.0106), rel=1e-3
+        )
+
+    # With a charge range the recorded charge is one guess among several:
+    # the precursor gets its isotope windows at every charge.
+    ranged = Spec2Pep(
+        tokenizer=tokenizer,
         precursor_mass_tol=20,
         isotope_error_range=(0, 1),
         isolation_window_width=2.0,
         charge_range=(1, 3),
     )
     windows = ranged._mass_windows(precursors)
-    assert windows.shape == (1, 3 * 2 + 3, 2)
-    assert ranged._n_precursor_windows == 6
-    selected = iter(windows[0, :6].tolist())
+    assert windows.shape == (1, 3 * 2, 2)
+    selected = iter(windows[0].tolist())
     for charge in (1, 2, 3):
         for isotope in (0, 1):
             lower, upper = next(selected)
@@ -3483,18 +3510,6 @@ def test_mass_windows(tiny_config):
             )
             assert lower < center < upper
 
-    # No isolation window, no constraint.
-    assert _chimera_model(tiny_config)._mass_windows(precursors) is None
-
-    # A model that predicts one peptide has no co-isolated one to place.
-    single = Spec2Pep(
-        tokenizer=depthcharge.tokenizers.peptides.PeptideTokenizer(
-            residues=Config(tiny_config).residues
-        ),
-        isolation_window_width=2.0,
-    )
-    assert single._mass_windows(precursors).shape == (1, 2, 2)
-
 
 def test_feasible_tokens(tiny_config):
     """A token is feasible if its peptide can still end in a window."""
@@ -3504,9 +3519,8 @@ def test_feasible_tokens(tiny_config):
     model.tokenizer.reverse = False
     index = model.tokenizer.index
     stop = model.stop_token
-    # LESLIEK is the selected peptide. LKSLIEK is ~1 Da lighter: inside the
-    # isolation window, far outside the precursor tolerance. LKSLIAK is
-    # outside both.
+    # LESLIEK was recorded. LKSLIEK is ~1 Da lighter, inside the isolation
+    # window; LKSLIAK is outside it.
     windows = model._mass_windows(_precursors(model, "LESLIEK"))
 
     def feasible(prefix):
@@ -3518,36 +3532,37 @@ def test_feasible_tokens(tiny_config):
     assert not feasible("LESL")[0]
     # A peptide cannot end before it weighs enough.
     assert not feasible("LESL")[stop]
-    # The only peptide of a prediction has to match the precursor.
-    assert feasible("LESLIEK")[stop]
-    assert not feasible("LKSLIEK")[stop]
-
-    # When a second peptide is forced, the isolation window is enough to
-    # end the first.
-    model.force_chimera = True
+    # A peptide ends anywhere in the isolation window, on the recorded
+    # precursor or not.
     assert feasible("LESLIEK")[stop] and feasible("LKSLIEK")[stop]
     assert not feasible("LKSLIAK")[stop]
+    # A residue is feasible only if a window stays reachable. Held to one
+    # charge, too heavy a residue after LESLIE overshoots it, K lands in it.
+    narrow = _chimera_model(
+        tiny_config, isolation_window_width=2.0, charge_range=(2, 2)
+    )
+    narrow.tokenizer.reverse = False
+    tokens = narrow.tokenizer.tokenize(["LESLIE"])
+    held = narrow._feasible_tokens(
+        tokens, narrow._mass_windows(_precursors(narrow, "LESLIEK"))
+    )[0]
+    assert held[index["K"]] and not held[index["W"]]
 
-    # After the selected peptide, the second only needs the isolation
-    # window.
+    # The second peptide of a forced chimera is judged the same way,
+    # whatever the first was.
+    model.force_chimera = True
     assert feasible("LESLIEK+LKSLIEK")[stop]
     assert not feasible("LESLIEK+LKSLIAK")[stop]
-
-    # After a co-isolated peptide, the second has to be the selected one,
-    # which the search knows a residue ahead: K completes it, nothing else
-    # does.
-    assert feasible("LKSLIEK+LESLIE").nonzero().flatten().tolist() == [
-        index["K"]
-    ]
-    assert feasible("LKSLIEK+LESLIEK").nonzero().flatten().tolist() == [stop]
-    assert not feasible("LKSLIEK+LKSLIEK")[stop]
+    assert feasible("LKSLIEK+LESLIEK")[stop]
+    assert feasible("LKSLIEK+LKSLIEK")[stop]
+    assert not feasible("LKSLIEK+LESLIE")[stop]
 
     # Each beam is judged against its own spectrum's windows.
     model.force_chimera = False
     both = torch.cat(
-        [windows, model._mass_windows(_precursors(model, "LKSLIEK"))]
+        [windows, model._mass_windows(_precursors(model, "LKSLIAK"))]
     )
-    tokens = model.tokenizer.tokenize(["LKSLIEK", "LKSLIEK"])
+    tokens = model.tokenizer.tokenize(["LKSLIAK", "LKSLIAK"])
     assert model._feasible_tokens(tokens, both)[:, stop].tolist() == [
         False,
         True,
@@ -3555,7 +3570,8 @@ def test_feasible_tokens(tiny_config):
 
 
 def test_feasible_tokens_charge_range(tiny_config):
-    """A wrong recorded charge only matters without a charge range."""
+    """A wrong recorded charge does not matter; a charge range that leaves
+    the true charge out does."""
     # LESLIEK was isolated at 2+ and recorded as 3+.
     precursors = _precursors(_chimera_model(tiny_config), "LESLIEK")
     precursors[0, 1] = 3
@@ -3571,7 +3587,7 @@ def test_feasible_tokens_charge_range(tiny_config):
             model._feasible_tokens(tokens, windows)[0, model.stop_token]
         )
 
-    assert not can_end()
+    assert can_end()
     assert can_end(charge_range=(1, 4))
     assert not can_end(charge_range=(3, 4))
 
@@ -3581,7 +3597,8 @@ def test_beam_search_mass_constrained(tiny_config, reverse):
     """The search leaves a path it prefers for one that fits the mass."""
     precursors_from = functools.partial(_precursors, peptide="LESLIEK")
 
-    # One peptide: the decoder wants LESLIAK, the precursor says LESLIEK.
+    # One peptide: the decoder wants LESLIAK, which is outside the
+    # isolation window around LESLIEK.
     free = _scripted_model(tiny_config, "LESLIAK", "LESLIEK", reverse)
     ((prediction,),) = _decode(free, precursors_from(free))
     assert prediction[2] == "LESLIAK"
@@ -3593,8 +3610,8 @@ def test_beam_search_mass_constrained(tiny_config, reverse):
     assert prediction[2] == "LESLIEK"
     assert prediction[0] > 0
 
-    # Two peptides: the co-isolated one is ~1 Da off the precursor, which
-    # the isolation window allows, and the path outside it is dropped.
+    # Two peptides: the second is ~1 Da off the precursor, which the
+    # isolation window allows, and the path outside it is dropped.
     model = _scripted_model(
         tiny_config,
         "LESLIEK+LKSLIAK",
@@ -3619,7 +3636,7 @@ def test_beam_search_mass_constrained(tiny_config, reverse):
 
 
 def test_beam_search_mass_constrained_fallback(tiny_config):
-    """A spectrum nothing fits is decoded freely and penalized."""
+    """A spectrum nothing fits is decoded freely, with plain scores."""
     model = _scripted_model(
         tiny_config,
         "LESLIEK+LKSLIAK",
@@ -3635,7 +3652,7 @@ def test_beam_search_mass_constrained_fallback(tiny_config):
     assert {seq for _, _, seq in constrained} == {"LESLIEK", "LKSLIEK"}
     assert all(score > 0 for score, _, _ in constrained)
     assert {seq for _, _, seq in fallback} == {"LESLIEK", "LKSLIAK"}
-    assert all(-1 <= score < 0 for score, _, _ in fallback)
+    assert all(score > 0 for score, _, _ in fallback)
 
 
 def test_beam_search_unconstrained_by_default(tiny_config):
@@ -3644,40 +3661,7 @@ def test_beam_search_unconstrained_by_default(tiny_config):
     model._feasible_tokens = unittest.mock.MagicMock(
         side_effect=AssertionError
     )
-    model._peptides_fit = unittest.mock.MagicMock(side_effect=AssertionError)
     # Nowhere near either peptide.
     (predictions,) = _decode(model, torch.tensor([[9.0, 1.0, 10.0]]))
     assert {seq for _, _, seq in predictions} == {"LESLIAK", "LKSLIAK"}
     assert all(score > 0 for score, _, _ in predictions)
-
-
-def test_split_prediction_mass_penalty(tiny_config):
-    """Only the peptides outside their window are penalized."""
-    model = _chimera_model(
-        tiny_config, precursor_mass_tol=20, isolation_window_width=2.0
-    )
-    model.tokenizer.reverse = False
-    windows = model._mass_windows(_precursors(model, "LESLIEK"))[0]
-
-    def scores(prediction):
-        tokens = model.tokenizer.tokenize([prediction])[0]
-        fits = model._peptides_fit(tokens, windows)
-        pep_score = 0.5 - (not all(fits))
-        return {
-            seq: score
-            for score, _, seq in model._split_prediction(
-                tokens, np.full(len(tokens), 0.9), pep_score, windows
-            )
-        }
-
-    # Both fit: the selected peptide and one in the isolation window.
-    assert all(s > 0 for s in scores("LKSLIEK+LESLIEK").values())
-    # The selected one fits, the other is outside the isolation window.
-    split = scores("LESLIEK+LKSLIAK")
-    assert split["LESLIEK"] > 0 and split["LKSLIAK"] < 0
-    assert split["LKSLIAK"] == pytest.approx(0.9**7 - 1)
-    # Neither matches the precursor, so neither is the selected peptide.
-    assert all(s < 0 for s in scores("LKSLIEK+LKSLIAK").values())
-    # A lone peptide has to match the precursor.
-    assert scores("LESLIEK") == {"LESLIEK": 0.5}
-    assert scores("LKSLIEK") == {"LKSLIEK": -0.5}

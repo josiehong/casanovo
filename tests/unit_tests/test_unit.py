@@ -3365,3 +3365,41 @@ def test_split_chimeric_prediction_top2_and_filtering(tiny_config):
     assert len(preds) == 2
     sequences = {seq for _, _, seq in preds}
     assert sequences == {"AAR", "SAK"}  # PEPTANEK (longest) scores lowest
+
+
+def test_split_chimeric_prediction_drops_repeats(tiny_config):
+    """A peptide written twice is returned once, with its higher score."""
+    model = _chimera_model(tiny_config, min_peptide_len=3)
+    model.tokenizer.reverse = False
+    sep = model.chimeric_separator_idx
+    index = model.tokenizer.index
+
+    def make_tokens(peptides):
+        toks = []
+        for i, pep in enumerate(peptides):
+            if i > 0:
+                toks.append(sep)
+            toks += [index[aa] for aa in pep]
+        return torch.tensor(toks)
+
+    # The same peptide in both slots: only the higher-scoring copy is kept.
+    tokens = make_tokens([list("PEPK"), list("PEPK")])
+    aa_scores = np.array([0.5] * 4 + [1.0] + [0.9] * 4)
+    preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    assert [seq for _, _, seq in preds] == ["PEPK"]
+    assert preds[0][0] == pytest.approx(0.9**4)
+    np.testing.assert_allclose(preds[0][1], [0.9] * 4)
+
+    # A repeat does not take the place of a different peptide.
+    tokens = make_tokens([list("PEPK"), list("PEPK"), list("PEPTANEK")])
+    aa_scores = np.full(len(tokens), 0.9)
+    preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    assert [seq for _, _, seq in preds] == ["PEPK", "PEPTANEK"]
+
+    # The same residues with another modification are a different peptide.
+    tokens = make_tokens(
+        [["P", "E", "M", "K"], ["P", "E", "M[Oxidation]", "K"]]
+    )
+    aa_scores = np.full(len(tokens), 0.9)
+    preds = model._split_prediction(tokens, aa_scores, pep_score=0.7)
+    assert {seq for _, _, seq in preds} == {"PEMK", "PEM[Oxidation]K"}

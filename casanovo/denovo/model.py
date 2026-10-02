@@ -776,8 +776,11 @@ class Spec2Pep(pl.LightningModule):
         (too short, or with a misplaced N-terminal modification) are dropped,
         and the two highest-scoring peptides are returned, each with its own
         detokenized sequence, amino acid scores, and (re-computed) peptide
-        score. For a non-chimeric prediction (or a non-chimeric tokenizer) a
-        single prediction is returned, preserving the original peptide score.
+        score. A peptide that repeats a higher-scoring one exactly (the same
+        residues and modifications) is dropped as well, so a spectrum is
+        never assigned the same peptide twice. For a non-chimeric prediction
+        (or a non-chimeric tokenizer) a single prediction is returned,
+        preserving the original peptide score.
 
         The split is performed on the raw (tokenizer-order) tokens, *before*
         applying the reverse-tokenizer score flip, so that each peptide is
@@ -842,9 +845,16 @@ class Spec2Pep(pl.LightningModule):
             predictions.append(_finalize(sub_tokens, sub_scores, score))
 
         # A chimera contains at most two peptides; keep the two highest-scoring
-        # ones (raw product score, no length normalization).
+        # ones (raw product score, no length normalization). A peptide written
+        # twice is one identification, so only its higher-scoring copy is kept.
+        # Peptides that differ in their modifications are distinct.
         predictions.sort(key=lambda prediction: prediction[0], reverse=True)
-        return predictions[:2]
+        unique, seen = [], set()
+        for prediction in predictions:
+            if prediction[2] not in seen:
+                seen.add(prediction[2])
+                unique.append(prediction)
+        return unique[:2]
 
     def _peptide_nterm_valid(self, sub_tokens: torch.Tensor) -> bool:
         """

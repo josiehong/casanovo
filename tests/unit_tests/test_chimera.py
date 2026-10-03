@@ -704,7 +704,7 @@ def test_a_batch_of_one_kind_logs_only_that_kind(monkeypatch):
     model._log_chimeric_split("valid", per_spectrum, batch)
 
     assert logged == ["valid_CTCLoss_single"]
-def test_the_partner_window_spans_the_isolation_window():
+def test_the_isolation_window_spans_every_charge():
     """One interval per charge, covering every m/z the window could hold."""
     model = _model(chimera=True, charge_range=(1, 4),
                    isolation_window_width=1.6)
@@ -718,12 +718,12 @@ def test_the_partner_window_spans_the_isolation_window():
         assert hi - lo == pytest.approx(1.6 * z)
 
 
-def test_a_partner_above_the_recorded_precursor_is_accepted():
+def test_a_peptide_above_the_recorded_precursor_is_accepted():
     """The case the old windows could never reach.
 
-    The isotope centers are always ``mass - iso * spacing``, so a partner
+    The isotope centers are always ``mass - iso * spacing``, so a peptide
     isolated ABOVE the recorded m/z is unreachable however many isotopes
-    are allowed. About half of them sit there.
+    are allowed. About half of the co-isolated ones sit there.
     """
     model = _model(chimera=True, charge_range=(1, 4),
                    isolation_window_width=1.6)
@@ -753,50 +753,22 @@ def test_without_a_width_every_window_is_unchanged():
     old = model._residue_mass_windows(
         model._precursor_candidates(mass, mz, z)
     )
-    for partner in (False, True):
-        assert model._slot_windows(mass, mz, z, partner=partner) == old
+    assert model._slot_windows(mass, mz, z) == old
 
 
-def test_the_partner_slot_is_the_one_that_misses_the_precursor(monkeypatch):
-    """The role comes from the greedy peptides, not the slot's position.
-
-    ``A:B`` and ``B:A`` are the same annotation and the loss keeps the
-    better pairing, so the selected peptide lands in either slot. Here it
-    lands in slot B, and the flags have to come out swapped.
-    """
+def test_a_chimeric_model_holds_every_slot_to_the_isolation_window():
+    """Neither peptide is held to the recorded precursor: the selected ion
+    is often a third species, and both labels are co-isolated neighbours.
+    A single-peptide model keeps the precursor windows."""
+    mass, mz, z = 1198.0, 600.0, 2
     model = _model(chimera=True, charge_range=(1, 4),
                    isolation_window_width=1.6)
-    frames = [torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)]
-    precursors = torch.tensor([[1198.0, 2.0, 600.0]])
-
-    monkeypatch.setattr(
-        model, "_ctc_decode",
-        lambda slot: ([[1]] if slot is frames[0] else [[2]], [[0.9]]),
+    assert model._slot_windows(mass, mz, z) == model._isolation_windows(mz)
+    single = _model(chimera=False, charge_range=(1, 4),
+                    isolation_window_width=1.6)
+    assert single._slot_windows(mass, mz, z) == single._residue_mass_windows(
+        single._precursor_candidates(mass, mz, z)
     )
-    # Only the peptide in slot B falls in a recorded-precursor window.
-    monkeypatch.setattr(
-        model, "_matching_window",
-        lambda tokens, mass, mz=None, z=None, partner=False: (
-            None if tokens == [1] else (2, 0.0, 1e9)
-        ),
-    )
-    assert model._partner_slots(frames, precursors) == [[True], [False]]
-
-
-def test_both_slots_matching_falls_back_to_position(monkeypatch):
-    """With nothing to choose between them, slot B stays the partner."""
-    model = _model(chimera=True, charge_range=(1, 4),
-                   isolation_window_width=1.6)
-    frames = [torch.zeros(1, 4, 8), torch.zeros(1, 4, 8)]
-    precursors = torch.tensor([[1198.0, 2.0, 600.0]])
-    monkeypatch.setattr(
-        model, "_ctc_decode", lambda slot: ([[1]], [[0.9]])
-    )
-    monkeypatch.setattr(
-        model, "_matching_window",
-        lambda tokens, mass, mz=None, z=None, partner=False: (2, 0.0, 1e9),
-    )
-    assert model._partner_slots(frames, precursors) == [[False], [True]]
 
 
 def test_database_padding_does_not_change_a_candidate_score():
@@ -863,32 +835,13 @@ def test_peptide_score_is_the_product_of_the_residue_scores():
     assert match.peptide_score != pytest.approx(np.mean(confs))
 
 
-def test_a_peptide_that_misses_every_window_sorts_last():
-    """PMC may give up, and what it leaves behind must rank below the rest.
+def test_a_peptide_that_misses_every_window_keeps_its_score(monkeypatch):
+    """PMC may give up, and what it leaves behind is scored like the rest.
 
-    Upstream's beam search withheld these; CTC decoding replaced it
-    without replacing the rule, so a peptide no precursor window accepted
-    kept its full confidence and outranked peptides that did match.
-    """
-    model = _model()
-    confs = [0.9, 0.8, 0.5]
-    tokens = _tokens(model.tokenizer, "PEK")
-    args = (tokens, confs, 2, ("file", "1"), 400.0)
-
-    matched = model._build_psm(*args, True)
-    missed = model._build_psm(*args, False)
-
-    assert matched.sequence == missed.sequence
-    assert missed.peptide_score < 0 <= matched.peptide_score
-    assert matched.peptide_score == pytest.approx(missed.peptide_score + 1)
-
-
-def test_the_fit_flag_reaches_the_score(monkeypatch):
-    """The whole path, since the flag crosses two functions to get there.
-
-    `_decode_frames` decides it and `predict_step` hands it to
-    `_build_psm`. Testing `_build_psm` alone would not catch it being
-    dropped in between, which is the part this adds.
+    Earlier runs subtracted one from its score. That marked down the
+    labels whose peptides sit off the recorded precursor along with the
+    wrong peptides, so the greedy peptide now keeps its plain score, as
+    the AR decoder's fallback does.
     """
     model = _model(decoder_frames=8, min_peptide_len=0).eval()
     batch = _spectrum_batch(n_spectra=1)
@@ -903,10 +856,10 @@ def test_the_fit_flag_reaches_the_score(monkeypatch):
     for frame, token in enumerate([idx["K"], idx["A"], idx["E"]]):
         logits[:, frame, token] = 5.0
 
-    decoded = model._decode_frames(logits, precursors)
-    assert [d.fit for d in decoded] == [False], (
-        "an unreachable precursor cannot be matched"
-    )
+    (decoded,) = model._decode_frames(logits, precursors)
+    assert model._matching_window(
+        decoded.tokens, 50_000.0, precursors[0, 2].item(), 2
+    ) is None, "an unreachable precursor cannot be matched"
 
     monkeypatch.setattr(model, "_forward_step", lambda b: (logits, None))
     monkeypatch.setattr(
@@ -915,10 +868,7 @@ def test_the_fit_flag_reaches_the_score(monkeypatch):
     psms = model.predict_step(batch)
 
     assert psms, "the greedy peptide should still be reported"
-    assert all(p.peptide_score < 0 for p in psms), (
-        "a peptide no window accepted must sort below every one that "
-        "matched, and only a negative score does that"
-    )
+    assert all(p.peptide_score > 0 for p in psms)
 
 
 def test_the_stop_is_scored_with_the_peptide_not_among_the_residues():
@@ -931,7 +881,7 @@ def test_the_stop_is_scored_with_the_peptide_not_among_the_residues():
     model = _model()
     confs = [0.9, 0.8, 0.5]
     tokens = _tokens(model.tokenizer, "PEK")
-    args = (tokens, confs, 2, ("file", "1"), 400.0, True)
+    args = (tokens, confs, 2, ("file", "1"), 400.0)
 
     without = model._build_psm(*args)
     with_stop = model._build_psm(*args, 0.5)

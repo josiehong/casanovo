@@ -2010,7 +2010,7 @@ def test_pmc_decode_charge_range():
     # Allowing 2-6 recovers it, and reports the charge it matched under
     # rather than the annotated one.
     model.charge_range = (2, 6)
-    tokens, confs, _, charge, _ = model._pmc_decode(
+    tokens, confs, _, charge = model._pmc_decode(
         logits, wrong_mass, precursor_mz, annotated_charge
     )
     assert tokens == [aa_k, aa_a, aa_e]

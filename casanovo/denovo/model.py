@@ -63,7 +63,6 @@ class Decoded(NamedTuple):
     scores: List[float]
     stop: Optional[float] = None
     charge: Optional[int] = None
-    fit: bool = True
 
 
 class Spec2Pep(pl.LightningModule):
@@ -1114,12 +1113,13 @@ class Spec2Pep(pl.LightningModule):
         self, precursor_mz: float, guard: float = 0.0
     ) -> List[Tuple[Optional[int], float, float]]:
         """
-        Acceptable residue mass windows for the co-isolated peptide.
+        Acceptable residue mass windows for a chimeric model's peptide.
 
-        The recorded m/z belongs to whichever peptide the instrument
-        selected; the other was co-isolated elsewhere in the window, so
-        its mass is not among the ``_precursor_candidates`` built from
-        that m/z. It spans the window instead, widened by the charge.
+        Both peptides were co-isolated somewhere in the window, and the
+        recorded m/z is held to neither: the selected ion is often a
+        third species, so a peptide's mass need not be among the
+        ``_precursor_candidates`` built from that m/z. Each peptide
+        spans the window instead, widened by the charge.
 
         One window per charge and no isotope loop: an interval this wide
         subsumes the isotope spacing, and unlike the isotope offsets it
@@ -1153,21 +1153,28 @@ class Spec2Pep(pl.LightningModule):
             for z in range(lo_z, hi_z + 1)
         ]
 
+    def _isolation_held(self, precursor_mz: Optional[float]) -> bool:
+        """Whether a peptide is held to the isolation window rather
+        than the recorded precursor."""
+        return bool(
+            self.chimera
+            and self.isolation_window_width
+            and precursor_mz is not None
+        )
+
     def _slot_windows(
         self,
         precursor_mass: float,
         precursor_mz: Optional[float] = None,
         precursor_charge: Optional[int] = None,
         guard: float = 0.0,
-        partner: bool = False,
     ) -> List[Tuple[Optional[int], float, float]]:
         """
         The mass windows one slot of a spectrum is held to.
 
-        The selected peptide is held to the recorded precursor, as
-        always; the co-isolated one to the isolation window, but only
-        when ``isolation_window_width`` is set. Without it every slot
-        gets the old windows and nothing changes.
+        A chimeric model's slots are held to the isolation window when
+        ``isolation_window_width`` is set. Otherwise, and for a
+        single-peptide model, a slot is held to the recorded precursor.
 
         Parameters
         ----------
@@ -1179,19 +1186,13 @@ class Spec2Pep(pl.LightningModule):
             The annotated precursor charge.
         guard : float
             Extra widening (in Da) applied to both window edges.
-        partner : bool
-            Whether this slot holds the co-isolated peptide.
 
         Returns
         -------
         List[Tuple[Optional[int], float, float]]
             The charge and bounds of each acceptable window.
         """
-        if (
-            partner
-            and self.isolation_window_width
-            and precursor_mz is not None
-        ):
+        if self._isolation_held(precursor_mz):
             return self._isolation_windows(precursor_mz, guard)
         return self._residue_mass_windows(
             self._precursor_candidates(
@@ -1206,7 +1207,6 @@ class Spec2Pep(pl.LightningModule):
         precursor_mass: float,
         precursor_mz: Optional[float] = None,
         precursor_charge: Optional[int] = None,
-        partner: bool = False,
     ) -> Optional[Tuple[Optional[int], float, float]]:
         """
         The mass window a peptide falls in, if it falls in any.
@@ -1241,7 +1241,7 @@ class Spec2Pep(pl.LightningModule):
             .item()
         )
         for window in self._slot_windows(
-            precursor_mass, precursor_mz, precursor_charge, partner=partner
+            precursor_mass, precursor_mz, precursor_charge
         ):
             if window[1] <= mass <= window[2]:
                 return window
@@ -1347,7 +1347,6 @@ class Spec2Pep(pl.LightningModule):
         precursor_mass: float,
         precursor_mz: Optional[float] = None,
         precursor_charge: Optional[int] = None,
-        partner: bool = False,
     ) -> Optional[Decoded]:
         """
         Precise mass control (PMC) decoding for a single spectrum.
@@ -1454,11 +1453,7 @@ class Spec2Pep(pl.LightningModule):
         # grows with the resolution and the number of emissions, and the
         # guard reduces to PMC_MASS_GUARD at the default resolution.
         base = self._slot_windows(
-            precursor_mass,
-            precursor_mz,
-            precursor_charge,
-            PMC_MASS_GUARD,
-            partner,
+            precursor_mass, precursor_mz, precursor_charge, PMC_MASS_GUARD
         )
         hi_base = max(hi for _, _, hi in base)
         if hi_base <= 0:
@@ -1475,14 +1470,14 @@ class Spec2Pep(pl.LightningModule):
         resolution = max(PMC_RESOLUTION, hi_base / (max_bins - 2))
         guard = max(PMC_MASS_GUARD, float(np.sqrt(n_frames)) * resolution)
         axis_windows = self._slot_windows(
-            precursor_mass, precursor_mz, precursor_charge, guard, partner
+            precursor_mass, precursor_mz, precursor_charge, guard
         )
         hi_max = max(hi for _, _, hi in axis_windows)
         # What the readout accepts: the true windows, unguarded. The
         # states carry exact masses, so this is the same predicate
         # `_matching_window` applies to the finished peptide.
         accept_windows = self._slot_windows(
-            precursor_mass, precursor_mz, precursor_charge, 0.0, partner
+            precursor_mass, precursor_mz, precursor_charge
         )
         # Negative-mass tokens (the ammonia-loss N-terminal modification)
         # push the running total below zero, so the axis starts below it.
@@ -1753,17 +1748,7 @@ class Spec2Pep(pl.LightningModule):
                 logits[:, : self.chimera_split],
                 logits[:, self.chimera_split :],
             ]
-            # The mass constraint differs by role, not by position, so
-            # the roles have to be settled before either slot is decoded.
-            partners = (
-                self._partner_slots(frames, precursors)
-                if self.isolation_window_width
-                else [False, True]
-            )
-            slots = [
-                self._decode_frames(slot, precursors, partner)
-                for slot, partner in zip(frames, partners)
-            ]
+            slots = [self._decode_frames(slot, precursors) for slot in frames]
         else:
             slots = [self._decode_frames(logits, precursors)]
 
@@ -1776,7 +1761,7 @@ class Spec2Pep(pl.LightningModule):
                 decoded = slot[i]
                 match = self._build_psm(
                     decoded.tokens, decoded.scores, decoded.charge,
-                    spectrum_id, exp_mz, decoded.fit, decoded.stop,
+                    spectrum_id, exp_mz, decoded.stop,
                 )
                 if match is not None:
                     matches.append(match)
@@ -1790,14 +1775,14 @@ class Spec2Pep(pl.LightningModule):
         self,
         logits: torch.Tensor,
         precursors: torch.Tensor,
-        partner: Union[bool, Sequence[bool]] = False,
-    ) -> Tuple[List[List[int]], List[List[float]], List[int]]:
+    ) -> List[Decoded]:
         """
         Decode one peptide per spectrum from a range of frames.
 
         Greedy CTC decoding, then precise mass control: when the greedy
-        peptide does not match the precursor mass, search for the best CTC
-        path that does.
+        peptide lands in none of its ``_slot_windows``, search for the
+        best CTC path that does. When there is none either, the greedy
+        peptide stands, scored like any other.
 
         Parameters
         ----------
@@ -1806,10 +1791,6 @@ class Spec2Pep(pl.LightningModule):
             single-peptide sequencing, and one slot's frames for chimeric.
         precursors : torch.Tensor of shape (n_spectra, 3)
             The precursor neutral mass, charge, and m/z.
-        partner : Union[bool, Sequence[bool]]
-            Whether this slot holds the co-isolated peptide, for every
-            spectrum or one flag each. Per spectrum because nothing ties
-            a slot to a peptide; ``_partner_slots`` decides it.
 
         Returns
         -------
@@ -1818,102 +1799,40 @@ class Spec2Pep(pl.LightningModule):
             accepted under: with ``charge_range`` unset always the
             annotated one, and with a range set the charge whose window
             the peptide matched, which is what ``calc_mz`` has to be
-            computed from downstream. ``fit`` says whether it landed in
-            any window at all; one that did not keeps its greedy
-            confidence, and the score subtracts one so it sorts below
-            every peptide that did match.
+            computed from downstream.
         """
         sequences, scores, stops = self._ctc_decode(logits)
         charges = [int(z) for z in precursors[:, 1].tolist()]
-        fits = [False] * len(sequences)
         for i, tokens in enumerate(sequences):
             precursor_mass = precursors[i, 0].item()
             precursor_mz = precursors[i, 2].item()
             annotated = charges[i]
-            is_partner = (
-                partner if isinstance(partner, bool) else bool(partner[i])
-            )
             if tokens:
                 window = self._matching_window(
-                    tokens, precursor_mass, precursor_mz, annotated,
-                    is_partner,
+                    tokens, precursor_mass, precursor_mz, annotated
                 )
                 if window is not None:
                     charges[i] = window[0]
-                    fits[i] = True
                     continue
             pmc = self._pmc_decode(
-                logits[i], precursor_mass, precursor_mz, annotated,
-                is_partner,
+                logits[i], precursor_mass, precursor_mz, annotated
             )
             if pmc is not None:
                 # PMC only returns mass-matching paths.
                 sequences[i], scores[i] = pmc.tokens, pmc.scores
                 stops[i], charges[i] = pmc.stop, pmc.charge
-                fits[i] = True
             elif self.chimera and tokens:
                 # No window accepted this peptide, so no charge was chosen
                 # for it. Reporting the annotated charge would be wrong
                 # more often than not: it belongs to whichever precursor
-                # the instrument picked, and this is the other one.
+                # the instrument picked, and this may be the other one.
                 charges[i] = self._best_effort_charge(
-                    tokens, precursor_mass, precursor_mz, annotated,
-                    is_partner,
+                    tokens, precursor_mass, precursor_mz, annotated
                 )
         return [
             Decoded(*fields)
-            for fields in zip(sequences, scores, stops, charges, fits)
+            for fields in zip(sequences, scores, stops, charges)
         ]
-
-    def _partner_slots(
-        self, frames: Sequence[torch.Tensor], precursors: torch.Tensor
-    ) -> List[List[bool]]:
-        """
-        Which slot holds the co-isolated peptide, for each spectrum.
-
-        The recorded precursor belongs to one of the two peptides and
-        the annotation does not say which: ``A:B`` and ``B:A`` are the
-        same spectrum and the loss keeps the better pairing. So the
-        greedy peptides settle it: whichever slot lands in a window
-        built from the recorded precursor is the selected one. When both
-        match or neither does, slot B stays the partner, as before.
-
-        Greedy CTC only, no mass search, so this costs an argmax per
-        slot.
-
-        Parameters
-        ----------
-        frames : Sequence[torch.Tensor]
-            The two slots' frame-level scores.
-        precursors : torch.Tensor of shape (n_spectra, 3)
-            The precursor neutral mass, charge, and m/z.
-
-        Returns
-        -------
-        List[List[bool]]
-            One flag list per slot, one entry per spectrum.
-        """
-        decoded = [self._ctc_decode(slot)[0] for slot in frames]
-        flags = [[], []]
-        for i in range(precursors.shape[0]):
-            precursor_mass = precursors[i, 0].item()
-            precursor_mz = precursors[i, 2].item()
-            annotated = int(precursors[i, 1].item())
-            matched = [
-                bool(tokens[i])
-                and self._matching_window(
-                    tokens[i], precursor_mass, precursor_mz, annotated
-                )
-                is not None
-                for tokens in decoded
-            ]
-            # Only an unambiguous match moves the partner off slot B.
-            selected = 0 if matched[0] and not matched[1] else (
-                1 if matched[1] and not matched[0] else 0
-            )
-            flags[0].append(selected != 0)
-            flags[1].append(selected != 1)
-        return flags
 
     def _best_effort_charge(
         self,
@@ -1921,7 +1840,6 @@ class Spec2Pep(pl.LightningModule):
         precursor_mass: float,
         precursor_mz: Optional[float],
         precursor_charge: Optional[int],
-        partner: bool = False,
     ) -> int:
         """
         The charge that comes closest to explaining a peptide's mass.
@@ -1958,11 +1876,7 @@ class Spec2Pep(pl.LightningModule):
             .sum()
             .item()
         )
-        if (
-            partner
-            and self.isolation_window_width
-            and precursor_mz is not None
-        ):
+        if self._isolation_held(precursor_mz):
             # At most one charge can put a peptide inside the isolation
             # window, so containment decides it outright; failing that,
             # the nearest edge.
@@ -1996,7 +1910,6 @@ class Spec2Pep(pl.LightningModule):
         charge: int,
         spectrum_id: Tuple[str, str],
         exp_mz: float,
-        fit: bool = True,
         stop: Optional[float] = None,
     ) -> Optional[psm.PepSpecMatch]:
         """
@@ -2014,10 +1927,6 @@ class Spec2Pep(pl.LightningModule):
             The peak file and scan identifier.
         exp_mz : float
             The observed precursor m/z.
-        fit : bool
-            Whether the peptide landed in a precursor window. When it did
-            not, ``_peptide_score`` subtracts one so it sorts below every
-            peptide that did.
         stop : Optional[float]
             The stop token's confidence, where the decoder emitted one.
             CTC supervises the stop, so upstream's peptide score counts
@@ -2038,8 +1947,8 @@ class Spec2Pep(pl.LightningModule):
         if self.tokenizer.reverse:
             aa_scores = aa_scores[::-1]
 
-        # Upstream's aggregation: the product of the residue scores, minus
-        # one when the peptide misses the precursor. The product also
+        # Upstream's aggregation: the product of the residue scores. A
+        # peptide outside its mass windows is not marked down. The product also
         # survives the N-terminal score merge in `on_predict_batch_end`,
         # where `aa_scores[1] *= aa_scores[0]` and element 0 is dropped; a
         # mean does not, so it would stop being the aggregate of the very
@@ -2052,7 +1961,7 @@ class Spec2Pep(pl.LightningModule):
         return psm.PepSpecMatch(
             sequence=peptide,
             spectrum_id=spectrum_id,
-            peptide_score=float(_peptide_score(scored, fit)),
+            peptide_score=float(_peptide_score(scored)),
             charge=int(charge),
             calc_mz=np.nan,
             exp_mz=exp_mz,

@@ -63,6 +63,7 @@ class Decoded(NamedTuple):
     scores: List[float]
     stop: Optional[float] = None
     charge: Optional[int] = None
+    posterior: Optional[float] = None
 
 
 class Spec2Pep(pl.LightningModule):
@@ -612,6 +613,94 @@ class Spec2Pep(pl.LightningModule):
         return self.ctc_loss_per_seq(
             log_probs, truth, input_lengths, target_lengths
         )
+
+    def _frames_needed(self, target: List[int]) -> int:
+        """Frames an alignment of ``target`` needs at a minimum.
+
+        One per token, plus a blank between each pair of repeated tokens,
+        which CTC requires or the pair collapses to one.
+        """
+        repeats = sum(
+            1 for a, b in zip(target, target[1:]) if a == b
+        )
+        return len(target) + repeats
+
+    def _ctc_posteriors(
+        self,
+        logits: torch.Tensor,
+        sequences: List[List[int]],
+        stops: List[Optional[float]],
+    ) -> List[Optional[float]]:
+        """
+        ``P(y | x)`` for each decoded peptide, over all its alignments.
+
+        THE SCORE THE GREEDY PATH GIVES IS NOT A PROBABILITY OF ANYTHING.
+        `_ctc_decode` takes a token's confidence to be the largest
+        probability among the frames CTC merged into it, drops the blank
+        frames, and `_peptide_score` multiplies those together. A maximum
+        over a run is biased upward by an amount that depends on how many
+        frames that token happened to occupy, so the product is neither
+        the probability of the greedy path nor the probability of the
+        peptide, and the reliability curves sit well above the diagonal
+        (log.md 2026-10-02both_chim_isolation-win).
+
+        This is the probability of the peptide: the CTC forward
+        algorithm's sum over every frame alignment that collapses to it,
+        which is exactly what `ctc_loss_per_seq` computes for training.
+        Decoding is untouched, so the same peptides come out and only
+        their scores change.
+
+        The target is the decoded tokens plus the stop, because that is
+        what the dataset supervises against (`chimera.py`, add_stop).
+
+        Parameters
+        ----------
+        logits : torch.Tensor of shape (n_spectra, n_frames, n_tokens)
+            The frames the peptides were decoded from.
+        sequences : List[List[int]]
+            The decoded tokens per spectrum, in tokenizer order.
+        stops : List[Optional[float]]
+            The stop's confidence, where one was emitted. Only whether it
+            exists matters here, not its value.
+
+        Returns
+        -------
+        List[Optional[float]]
+            The posterior per spectrum, or None where there is nothing to
+            score or the target cannot be aligned to the frames at all.
+        """
+        targets = [
+            list(tokens) + ([self.stop_token] if stop is not None else [])
+            for tokens, stop in zip(sequences, stops)
+        ]
+        width = max((len(t) for t in targets), default=0)
+        if not width:
+            return [None] * len(sequences)
+
+        n_frames = logits.shape[1]
+        truth = torch.zeros(
+            (len(targets), width), dtype=torch.long, device=logits.device
+        )
+        for i, target in enumerate(targets):
+            if target:
+                truth[i, : len(target)] = torch.tensor(
+                    target, dtype=torch.long, device=logits.device
+                )
+        lengths = torch.tensor(
+            [len(t) for t in targets], dtype=torch.long, device=logits.device
+        )
+        loss = self._ctc_per_spectrum(logits, truth, lengths)
+
+        posteriors = []
+        for i, target in enumerate(targets):
+            # `zero_infinity` turns an unalignable target's infinite loss
+            # into zero, which would come back out as a probability of
+            # one. Those are refused here rather than reported.
+            if not target or self._frames_needed(target) > n_frames:
+                posteriors.append(None)
+            else:
+                posteriors.append(float(torch.exp(-loss[i]).item()))
+        return posteriors
 
     def _warn_if_infeasible(
         self,
@@ -1761,7 +1850,7 @@ class Spec2Pep(pl.LightningModule):
                 decoded = slot[i]
                 match = self._build_psm(
                     decoded.tokens, decoded.scores, decoded.charge,
-                    spectrum_id, exp_mz, decoded.stop,
+                    spectrum_id, exp_mz, decoded.stop, decoded.posterior,
                 )
                 if match is not None:
                     matches.append(match)
@@ -1829,9 +1918,12 @@ class Spec2Pep(pl.LightningModule):
                 charges[i] = self._best_effort_charge(
                     tokens, precursor_mass, precursor_mz, annotated
                 )
+        posteriors = self._ctc_posteriors(logits, sequences, stops)
         return [
             Decoded(*fields)
-            for fields in zip(sequences, scores, stops, charges)
+            for fields in zip(
+                sequences, scores, stops, charges, posteriors
+            )
         ]
 
     def _best_effort_charge(
@@ -1911,6 +2003,7 @@ class Spec2Pep(pl.LightningModule):
         spectrum_id: Tuple[str, str],
         exp_mz: float,
         stop: Optional[float] = None,
+        posterior: Optional[float] = None,
     ) -> Optional[psm.PepSpecMatch]:
         """
         Assemble one PSM from decoded tokens.
@@ -1958,10 +2051,22 @@ class Spec2Pep(pl.LightningModule):
         # is not reported among the residues, so `aa_scores` stays one per
         # residue and only the score sees it.
         scored = aa_scores if stop is None else np.append(aa_scores, stop)
+        # The CTC posterior where there is one, and the old product where
+        # the target could not be aligned to the frames at all. Both count
+        # the stop: the posterior has it in the target, the product
+        # appends it above, as the AR decoder's score does.
+        #
+        # `aa_scores` stays the per-token confidences `_ctc_decode` found,
+        # so the reported residues still say which positions the decoder
+        # was unsure of. They no longer multiply to the peptide score, and
+        # are not meant to: that product is the quantity this replaces.
+        score = (
+            _peptide_score(scored) if posterior is None else posterior
+        )
         return psm.PepSpecMatch(
             sequence=peptide,
             spectrum_id=spectrum_id,
-            peptide_score=float(_peptide_score(scored)),
+            peptide_score=float(score),
             charge=int(charge),
             calc_mz=np.nan,
             exp_mz=exp_mz,

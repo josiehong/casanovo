@@ -702,6 +702,107 @@ class Spec2Pep(pl.LightningModule):
                 posteriors.append(float(torch.exp(-loss[i]).item()))
         return posteriors
 
+    def _ctc_marginals(
+        self,
+        log_probs: torch.Tensor,
+        target: List[int],
+    ) -> List[float]:
+        """
+        Per-residue confidence from the CTC forward-backward posterior.
+
+        A BUG FIX, not a refinement. `_ctc_decode` scored a residue by the
+        largest probability among the frames a greedy collapse merged into
+        it. A maximum over a run is biased upward by however many frames
+        that run holds, so two residues the model is equally sure of came
+        out with different numbers purely because one occupied more
+        frames, and the reported confidences were not comparable with each
+        other.
+
+        This asks the alignment posterior instead: ``gamma(t, i)`` is the
+        probability that an alignment of this target puts residue i at
+        frame t, and the confidence is the model's probability of that
+        residue over those frames, weighted by gamma. It does not depend
+        on the greedy path, and is the per-residue analogue of
+        `_ctc_posteriors`.
+
+        WHAT IT IS NOT: the probability that residue i is correct, which
+        would need a sum over alternative label sequences. This is the
+        model's confidence in the residue it chose, where the alignment
+        puts it.
+
+        Standard forward-backward over the extended target
+        ``[blank, y0, blank, y1, ..., blank]``, in log space, vectorised
+        across extended positions and looped over frames. The backward
+        pass is the same recursion on the reversed target, so one sweep
+        serves both.
+
+        Parameters
+        ----------
+        log_probs : torch.Tensor of shape (n_frames, n_tokens)
+            One spectrum's log-softmaxed frame scores.
+        target : List[int]
+            The label sequence, stop included, as `_ctc_posteriors` scores
+            it.
+
+        Returns
+        -------
+        List[float]
+            One confidence per entry of ``target``; NaN where the target
+            does not align to the frames at all.
+        """
+        blank, device = self.blank_token, log_probs.device
+        neg = float("-inf")
+        extended = [blank]
+        for token in target:
+            extended += [token, blank]
+        width = len(extended)
+
+        def skips(labels):
+            """Where a two-step skip is legal: onto a token, not a repeat."""
+            return torch.tensor(
+                [s >= 2 and labels[s] != blank
+                 and labels[s] != labels[s - 2] for s in range(width)],
+                device=device,
+            )
+
+        def sweep(emit, can_skip):
+            """Forward recursion: stay, step one, or skip a blank."""
+            out = torch.full((len(emit), width), neg, device=device)
+            out[0, :2] = emit[0, :2]
+            pad = torch.full((1,), neg, device=device)
+            for t in range(1, len(emit)):
+                prev = out[t - 1]
+                step = torch.cat([pad, prev[:-1]])
+                jump = torch.cat([pad, pad, prev[:-2]])
+                jump = torch.where(can_skip, jump, torch.full_like(jump, neg))
+                out[t] = torch.logaddexp(
+                    torch.logaddexp(prev, step), jump
+                ) + emit[t]
+            return out
+
+        emit = log_probs[:, torch.tensor(extended, device=device)]
+        alpha = sweep(emit, skips(extended))
+        beta = sweep(
+            emit.flip(0).flip(1), skips(extended[::-1])
+        ).flip(0).flip(1)
+
+        # Both sweeps carry the frame's own emission, so one copy comes
+        # back out. The total is the same at every frame; frame 0 is as
+        # good as any to read it off.
+        gamma = alpha + beta - emit
+        total = torch.logsumexp(gamma[0], dim=0)
+        if not torch.isfinite(total):
+            return [float("nan")] * len(target)
+
+        probs = log_probs.exp()
+        out = []
+        for i, token in enumerate(target):
+            weight = (gamma[:, 2 * i + 1] - total).exp()
+            mass = float(weight.sum())
+            out.append(float((weight * probs[:, token]).sum() / mass)
+                       if mass > 0 else float("nan"))
+        return out
+
     def _warn_if_infeasible(
         self,
         truth: torch.Tensor,
@@ -1919,6 +2020,31 @@ class Spec2Pep(pl.LightningModule):
                     tokens, precursor_mass, precursor_mz, annotated
                 )
         posteriors = self._ctc_posteriors(logits, sequences, stops)
+
+        # The reported residue scores come from the alignment posterior
+        # rather than off the greedy path. Computed after the loop, so a
+        # PMC peptide gets the same treatment as a greedy one, and after
+        # `_ctc_posteriors`, which reads `stops` as a presence flag before
+        # the stop's own confidence is replaced below.
+        frame_log_probs = logits.log_softmax(-1)
+        for i, tokens in enumerate(sequences):
+            if not tokens:
+                continue
+            target = list(tokens)
+            if stops[i] is not None:
+                target.append(self.stop_token)
+            if self._frames_needed(target) > logits.shape[1]:
+                # Unalignable: the forward-backward has no path to weight,
+                # so the greedy confidences stand.
+                continue
+            marginal = self._ctc_marginals(frame_log_probs[i], target)
+            if any(value != value for value in marginal):
+                continue
+            if stops[i] is not None:
+                scores[i], stops[i] = marginal[:-1], marginal[-1]
+            else:
+                scores[i] = marginal
+
         return [
             Decoded(*fields)
             for fields in zip(

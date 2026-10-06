@@ -835,6 +835,49 @@ def test_peptide_score_is_the_product_of_the_residue_scores():
     assert match.peptide_score != pytest.approx(np.mean(confs))
 
 
+def test_the_ctc_posterior_replaces_the_product_when_there_is_one():
+    """The peptide score is P(y|x), not the product of residue maxima.
+
+    The product stands only where the target cannot be aligned to the
+    frames, which is the fallback `_build_psm` keeps.
+    """
+    model = _model()
+    confs = [0.9, 0.8, 0.5]
+    tokens = _tokens(model.tokenizer, "PEK")
+    args = (tokens, confs, 2, ("file", "1"), 400.0)
+
+    fallback = model._build_psm(*args)
+    scored = model._build_psm(*args, None, 0.25)
+
+    assert fallback.peptide_score == pytest.approx(0.9 * 0.8 * 0.5)
+    assert scored.peptide_score == pytest.approx(0.25)
+    # The residues reported beside it are the same either way.
+    assert np.allclose(scored.aa_scores, fallback.aa_scores)
+
+
+def test_residue_confidence_is_a_weighted_mean_of_its_own_frames():
+    """The marginal is an average over frames, so it cannot leave their range.
+
+    The rule it replaces took a maximum, which sits at the top of that
+    range by construction and is pushed there further the more frames a
+    residue happens to occupy. An average cannot be outside it, whatever
+    the alignment posterior does, so this catches a sign or index error
+    in the forward-backward that still produced finite numbers.
+    """
+    model = _model()
+    torch.manual_seed(0)
+    target = _tokens(model.tokenizer, "PEK") + [model.stop_token]
+    log_probs = torch.randn(12, model.vocab_size).log_softmax(-1)
+
+    got = model._ctc_marginals(log_probs, target)
+
+    assert len(got) == len(target)
+    probs = log_probs.exp()
+    for confidence, token in zip(got, target):
+        frames = probs[:, token]
+        assert float(frames.min()) <= confidence <= float(frames.max())
+
+
 def test_a_peptide_that_misses_every_window_keeps_its_score(monkeypatch):
     """PMC may give up, and what it leaves behind is scored like the rest.
 

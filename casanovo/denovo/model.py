@@ -1796,6 +1796,12 @@ class Spec2Pep(pl.LightningModule):
             # predecessor the score chose.
             mass_best = state_mass.gather(1, best_arg.unsqueeze(1)).squeeze(1)
             sel_tokens = emit_idx[sel]
+            # Hoisted out of the three uses below. This is (|sel|,
+            # n_bins) of int64 -- 45 MB on a typical lattice, as much as
+            # the float64 mass plane and twice the float32 score plane --
+            # and it was being rebuilt identically for each, 90 MB a
+            # frame of pure duplication.
+            src_sel = src_bins[sel]
             # Best predecessor excluding each candidate token itself,
             # shifted by that token's mass: a new emission of token e at
             # mass m extends the best path at mass m - delta_e whose
@@ -1807,17 +1813,24 @@ class Spec2Pep(pl.LightningModule):
             excl_arg = torch.where(
                 is_self, second_arg.unsqueeze(0), best_arg.unsqueeze(0)
             )
-            emit_val = excl_val.gather(1, src_bins[sel]) + lp[
+            emit_val = excl_val.gather(1, src_sel) + lp[
                 sel_tokens
             ].unsqueeze(1)
             emit_val = emit_val.masked_fill(~valid[sel], neg_inf)
-            emit_arg = excl_arg.gather(1, src_bins[sel])
+            emit_arg = excl_arg.gather(1, src_sel)
             # The exact mass follows the same predecessor the score does
             # -- state (src_bins, emit_arg) -- gaining the unrounded
             # residue mass rather than its bin.
-            emit_mass = state_mass.view(-1)[
-                src_bins[sel] * vocab + emit_arg
-            ] + emit_exact[sel].unsqueeze(1)
+            #
+            # Indexed on both axes at once rather than through a flat
+            # index into `view(-1)`: `src_sel * vocab + emit_arg` built a
+            # further 45 MB of int64 to say what the two index tensors
+            # already say. `state_mass` is contiguous, so the flat and
+            # the two-axis forms address the same elements in the same
+            # order by definition.
+            emit_mass = state_mass[src_sel, emit_arg] + emit_exact[
+                sel
+            ].unsqueeze(1)
             # Continue the current run: no new emission.
             repeat = score[:, sel_tokens].T + lp[sel_tokens].unsqueeze(1)
             repeat_mass = state_mass[:, sel_tokens].T

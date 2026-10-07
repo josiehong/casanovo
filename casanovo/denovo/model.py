@@ -1788,9 +1788,20 @@ class Spec2Pep(pl.LightningModule):
                 state_mass = new_mass
                 pointers[t] = new_ptr
                 continue
-            top2 = score.topk(2, dim=1)
-            best, best_arg = top2.values[:, 0], top2.indices[:, 0]
-            second, second_arg = top2.values[:, 1], top2.indices[:, 1]
+            # Best and second-best per bin. `topk(2)` sorts, and over
+            # 30 tokens that costs 2.5x a max, a mask and a second max
+            # at the real lattice size -- 19% of a PMC call against 8%.
+            #
+            # TIE-BREAKING NEED NOT MATCH topk's. Where two tokens hold
+            # the same score in one bin, which is called best and which
+            # second can differ, and that changes the predecessor the
+            # pointer table records even though both paths carry the
+            # same probability. The equivalence check over 200 calls is
+            # what says it does not happen here.
+            best, best_arg = score.max(dim=1)
+            second, second_arg = score.scatter(
+                1, best_arg.unsqueeze(1), neg_inf
+            ).max(dim=1)
             # The blank column's predecessor mass; the emission columns
             # read theirs off `emit_arg` below, which already names the
             # predecessor the score chose.
